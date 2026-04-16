@@ -10,6 +10,7 @@ services:
       - ./bot_data:/app/bot_data
     environment:
       - TZ=Europe/Zurich
+      - PYTHONUNBUFFERED=1
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 

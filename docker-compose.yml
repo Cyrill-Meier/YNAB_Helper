@@ -1,0 +1,30 @@
+services:
+  revolut-ynab-bot:
+    image: ghcr.io/cyrill-meier/ynab_helper:latest
+    container_name: revolut-ynab-bot
+    restart: unless-stopped
+    volumes:
+      # Your .env file with secrets (create on the NAS, NOT from Git)
+      - ./bot.env:/app/.env:ro
+      # Persistent storage for user DB + per-user transaction DBs
+      - ./bot_data:/app/bot_data
+    environment:
+      - TZ=Europe/Zurich
+    labels:
+      - "com.centurylinklabs.watchtower.scope=ynab"
+
+  # Auto-update: pulls new images and restarts the bot automatically
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Check for new images every 5 minutes
+      - WATCHTOWER_POLL_INTERVAL=300
+      # Only update containers with the "ynab" scope label
+      - WATCHTOWER_SCOPE=ynab
+      - TZ=Europe/Zurich
+    labels:
+      - "com.centurylinklabs.watchtower.scope=ynab"

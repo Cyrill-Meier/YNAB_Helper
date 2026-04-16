@@ -48,6 +48,29 @@ sys.path.insert(0, str(_script_dir))
 
 import revolut_to_ynab as ynab
 
+# ─── Version ────────────────────────────────────────────────────────────────
+# Bump __version__ manually for meaningful releases.
+# BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
+# (see Dockerfile ARGs). When running locally from source, they stay "dev".
+
+__version__ = "1.1.2"
+
+
+def get_version_info():
+    """Return a dict with version, build sha, and build date."""
+    return {
+        "version": __version__,
+        "sha": os.environ.get("BUILD_SHA", "dev")[:7] or "dev",
+        "date": os.environ.get("BUILD_DATE", "local"),
+    }
+
+
+def format_version_line():
+    """Compact one-line version string for /help and logs."""
+    v = get_version_info()
+    return f"v{v['version']} ({v['sha']}, {v['date']})"
+
+
 # ─── Telegram API helpers ───────────────────────────────────────────────────
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
@@ -218,10 +241,36 @@ class RevolutYNABBot:
         self.db = user_db_conn
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.offset = 0
+        # Persist the Telegram update offset so a container restart doesn't
+        # cause Telegram to redeliver updates that were already processed.
+        self._offset_path = self.data_dir / "telegram_offset"
+        self.offset = self._load_offset()
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="revolut_bot_"))
         # Per-user last CSV cache: {telegram_id: Path}
         self._last_csv = {}
+        # In-memory guard against double-processing a single update_id
+        # (belt-and-suspenders alongside the persisted offset).
+        self._seen_updates = set()
+
+    def _load_offset(self):
+        """Read the persisted Telegram update offset, or 0 if missing."""
+        try:
+            if self._offset_path.exists():
+                raw = self._offset_path.read_text().strip()
+                if raw:
+                    return int(raw)
+        except (OSError, ValueError) as e:
+            ynab.log.warning("bot: could not load offset (%s), starting at 0", e)
+        return 0
+
+    def _save_offset(self):
+        """Atomically persist the current offset."""
+        try:
+            tmp = self._offset_path.with_suffix(".tmp")
+            tmp.write_text(str(self.offset))
+            os.replace(tmp, self._offset_path)
+        except OSError as e:
+            ynab.log.warning("bot: could not save offset: %s", e)
 
     # ── Polling ──────────────────────────────────────────────────────────
 
@@ -238,6 +287,7 @@ class RevolutYNABBot:
         updates = result.get("result", [])
         if updates:
             self.offset = updates[-1]["update_id"] + 1
+            self._save_offset()
         return updates
 
     # ── Message routing ──────────────────────────────────────────────────
@@ -617,7 +667,7 @@ class RevolutYNABBot:
 
     def _handle_help(self, chat_id, sender_id):
         lines = [
-            "*Revolut → YNAB Bot*\n",
+            f"*Revolut → YNAB Bot* — {format_version_line()}\n",
             "📎 *Send a CSV* — Import Revolut transactions into YNAB",
             "🧮 /reconcile — Reconcile YNAB balance against last CSV",
             "📊 /status — Show YNAB account balance & last import",
@@ -1174,11 +1224,26 @@ class RevolutYNABBot:
             print("Error: invalid Telegram bot token.")
             sys.exit(1)
         bot_name = me["result"].get("username", "?")
-        print(f"🤖 Bot @{bot_name} started (admin: {self.admin_id})")
+        version_line = format_version_line()
+        print(f"🤖 Bot @{bot_name} started ({version_line}) admin={self.admin_id}")
         print(f"   User DB: {self.db.execute('SELECT count(*) FROM users').fetchone()[0]} users")
         print(f"   Data dir: {self.data_dir}")
         print(f"   Press Ctrl+C to stop.\n")
-        ynab.log.info("bot: started @%s admin=%s", bot_name, self.admin_id)
+        ynab.log.info("bot: started @%s %s admin=%s",
+                      bot_name, version_line, self.admin_id)
+
+        # Notify admin that the bot just (re)started + which version is running
+        try:
+            n_users = self.db.execute(
+                "SELECT count(*) FROM users WHERE state='ready'"
+            ).fetchone()[0]
+            tg_send(self.token, self.admin_id, (
+                f"🚀 *Bot started*\n\n"
+                f"Version: {version_line}\n"
+                f"Ready users: {n_users}"
+            ))
+        except Exception as e:
+            ynab.log.warning("bot: could not send startup message to admin: %s", e)
 
         retry_delay = 1
         while True:
@@ -1186,8 +1251,24 @@ class RevolutYNABBot:
                 updates = self.poll()
                 retry_delay = 1
                 for update in updates:
+                    uid = update.get("update_id")
+                    if uid in self._seen_updates:
+                        ynab.log.info("bot: skipping duplicate update %s", uid)
+                        continue
+                    self._seen_updates.add(uid)
+                    # Cap memory — keep the last 500 IDs
+                    if len(self._seen_updates) > 500:
+                        self._seen_updates = set(
+                            list(self._seen_updates)[-250:]
+                        )
                     try:
                         self.handle_update(update)
+                    except SystemExit as e:
+                        # A called helper (e.g. ynab.list_budgets, crypto_sync)
+                        # tried to sys.exit(). Swallow it so one bad command
+                        # doesn't kill the whole bot.
+                        ynab.log.error("bot: handler raised SystemExit(%s): %s",
+                                       e.code, traceback.format_exc())
                     except Exception:
                         ynab.log.error("bot: error handling update: %s",
                                        traceback.format_exc())

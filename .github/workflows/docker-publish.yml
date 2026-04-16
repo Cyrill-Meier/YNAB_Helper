@@ -7,6 +7,8 @@ on:
       - 'revolut_to_ynab.py'
       - 'revolut_ynab_bot.py'
       - 'Dockerfile'
+      - '.github/workflows/docker-publish.yml'
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -39,6 +41,12 @@ jobs:
             type=raw,value=latest
             type=sha,prefix=
 
+      - name: Capture build metadata
+        id: buildinfo
+        run: |
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +'%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -46,3 +54,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ steps.buildinfo.outputs.sha }}
+            BUILD_DATE=${{ steps.buildinfo.outputs.date }}

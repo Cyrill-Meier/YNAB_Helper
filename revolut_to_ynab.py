@@ -1167,15 +1167,28 @@ def fetch_btc_balance_address(address):
 # ── Ethereum balance queries (via public JSON-RPC) ──
 
 def _get_eth_rpc_urls():
-    """Build ordered list of Ethereum RPC endpoints. Authenticated Ankr first if configured."""
+    """Build ordered list of Ethereum RPC endpoints.
+
+    Authenticated Ankr first if configured, then a broad set of free public
+    endpoints as fallbacks. Endpoints are tried in order and the first one
+    that returns a usable result wins.
+    """
     urls = []
     ankr_key = os.environ.get("ANKR_API_KEY", "")
     if ankr_key:
         urls.append(f"https://rpc.ankr.com/eth/{ankr_key}")
+    # Public endpoints — ordered by observed reliability.
+    # Note: unauthenticated Ankr now returns -32000 Unauthorized, so it's
+    # kept last as a last-ditch option rather than first.
     urls.extend([
-        "https://rpc.ankr.com/eth",
+        "https://ethereum.publicnode.com",
+        "https://eth.drpc.org",
+        "https://rpc.payload.de",
+        "https://1rpc.io/eth",
+        "https://eth.meowrpc.com",
         "https://cloudflare-eth.com",
         "https://eth.llamarpc.com",
+        "https://rpc.ankr.com/eth",
     ])
     return urls
 
@@ -1189,12 +1202,19 @@ ERC20_TOKENS = [
 
 
 def _eth_rpc_call(method, params):
-    """Make a JSON-RPC call to a public Ethereum node (tries multiple endpoints)."""
+    """Make a JSON-RPC call to a public Ethereum node (tries multiple endpoints).
+
+    Tries each endpoint in order, skipping those that return RPC errors or
+    raise network exceptions. Raises RuntimeError if every endpoint fails
+    so callers (including the Telegram bot) can surface a proper error
+    message instead of silently sys.exit'ing.
+    """
     payload = json.dumps({
         "jsonrpc": "2.0", "id": 1,
         "method": method, "params": params,
     }).encode()
 
+    errors = []
     for rpc_url in _get_eth_rpc_urls():
         try:
             req = Request(rpc_url, data=payload, headers={
@@ -1206,13 +1226,25 @@ def _eth_rpc_call(method, params):
             if "result" in data:
                 return data["result"]
             if "error" in data:
-                print(f"  ⚠ RPC error from {rpc_url}: {data['error']}")
+                err = data["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                short = (msg or "")[:120]
+                print(f"  ⚠ RPC error from {rpc_url}: {short}")
+                errors.append(f"{rpc_url}: {short}")
                 continue
-        except Exception:
+        except Exception as e:
+            short = str(e)[:120]
+            print(f"  ⚠ Network error from {rpc_url}: {short}")
+            errors.append(f"{rpc_url}: {short}")
             continue
 
-    print(f"  ✗ All Ethereum RPC endpoints failed")
-    sys.exit(1)
+    print("  ✗ All Ethereum RPC endpoints failed")
+    # Raise a readable error so bot users see why, e.g.:
+    #   "Crypto sync failed: All ETH RPC endpoints failed for eth_getBalance"
+    raise RuntimeError(
+        f"All ETH RPC endpoints failed for {method}: "
+        + " | ".join(errors[-3:])  # last 3 keep the message short
+    )
 
 
 def fetch_eth_balance(eth_address):

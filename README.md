@@ -171,7 +171,30 @@ From your phone: Revolut → Export → Share → Telegram → send to your bot.
 - `/reconcile` — Reconcile YNAB balance against the last uploaded CSV
 - `/status` — Show current YNAB balance and reconciliation status
 - `/setup` — Re-run onboarding (change token / budget / account)
+- `/crypto` — Sync crypto portfolio value to the YNAB tracking account
+- `/crypto_setup` — Configure BTC xpub / ETH address / tracking account
+- `/crypto_status` — Show the current crypto configuration
 - `/help` — List commands
+
+### Crypto via the bot
+
+Each user can optionally attach a crypto portfolio to their YNAB budget. Setup happens entirely in chat:
+
+1. Create a **tracking account** in YNAB first (`app.ynab.com → Add Account → Tracking → Asset`, name it e.g. "Crypto")
+2. In Telegram, run `/crypto_setup`
+3. Pick the tracking account from the list
+4. Send your BTC xpub (or single BTC address) — or type `skip`
+5. Send your Ethereum address (0x...) — or type `skip`
+6. Run `/crypto` any time to refresh the balance
+
+What the sync does:
+
+- BTC: derives addresses locally from the xpub, queries Blockstream for each address, stops after 20 unused in a row
+- ETH: fetches native ETH plus AAVE/USDC/USDT/aUSDT balances via public JSON-RPC
+- Prices: CoinGecko (no API key needed) in CHF
+- YNAB: creates a single adjustment transaction in the tracking account so its balance matches the on-chain portfolio value. Safe to re-run — duplicate `import_id` protection.
+
+All crypto inputs are **read-only identifiers** — xpubs and public addresses can show balances but cannot spend funds.
 
 ### Admin Commands
 
@@ -249,6 +272,11 @@ TELEGRAM_ADMIN_ID=123456789
 YNAB_TOKEN=your-ynab-token
 YNAB_BUDGET_ID=your-budget-id
 YNAB_ACCOUNT_ID=your-account-id
+
+# Optional: auto-register admin crypto config too
+YNAB_CRYPTO_ACCOUNT_ID=your-crypto-tracking-account-id
+CRYPTO_BTC_XPUB=xpub6C8BFPB...
+CRYPTO_ETH_ADDRESS=0x2a1EC41E...
 
 LOG_LEVEL=INFO
 LOG_FILE=/app/bot_data/bot.log

@@ -9,6 +9,9 @@ User commands:
   /reconcile         — Reconcile YNAB cleared balance against the last uploaded CSV
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
+  /crypto            — Sync crypto portfolio value → YNAB tracking account
+  /crypto_setup      — Configure BTC xpub, ETH address, crypto tracking account
+  /crypto_status     — Show current crypto configuration
   /help              — List available commands
 
 Admin commands:
@@ -109,9 +112,13 @@ def tg_download_file(token, file_id, dest_path):
 
 # States: pending → approved → awaiting_token → awaiting_budget → awaiting_account → ready
 #         pending → denied
+# Crypto sub-flow (only entered from `ready`):
+#   ready → awaiting_crypto_account → awaiting_crypto_btc → awaiting_crypto_eth → ready
 
 USER_STATES = ("pending", "approved", "awaiting_token", "awaiting_budget",
-               "awaiting_account", "ready", "denied")
+               "awaiting_account", "ready", "denied",
+               "awaiting_crypto_account", "awaiting_crypto_btc",
+               "awaiting_crypto_eth")
 
 
 def init_user_db(db_path):
@@ -120,21 +127,32 @@ def init_user_db(db_path):
     conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id  INTEGER PRIMARY KEY,
-            chat_id      INTEGER,
-            username     TEXT,
-            first_name   TEXT,
-            ynab_token   TEXT,
-            budget_id    TEXT,
-            budget_name  TEXT,
-            account_id   TEXT,
-            account_name TEXT,
-            state        TEXT NOT NULL DEFAULT 'pending',
-            temp_data    TEXT,
-            created_at   TEXT NOT NULL,
-            updated_at   TEXT NOT NULL
+            telegram_id         INTEGER PRIMARY KEY,
+            chat_id             INTEGER,
+            username            TEXT,
+            first_name          TEXT,
+            ynab_token          TEXT,
+            budget_id           TEXT,
+            budget_name         TEXT,
+            account_id          TEXT,
+            account_name        TEXT,
+            crypto_account_id   TEXT,
+            crypto_account_name TEXT,
+            btc_xpub            TEXT,
+            eth_address         TEXT,
+            state               TEXT NOT NULL DEFAULT 'pending',
+            temp_data           TEXT,
+            created_at          TEXT NOT NULL,
+            updated_at          TEXT NOT NULL
         )
     """)
+    # Idempotent migration for DBs created before crypto columns existed
+    for col in ("crypto_account_id", "crypto_account_name",
+                "btc_xpub", "eth_address"):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
     return conn
 
@@ -302,6 +320,19 @@ class RevolutYNABBot:
             self._onboard_account(chat_id, sender_id, msg)
             return
 
+        # ── Crypto onboarding states ─────────────────────────────────────
+        if state == "awaiting_crypto_account":
+            self._onboard_crypto_account(chat_id, sender_id, msg)
+            return
+
+        if state == "awaiting_crypto_btc":
+            self._onboard_crypto_btc(chat_id, sender_id, msg)
+            return
+
+        if state == "awaiting_crypto_eth":
+            self._onboard_crypto_eth(chat_id, sender_id, msg)
+            return
+
         # ── Ready users: normal commands ─────────────────────────────────
         assert state == "ready"
 
@@ -327,6 +358,12 @@ class RevolutYNABBot:
                         "Please send me your YNAB Personal Access Token.\n"
                         "(Get it from app.ynab.com → Account Settings → Developer Settings)",
                         None)
+            elif cmd == "/crypto":
+                self._handle_crypto(chat_id, sender_id)
+            elif cmd == "/crypto_setup":
+                self._handle_crypto_setup(chat_id, sender_id)
+            elif cmd == "/crypto_status":
+                self._handle_crypto_status(chat_id, sender_id)
             elif cmd in ("/start", "/help"):
                 self._handle_help(chat_id, sender_id)
             else:
@@ -585,6 +622,9 @@ class RevolutYNABBot:
             "🧮 /reconcile — Reconcile YNAB balance against last CSV",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
+            "🪙 /crypto — Sync crypto portfolio value to YNAB",
+            "🛠 /crypto\\_setup — Configure BTC xpub / ETH address / tracking account",
+            "🔍 /crypto\\_status — Show current crypto configuration",
             "❓ /help — This message",
         ]
         if sender_id == self.admin_id:
@@ -821,6 +861,310 @@ class RevolutYNABBot:
         except Exception:
             pass
 
+    # ── /crypto: sync portfolio to YNAB tracking account ────────────────
+
+    def _handle_crypto(self, chat_id, sender_id):
+        user = get_user(self.db, sender_id)
+        if not user.get("crypto_account_id"):
+            tg_send(self.token, chat_id,
+                    "🪙 Crypto tracking isn't configured yet.\n"
+                    "Run /crypto\\_setup to pick a tracking account and add "
+                    "your BTC xpub or ETH address.")
+            return
+        if not user.get("btc_xpub") and not user.get("eth_address"):
+            tg_send(self.token, chat_id,
+                    "No BTC xpub or ETH address on file. "
+                    "Run /crypto\\_setup to add one.")
+            return
+
+        tg_send(self.token, chat_id,
+                "🪙 Syncing crypto portfolio... (this can take 30–60s for BTC xpubs)",
+                None)
+
+        try:
+            buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                ynab.crypto_sync(
+                    user["ynab_token"],
+                    user["budget_id"],
+                    user["crypto_account_id"],
+                    btc_xpub=user.get("btc_xpub") or None,
+                    eth_address=user.get("eth_address") or None,
+                )
+            finally:
+                sys.stdout = old_stdout
+            output = buf.getvalue()
+        except Exception as e:
+            ynab.log.error("bot: crypto sync failed for user %s: %s",
+                           sender_id, traceback.format_exc())
+            tg_send(self.token, chat_id, f"Crypto sync failed: {e}", None)
+            return
+
+        summary = self._format_crypto_summary(output, user)
+        tg_send(self.token, chat_id, summary, None)
+
+    def _format_crypto_summary(self, stdout_output, user):
+        """Condense crypto_sync stdout into a Telegram-friendly summary."""
+        lines = stdout_output.strip().splitlines()
+        holdings = []
+        portfolio_chf = None
+        ynab_before = None
+        delta = None
+        new_balance = None
+        in_sync = False
+
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if "Portfolio value:" in line or "Total portfolio:" in line:
+                portfolio_chf = line.split(":", 1)[-1].strip()
+            elif "YNAB balance:" in line:
+                ynab_before = line.split(":", 1)[-1].strip()
+            elif "Delta:" in line or "Adjustment:" in line:
+                delta = line.split(":", 1)[-1].strip()
+            elif "New balance:" in line:
+                new_balance = line.split(":", 1)[-1].strip()
+            elif "already in sync" in line.lower():
+                in_sync = True
+            elif line.startswith(("BTC", "ETH", "USDC", "USDT", "AAVE")) and "CHF" in line:
+                holdings.append(line)
+
+        parts = [f"🪙 *Crypto sync — {user.get('crypto_account_name') or 'tracking account'}*\n"]
+        if holdings:
+            parts.append("*Holdings:*")
+            for h in holdings[:15]:
+                parts.append(f"  {h}")
+            parts.append("")
+        if portfolio_chf:
+            parts.append(f"Portfolio: {portfolio_chf}")
+        if ynab_before:
+            parts.append(f"YNAB was:  {ynab_before}")
+        if in_sync:
+            parts.append("\n✅ Already in sync — no adjustment needed.")
+        else:
+            if delta:
+                parts.append(f"Adjustment: {delta}")
+            if new_balance:
+                parts.append(f"New bal:   {new_balance}")
+        return "\n".join(parts)
+
+    # ── /crypto_status: show current crypto config ──────────────────────
+
+    def _handle_crypto_status(self, chat_id, sender_id):
+        user = get_user(self.db, sender_id)
+        parts = ["🔍 *Crypto configuration*\n"]
+        if user.get("crypto_account_name"):
+            parts.append(f"Tracking account: {user['crypto_account_name']}")
+        else:
+            parts.append("Tracking account: _(not set)_")
+
+        if user.get("btc_xpub"):
+            x = user["btc_xpub"]
+            masked = f"{x[:12]}...{x[-8:]}" if len(x) > 24 else x
+            parts.append(f"BTC xpub/addr: `{masked}`")
+        else:
+            parts.append("BTC xpub/addr: _(not set)_")
+
+        if user.get("eth_address"):
+            a = user["eth_address"]
+            masked = f"{a[:8]}...{a[-6:]}" if len(a) > 20 else a
+            parts.append(f"ETH address:   `{masked}`")
+        else:
+            parts.append("ETH address:   _(not set)_")
+
+        parts.append("\nUse /crypto\\_setup to change these.")
+        tg_send(self.token, chat_id, "\n".join(parts))
+
+    # ── /crypto_setup: start onboarding flow ────────────────────────────
+
+    def _handle_crypto_setup(self, chat_id, sender_id):
+        user = get_user(self.db, sender_id)
+        if user["state"] != "ready":
+            tg_send(self.token, chat_id,
+                    "Please finish the main /setup first.", None)
+            return
+
+        try:
+            accounts = ynab.list_accounts(user["ynab_token"], user["budget_id"])
+        except Exception as e:
+            tg_send(self.token, chat_id,
+                    f"Could not fetch YNAB accounts: {e}", None)
+            return
+
+        # Only "tracking" accounts are appropriate for crypto portfolio value
+        tracking = [a for a in accounts
+                    if a.get("type") in ("otherAsset", "otherLiability")
+                    and not a.get("closed")]
+        if not tracking:
+            tg_send(self.token, chat_id,
+                    "No tracking accounts found in your YNAB budget.\n\n"
+                    "Create one in YNAB first:\n"
+                    "  app.ynab.com → Add Account → *Tracking* → "
+                    "Asset → name it e.g. 'Crypto'.\n"
+                    "Then run /crypto\\_setup again.")
+            return
+
+        account_list = [{"id": a["id"], "name": a["name"],
+                         "balance": a.get("balance", 0),
+                         "type": a.get("type", "")}
+                        for a in tracking]
+
+        upsert_user(self.db, sender_id,
+                    state="awaiting_crypto_account",
+                    temp_data=json.dumps(account_list))
+
+        lines = ["🪙 *Crypto setup* — pick your tracking account:\n"]
+        for i, a in enumerate(account_list, 1):
+            bal = a["balance"] / 1000
+            lines.append(f"  {i}. {a['name']} — {bal:,.2f}")
+        lines.append("\nReply with the number (or 'cancel' to abort).")
+        tg_send(self.token, chat_id, "\n".join(lines))
+
+    # ── Crypto onboarding: tracking account ─────────────────────────────
+
+    def _onboard_crypto_account(self, chat_id, sender_id, msg):
+        text = (msg.get("text") or "").strip()
+        user = get_user(self.db, sender_id)
+
+        if text.lower() == "cancel":
+            upsert_user(self.db, sender_id, state="ready", temp_data=None)
+            tg_send(self.token, chat_id, "Cancelled. Back to normal.", None)
+            return
+
+        account_list = json.loads(user.get("temp_data") or "[]")
+        if not account_list:
+            upsert_user(self.db, sender_id, state="ready", temp_data=None)
+            tg_send(self.token, chat_id,
+                    "Something went wrong. Run /crypto\\_setup again.")
+            return
+
+        try:
+            idx = int(text) - 1
+            if idx < 0 or idx >= len(account_list):
+                raise ValueError
+        except ValueError:
+            lines = ["Please reply with the number of your tracking account:\n"]
+            for i, a in enumerate(account_list, 1):
+                bal = a["balance"] / 1000
+                lines.append(f"  {i}. {a['name']} — {bal:,.2f}")
+            lines.append("\n(Or type 'cancel' to abort.)")
+            tg_send(self.token, chat_id, "\n".join(lines), None)
+            return
+
+        selected = account_list[idx]
+        upsert_user(self.db, sender_id,
+                    crypto_account_id=selected["id"],
+                    crypto_account_name=selected["name"],
+                    state="awaiting_crypto_btc",
+                    temp_data=None)
+
+        tg_send(self.token, chat_id, (
+            f"✅ Tracking account: *{selected['name']}*\n\n"
+            "Now send your *BTC xpub* (from Ledger Live → Account → Edit → "
+            "Advanced logs) — or a single BTC address.\n\n"
+            "• xpub/ypub/zpub: tracks the whole HD wallet\n"
+            "• Single address: tracks just that address\n"
+            "• Type 'skip' to skip BTC\n"
+            "• Type 'cancel' to abort"
+        ))
+
+    # ── Crypto onboarding: BTC xpub/address ─────────────────────────────
+
+    def _onboard_crypto_btc(self, chat_id, sender_id, msg):
+        text = (msg.get("text") or "").strip()
+        low = text.lower()
+
+        if low == "cancel":
+            upsert_user(self.db, sender_id, state="ready", temp_data=None)
+            tg_send(self.token, chat_id, "Cancelled.", None)
+            return
+
+        if low == "skip":
+            upsert_user(self.db, sender_id,
+                        btc_xpub=None,
+                        state="awaiting_crypto_eth",
+                        temp_data=None)
+            tg_send(self.token, chat_id,
+                    "⏭ Skipped BTC.\n\n"
+                    "Now send your *ETH address* (0x...) — "
+                    "or type 'skip' / 'cancel'.")
+            return
+
+        # Very light validation
+        looks_xpub = text.startswith(("xpub", "ypub", "zpub"))
+        looks_btc_addr = (text.startswith(("bc1", "1", "3"))
+                          and 25 <= len(text) <= 100)
+        if not looks_xpub and not looks_btc_addr:
+            tg_send(self.token, chat_id,
+                    "That doesn't look like an xpub or BTC address.\n"
+                    "Expected xpub/ypub/zpub... or bc1.../1.../3...\n"
+                    "Type 'skip' to skip or 'cancel' to abort.",
+                    None)
+            return
+
+        upsert_user(self.db, sender_id,
+                    btc_xpub=text,
+                    state="awaiting_crypto_eth",
+                    temp_data=None)
+
+        masked = f"{text[:12]}...{text[-8:]}" if len(text) > 24 else text
+        tg_send(self.token, chat_id, (
+            f"✅ BTC saved: `{masked}`\n\n"
+            "Now send your *ETH address* (0x...) — or type 'skip' / 'cancel'."
+        ))
+
+    # ── Crypto onboarding: ETH address ──────────────────────────────────
+
+    def _onboard_crypto_eth(self, chat_id, sender_id, msg):
+        text = (msg.get("text") or "").strip()
+        low = text.lower()
+
+        if low == "cancel":
+            upsert_user(self.db, sender_id, state="ready", temp_data=None)
+            tg_send(self.token, chat_id, "Cancelled.", None)
+            return
+
+        if low == "skip":
+            upsert_user(self.db, sender_id, eth_address=None, state="ready",
+                        temp_data=None)
+            self._finish_crypto_setup(chat_id, sender_id)
+            return
+
+        if not (text.startswith("0x") and len(text) == 42):
+            tg_send(self.token, chat_id,
+                    "That doesn't look like an Ethereum address.\n"
+                    "Expected a 42-character string starting with 0x.\n"
+                    "Type 'skip' to skip or 'cancel' to abort.",
+                    None)
+            return
+
+        upsert_user(self.db, sender_id, eth_address=text, state="ready",
+                    temp_data=None)
+        self._finish_crypto_setup(chat_id, sender_id)
+
+    def _finish_crypto_setup(self, chat_id, sender_id):
+        user = get_user(self.db, sender_id)
+        parts = ["🎉 *Crypto setup complete!*\n"]
+        parts.append(f"Tracking account: {user.get('crypto_account_name')}")
+        if user.get("btc_xpub"):
+            x = user["btc_xpub"]
+            parts.append(f"BTC: `{x[:12]}...{x[-8:]}`")
+        if user.get("eth_address"):
+            a = user["eth_address"]
+            parts.append(f"ETH: `{a[:8]}...{a[-6:]}`")
+        if not user.get("btc_xpub") and not user.get("eth_address"):
+            parts.append("\n⚠ No BTC or ETH configured — /crypto won't do anything.")
+            parts.append("Run /crypto\\_setup again to add one.")
+        else:
+            parts.append("\nRun /crypto anytime to sync your portfolio value to YNAB.")
+        tg_send(self.token, chat_id, "\n".join(parts))
+        ynab.log.info("bot: user %s crypto setup complete (btc=%s eth=%s)",
+                      sender_id, bool(user.get("btc_xpub")),
+                      bool(user.get("eth_address")))
+
     # ── Main loop ────────────────────────────────────────────────────────
 
     def run(self):
@@ -892,16 +1236,28 @@ def main():
     admin_ynab_token = os.environ.get("YNAB_TOKEN", "").strip()
     admin_budget_id = os.environ.get("YNAB_BUDGET_ID", "").strip()
     admin_account_id = os.environ.get("YNAB_ACCOUNT_ID", "").strip()
+    admin_crypto_account_id = os.environ.get("YNAB_CRYPTO_ACCOUNT_ID", "").strip()
+    admin_btc_xpub = os.environ.get("CRYPTO_BTC_XPUB", "").strip()
+    admin_eth_address = os.environ.get("CRYPTO_ETH_ADDRESS", "").strip()
 
     if admin_ynab_token and admin_budget_id and admin_account_id:
         existing = get_user(user_db, int(admin_id))
+        fields = {
+            "state": "ready",
+            "ynab_token": admin_ynab_token,
+            "budget_id": admin_budget_id,
+            "account_id": admin_account_id,
+            "first_name": "Admin",
+        }
+        # Optional crypto config from .env (admin convenience)
+        if admin_crypto_account_id:
+            fields["crypto_account_id"] = admin_crypto_account_id
+        if admin_btc_xpub:
+            fields["btc_xpub"] = admin_btc_xpub
+        if admin_eth_address:
+            fields["eth_address"] = admin_eth_address
         if not existing or existing["state"] != "ready":
-            upsert_user(user_db, int(admin_id),
-                        state="ready",
-                        ynab_token=admin_ynab_token,
-                        budget_id=admin_budget_id,
-                        account_id=admin_account_id,
-                        first_name="Admin")
+            upsert_user(user_db, int(admin_id), **fields)
             print(f"   Admin ({admin_id}) auto-registered from .env config.")
 
     bot = RevolutYNABBot(bot_token, admin_id, user_db, str(data_dir))

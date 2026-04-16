@@ -1062,15 +1062,47 @@ def _pubkey_to_bech32(compressed_pub):
 # ── xpub → address derivation + Blockstream balance queries ──
 
 def _query_address_balance(address):
-    """Query Blockstream API for an address's balance and tx count."""
+    """Query Blockstream API for an address's balance and tx count.
+
+    Retries 429 (rate limit) and transient 5xx with exponential backoff.
+    Raises RuntimeError on final failure instead of sys.exit, so callers
+    (including the Telegram bot) can surface a real error message.
+    """
     url = f"https://blockstream.info/api/address/{address}"
     req = Request(url, headers={"User-Agent": "revolut-to-ynab/1.0"})
-    try:
-        with urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-    except HTTPError as e:
-        print(f"  ✗ Blockstream error for {address[:12]}...: {e.code}")
-        sys.exit(1)
+
+    last_err = None
+    data = None
+    for attempt in range(5):
+        try:
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            break
+        except HTTPError as e:
+            last_err = e
+            if e.code in (429, 502, 503, 504) and attempt < 4:
+                wait = 2 ** attempt  # 1, 2, 4, 8s
+                print(f"  ⏳ Blockstream {e.code} for {address[:12]}..., retry in {wait}s")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Blockstream error for {address[:12]}...: HTTP {e.code}"
+            ) from e
+        except URLError as e:
+            last_err = e
+            if attempt < 4:
+                wait = 2 ** attempt
+                print(f"  ⏳ Network error for {address[:12]}..., retry in {wait}s: {e}")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(
+                f"Blockstream network error for {address[:12]}...: {e}"
+            ) from e
+
+    if data is None:
+        raise RuntimeError(
+            f"Blockstream failed after retries for {address[:12]}...: {last_err}"
+        )
 
     cs = data.get("chain_stats", {})
     ms = data.get("mempool_stats", {})
@@ -1120,7 +1152,7 @@ def fetch_btc_balance_xpub(xpub):
                 gap += 1
 
             i += 1
-            time.sleep(0.15)  # respect Blockstream rate limits
+            time.sleep(0.6)  # Blockstream free tier is strict; stay well under 2 req/s
 
     print(f"    Active addresses scanned: {active_addrs}")
     return total_sats / 1e8

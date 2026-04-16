@@ -53,7 +53,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.2"
+__version__ = "1.1.4"
 
 
 def get_version_info():
@@ -946,10 +946,14 @@ class RevolutYNABBot:
             finally:
                 sys.stdout = old_stdout
             output = buf.getvalue()
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit bypasses `except Exception`; catch it here too so the
+            # bot always reports sync failures instead of going silent when a
+            # helper in revolut_to_ynab.py calls sys.exit(1).
             ynab.log.error("bot: crypto sync failed for user %s: %s",
                            sender_id, traceback.format_exc())
-            tg_send(self.token, chat_id, f"Crypto sync failed: {e}", None)
+            msg = f"exit({e.code})" if isinstance(e, SystemExit) else str(e)
+            tg_send(self.token, chat_id, f"Crypto sync failed: {msg}", None)
             return
 
         summary = self._format_crypto_summary(output, user)

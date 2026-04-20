@@ -1728,12 +1728,18 @@ def reconcile_from_csv(token, budget_id, account_id, csv_path, dry_run=False):
     # Create a reconciliation adjustment in YNAB. `cleared=reconciled` tells
     # YNAB to lock these (and all cleared transactions up to this point) in the
     # reconciled state, matching what the built-in reconcile flow does.
+    #
+    # NOTE: YNAB reserves a set of internal payee names ("Reconciliation
+    # Balance Adjustment", "Starting Balance", "Manual Balance Adjustment",
+    # "Transfer :") — the API rejects transactions whose payee_name *starts*
+    # with any of them. We use "CSV Reconciliation" so the transaction still
+    # shows its purpose without tripping the reserved-name check.
     import_id = f"RECON:{delta_milli}:{as_of}:1"
     tx = {
         "account_id": account_id,
         "date": as_of,
         "amount": delta_milli,
-        "payee_name": "Reconciliation Balance Adjustment",
+        "payee_name": "CSV Reconciliation",
         "memo": f"Reconciled to CSV running balance {target_balance:,.2f} {currency} as of {as_of}",
         "cleared": "reconciled",
         "approved": True,

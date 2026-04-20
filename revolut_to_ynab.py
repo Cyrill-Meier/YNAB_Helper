@@ -341,12 +341,20 @@ def ynab_request(method, path, token, body=None):
     req = Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=20) as resp:
             return json.loads(resp.read().decode())
     except HTTPError as e:
-        error_body = e.read().decode()
+        try:
+            error_body = e.read().decode()
+        except Exception:
+            error_body = ""
         print(f"  ✗ YNAB API error ({e.code}): {error_body}")
-        sys.exit(1)
+        # Raise instead of sys.exit so bot handlers can surface the failure
+        # to users via Telegram instead of silently dying.
+        raise RuntimeError(f"YNAB API {e.code}: {error_body[:200]}") from e
+    except URLError as e:
+        print(f"  ✗ YNAB network error: {e}")
+        raise RuntimeError(f"YNAB network error: {e}") from e
 
 
 def list_budgets(token):

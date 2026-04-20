@@ -30,6 +30,7 @@ Usage:
   python3 revolut_to_ynab.py --crypto-sync          # Sync crypto portfolio value → YNAB
   python3 revolut_to_ynab.py --brokerage-sync       # Sync Interactive Brokers NAV → YNAB
   python3 revolut_to_ynab.py --reconcile            # Reconcile YNAB cleared balance to latest CSV
+  python3 revolut_to_ynab.py --cleanup-pending-memos # Strip stale '(pending)' memos from cleared YNAB txns
 """
 
 import csv
@@ -586,6 +587,86 @@ def diff_transactions(conn, transactions):
     return to_create, to_update, skipped
 
 
+def _fetch_ynab_txns_by_import_id(token, budget_id, account_id, import_ids, since_date=None):
+    """Return {import_id: ynab_tx_dict} for any import_ids present on YNAB.
+
+    Fetches the account's transactions (optionally since `since_date` as YYYY-MM-DD)
+    and filters to the requested import_ids. Used to recover YNAB tx IDs after a
+    fresh local DB so we can patch existing rows instead of losing state.
+    """
+    path = f"/budgets/{budget_id}/accounts/{account_id}/transactions"
+    if since_date:
+        path += f"?since_date={since_date}"
+    result = ynab_request("GET", path, token)
+    txns = result.get("data", {}).get("transactions", [])
+    wanted = set(import_ids)
+    return {t["import_id"]: t for t in txns if t.get("import_id") in wanted}
+
+
+def _strip_pending_marker(memo):
+    """Remove any '(pending)' substring (and surrounding ' | ' separators) from memo."""
+    if not memo:
+        return memo
+    # Drop '(pending)' with any adjacent pipe separators produced by parse_revolut_csv
+    cleaned = re.sub(r"\s*\|\s*\(pending\)|\(pending\)\s*\|\s*|\(pending\)", "", memo)
+    return cleaned.strip(" |")
+
+
+def cleanup_pending_memos(token, budget_id, account_id, dry_run=False):
+    """Patch YNAB transactions where cleared=cleared but memo still contains '(pending)'.
+
+    After a local-DB wipe (e.g. VM redeploy) previously-pending transactions that
+    have since cleared on Revolut's side won't be PATCHed by import_and_track —
+    YNAB's import_id dedup skips them on the POST. This helper scans the account
+    and strips the stale marker directly.
+    """
+    print(f"\n🧹 Scanning account for stale '(pending)' memos...")
+    path = f"/budgets/{budget_id}/accounts/{account_id}/transactions"
+    result = ynab_request("GET", path, token)
+    txns = result.get("data", {}).get("transactions", [])
+    print(f"   Fetched {len(txns)} transaction(s) from YNAB.")
+
+    stale = [
+        t for t in txns
+        if not t.get("deleted")
+        and t.get("cleared") == "cleared"
+        and "(pending)" in (t.get("memo") or "")
+    ]
+
+    if not stale:
+        print(f"   ✓ No stale '(pending)' memos — nothing to do.")
+        return 0
+
+    print(f"   Found {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'}.")
+
+    if dry_run:
+        print(f"\n   Would patch (dry-run):")
+        for t in stale[:20]:
+            amt = t["amount"] / 1000
+            print(f"    ↻ {t['date']}  {amt:>10.2f}  {t.get('payee_name', '')}")
+        if len(stale) > 20:
+            print(f"    …and {len(stale) - 20} more.")
+        return len(stale)
+
+    patched = 0
+    for t in stale:
+        new_memo = _strip_pending_marker(t.get("memo") or "")
+        update_body = {"transaction": {"memo": new_memo or None}}
+        try:
+            ynab_request(
+                "PATCH",
+                f"/budgets/{budget_id}/transactions/{t['id']}",
+                token, update_body,
+            )
+            patched += 1
+            log.info("cleanup tx   id=%s memo: %r → %r", t["id"], t.get("memo"), new_memo)
+        except Exception as e:
+            print(f"    ⚠ Failed to patch {t['id']}: {e}")
+
+    print(f"   ✓ Cleaned {patched} memo(s).")
+    return patched
+
+
 def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=False):
     """
     Diff transactions against the local DB, then create/update only what's needed.
@@ -656,10 +737,72 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 tx["import_id"], ynab_tx_id or "-",
             )
 
-        # Also record any that YNAB said were duplicates (they exist on YNAB's side)
-        for tx in to_create:
-            if tx["import_id"] in duplicates:
-                db_upsert(conn, tx)
+        # ── Duplicate reconciliation ──
+        # YNAB's import_id dedup skips the POST when an import_id already exists,
+        # but it does NOT update the existing row — so if our CSV now has a
+        # different cleared state / memo (e.g. a previously-pending row that
+        # has cleared), the old record stays stale. Fetch the existing rows,
+        # PATCH anything that drifted, and record their YNAB tx IDs locally so
+        # the normal diff path handles them on future imports.
+        if duplicates:
+            dup_txs = [tx for tx in to_create if tx["import_id"] in duplicates]
+            # Fetch only the window we care about to keep the GET cheap
+            earliest = min(tx["date"] for tx in dup_txs)
+            try:
+                existing_map = _fetch_ynab_txns_by_import_id(
+                    token, budget_id, account_id, duplicates, since_date=earliest,
+                )
+            except Exception as e:
+                print(f"    ⚠ Could not fetch existing duplicates for patch: {e}")
+                existing_map = {}
+
+            dup_patched = 0
+            for tx in dup_txs:
+                existing = existing_map.get(tx["import_id"])
+                if not existing:
+                    db_upsert(conn, tx)
+                    continue
+
+                ynab_tx_id = existing.get("id")
+                incoming_memo = tx.get("memo") or ""
+                existing_memo = existing.get("memo") or ""
+                drift = (
+                    existing.get("cleared", "uncleared") != tx["cleared"]
+                    or existing.get("amount", 0) != tx["amount"]
+                    or existing_memo != incoming_memo
+                )
+                if drift and ynab_tx_id:
+                    update_body = {
+                        "transaction": {
+                            "amount": tx["amount"],
+                            "cleared": tx["cleared"],
+                            "memo": incoming_memo or None,
+                        }
+                    }
+                    try:
+                        ynab_request(
+                            "PATCH",
+                            f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
+                            token, update_body,
+                        )
+                        dup_patched += 1
+                        log.info(
+                            "tx drift-fix date=%s amount=%+.2f payee=%s "
+                            "cleared=%s→%s memo=%r→%r import_id=%s ynab_id=%s",
+                            tx["date"], tx["amount"] / 1000,
+                            tx.get("payee_name", ""),
+                            existing.get("cleared", "uncleared"), tx["cleared"],
+                            existing_memo, incoming_memo,
+                            tx["import_id"], ynab_tx_id,
+                        )
+                    except Exception as e:
+                        print(f"    ⚠ Failed to patch {ynab_tx_id}: {e}")
+
+                # Record locally either way so future imports have the ynab_tx_id
+                db_upsert(conn, tx, ynab_tx_id=ynab_tx_id)
+
+            if dup_patched:
+                print(f"    ↻ Patched:   {dup_patched} drifted (pending→cleared / memo / amount)")
 
         conn.commit()
 
@@ -1801,6 +1944,8 @@ def main():
     parser.add_argument("--ibkr-base-url", help="IB Gateway URL (or set IBKR_BASE_URL; default: https://localhost:5050)")
     parser.add_argument("--reconcile", action="store_true",
                         help="Reconcile YNAB cleared balance to the CSV's running Balance column")
+    parser.add_argument("--cleanup-pending-memos", action="store_true",
+                        help="Scan YNAB for transactions marked cleared with a stale '(pending)' memo and strip the marker")
     parser.add_argument("--log-level", help="Log level: DEBUG, INFO, WARNING, ERROR (or set LOG_LEVEL)")
     parser.add_argument("--log-file", help="Path to log file (or set LOG_FILE; \"\" disables file logging)")
     parser.add_argument("--csv-dir",
@@ -1938,6 +2083,14 @@ def main():
             print("Error: --budget-id and --account-id required for watch mode.")
             sys.exit(1)
         watch_folder(args.watch, token, budget_id, account_id)
+        return
+
+    # ── Cleanup stale '(pending)' memos ──
+    if args.cleanup_pending_memos:
+        if not budget_id or not account_id:
+            print("Error: --budget-id and --account-id required to cleanup pending memos.")
+            sys.exit(1)
+        cleanup_pending_memos(token, budget_id, account_id, dry_run=args.dry_run)
         return
 
     # ── Reconcile from CSV running balance ──

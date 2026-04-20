@@ -7,6 +7,7 @@ Share a Revolut CSV from your phone → Telegram → bot processes it → done.
 User commands:
   (send a CSV file)  — Import transactions into YNAB
   /reconcile         — Reconcile YNAB cleared balance against the last uploaded CSV
+  /cleanup_pending   — Strip stale "(pending)" memos from cleared YNAB transactions
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
   /crypto            — Sync crypto portfolio value → YNAB tracking account
@@ -53,7 +54,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 
 def get_version_info():
@@ -397,6 +398,8 @@ class RevolutYNABBot:
             cmd = text.split()[0].lower().split("@")[0]
             if cmd == "/reconcile":
                 self._handle_reconcile(chat_id, sender_id)
+            elif cmd == "/cleanup_pending":
+                self._handle_cleanup_pending(chat_id, sender_id)
             elif cmd == "/status":
                 self._handle_status(chat_id, sender_id)
             elif cmd == "/setup":
@@ -670,6 +673,7 @@ class RevolutYNABBot:
             f"*Revolut → YNAB Bot* — {format_version_line()}\n",
             "📎 *Send a CSV* — Import Revolut transactions into YNAB",
             "🧮 /reconcile — Reconcile YNAB balance against last CSV",
+            "🧹 /cleanup\\_pending — Strip stale '(pending)' memos from cleared txns",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
             "🪙 /crypto — Sync crypto portfolio value to YNAB",
@@ -858,6 +862,42 @@ class RevolutYNABBot:
                 continue
             parts.append(line)
         return "\n".join(parts) if parts else "Reconciliation complete."
+
+    # ── /cleanup_pending ─────────────────────────────────────────────────
+
+    def _handle_cleanup_pending(self, chat_id, sender_id):
+        cfg = self._user_config(sender_id)
+        if not cfg:
+            tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
+            return
+
+        tg_send(self.token, chat_id,
+                "🧹 Scanning YNAB for stale '(pending)' memos...", None)
+
+        try:
+            buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                patched = ynab.cleanup_pending_memos(
+                    cfg["ynab_token"], cfg["budget_id"], cfg["account_id"],
+                )
+            finally:
+                sys.stdout = old_stdout
+        except (Exception, SystemExit) as e:
+            ynab.log.error("bot: cleanup_pending failed for user %s: %s",
+                           sender_id, traceback.format_exc())
+            msg = f"exit({e.code})" if isinstance(e, SystemExit) else str(e)
+            tg_send(self.token, chat_id, f"Cleanup failed: {msg}", None)
+            return
+
+        if patched == 0:
+            tg_send(self.token, chat_id,
+                    "✓ No stale '(pending)' memos found.", None)
+        else:
+            tg_send(self.token, chat_id,
+                    f"✓ Cleaned {patched} stale '(pending)' memo"
+                    f"{'s' if patched != 1 else ''}.", None)
 
     # ── /status ──────────────────────────────────────────────────────────
 

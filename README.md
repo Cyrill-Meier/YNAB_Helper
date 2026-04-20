@@ -102,6 +102,7 @@ Everything below is sent from your personal Telegram to the bot.
 |---|---|
 | *(send a CSV attachment)* | Import a Revolut statement into YNAB. The bot diffs against past imports so duplicates are skipped. |
 | `/reconcile` | Reconcile the YNAB balance against the last CSV you uploaded. |
+| `/cleanup_pending` | Scan YNAB and strip `(pending)` memos from transactions that have since cleared. Useful after a fresh deploy or DB wipe. |
 | `/status` | Show current YNAB balance and last-import state. |
 | `/setup` | Re-run onboarding — change your YNAB token, budget, or account. |
 | `/crypto` | Refresh BTC + ETH + ERC-20 balances, update the tracking account. |
@@ -230,6 +231,10 @@ python3 revolut_to_ynab.py --sync --since-date 2026-01-01
 
 # Reconcile local state against YNAB balance
 python3 revolut_to_ynab.py --reconcile
+
+# Strip stale "(pending)" memos from transactions that have since cleared
+python3 revolut_to_ynab.py --cleanup-pending-memos
+python3 revolut_to_ynab.py --cleanup-pending-memos --dry-run
 
 # Crypto sync
 python3 revolut_to_ynab.py --crypto-sync
@@ -419,6 +424,8 @@ Bot data lives in the `bot_data/` directory (mounted as a Docker volume). Each u
 ### Deduplication
 
 Each transaction gets an `import_id` derived from its date, amount, and payee. YNAB drops duplicates on re-import, so running the same CSV twice is a no-op. The crypto sync uses a date-stamped `import_id` so re-runs within a day update the same adjustment rather than stacking new ones.
+
+**Pending → cleared drift.** When a row is first imported while still pending, its memo gets a `(pending)` tag and `cleared=uncleared`. On a later CSV where that row has cleared, the importer normally sees the state change in the local DB and issues a `PATCH` to strip the marker and flip `cleared`. If the local DB was wiped (fresh VM, deleted volume, etc.), that record is missing — the importer re-POSTs, YNAB returns it as a duplicate, and without intervention the original stale row would stay. The importer now fetches duplicates and patches any whose `cleared` / `memo` / `amount` has drifted. To clean up historic drift that predates this fix, run `/cleanup_pending` (bot) or `--cleanup-pending-memos` (CLI).
 
 ### Auto-update flow
 

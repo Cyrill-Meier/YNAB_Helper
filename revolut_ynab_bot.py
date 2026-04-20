@@ -54,7 +54,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.9"
+__version__ = "1.1.10"
 
 
 def get_version_info():
@@ -871,8 +871,14 @@ class RevolutYNABBot:
             tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
             return
 
+        # Use the last uploaded CSV to also flip cleared state where the CSV
+        # confirms the row has cleared on Revolut's side.
+        csv_path = self._last_csv.get(sender_id)
+        csv_arg = str(csv_path) if csv_path and csv_path.exists() else None
+
+        hint = f" against _{csv_path.name}_" if csv_arg else " (no CSV — memo-only)"
         tg_send(self.token, chat_id,
-                "🧹 Scanning YNAB for stale '(pending)' memos...", None)
+                f"🧹 Scanning YNAB for stale '(pending)' memos{hint}...", None)
 
         try:
             buf = io.StringIO()
@@ -881,6 +887,7 @@ class RevolutYNABBot:
             try:
                 patched = ynab.cleanup_pending_memos(
                     cfg["ynab_token"], cfg["budget_id"], cfg["account_id"],
+                    csv_path=csv_arg,
                 )
             finally:
                 sys.stdout = old_stdout

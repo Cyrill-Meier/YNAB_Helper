@@ -612,15 +612,39 @@ def _strip_pending_marker(memo):
     return cleaned.strip(" |")
 
 
-def cleanup_pending_memos(token, budget_id, account_id, dry_run=False):
-    """Patch YNAB transactions where cleared=cleared but memo still contains '(pending)'.
+def cleanup_pending_memos(token, budget_id, account_id, csv_path=None, dry_run=False):
+    """Strip stale '(pending)' memos from YNAB transactions.
 
-    After a local-DB wipe (e.g. VM redeploy) previously-pending transactions that
-    have since cleared on Revolut's side won't be PATCHed by import_and_track —
-    YNAB's import_id dedup skips them on the POST. This helper scans the account
-    and strips the stale marker directly.
+    Any YNAB row whose memo contains '(pending)' is considered stale — the
+    importer adds that marker on first import and relies on a subsequent CSV
+    to flip it off. After a local-DB wipe (e.g. VM redeploy) that subsequent
+    flip never happens for rows that YNAB's import_id dedup rejects.
+
+    If `csv_path` is provided, the latest CSV is used to also flip each tx's
+    `cleared` state when Revolut now reports it as COMPLETED. Rows the CSV
+    confirms are still PENDING are left untouched. Rows not present in the
+    CSV (e.g. ancient / out-of-window) have their memo stripped but cleared
+    state left alone.
     """
     print(f"\n🧹 Scanning account for stale '(pending)' memos...")
+
+    # Optional CSV cross-reference: build import_id → (cleared, pending_flag) map
+    csv_state = {}
+    if csv_path:
+        try:
+            csv_txs = parse_revolut_csv(str(csv_path))
+            for tx in csv_txs:
+                csv_state[tx["import_id"]] = {
+                    "cleared": tx["cleared"],
+                    "is_pending": tx["_state"] == "PENDING",
+                    "memo": tx.get("memo") or "",
+                    "amount": tx["amount"],
+                }
+            print(f"   Cross-referencing against {len(csv_state)} row(s) from {Path(csv_path).name}.")
+        except Exception as e:
+            print(f"   ⚠ Could not parse CSV for cross-reference: {e}")
+            csv_state = {}
+
     path = f"/budgets/{budget_id}/accounts/{account_id}/transactions"
     result = ynab_request("GET", path, token)
     txns = result.get("data", {}).get("transactions", [])
@@ -628,42 +652,70 @@ def cleanup_pending_memos(token, budget_id, account_id, dry_run=False):
 
     stale = [
         t for t in txns
-        if not t.get("deleted")
-        and t.get("cleared") == "cleared"
-        and "(pending)" in (t.get("memo") or "")
+        if not t.get("deleted") and "(pending)" in (t.get("memo") or "")
     ]
 
     if not stale:
         print(f"   ✓ No stale '(pending)' memos — nothing to do.")
         return 0
 
-    print(f"   Found {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'}.")
+    # Skip rows the CSV confirms are still PENDING (don't strip their marker)
+    actionable = []
+    still_pending = 0
+    for t in stale:
+        iid = t.get("import_id")
+        if iid and iid in csv_state and csv_state[iid]["is_pending"]:
+            still_pending += 1
+            continue
+        actionable.append(t)
+
+    print(f"   Found {len(stale)} stale entr{'y' if len(stale) == 1 else 'ies'}; "
+          f"{len(actionable)} actionable, {still_pending} still pending per CSV.")
+
+    if not actionable:
+        return 0
 
     if dry_run:
         print(f"\n   Would patch (dry-run):")
-        for t in stale[:20]:
+        for t in actionable[:20]:
             amt = t["amount"] / 1000
-            print(f"    ↻ {t['date']}  {amt:>10.2f}  {t.get('payee_name', '')}")
-        if len(stale) > 20:
-            print(f"    …and {len(stale) - 20} more.")
-        return len(stale)
+            iid = t.get("import_id")
+            csv_row = csv_state.get(iid) if iid else None
+            flip = " → cleared" if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") != "cleared" else ""
+            print(f"    ↻ {t['date']}  {amt:>10.2f}  {t.get('payee_name', '')}{flip}")
+        if len(actionable) > 20:
+            print(f"    …and {len(actionable) - 20} more.")
+        return len(actionable)
 
     patched = 0
-    for t in stale:
+    flipped = 0
+    for t in actionable:
         new_memo = _strip_pending_marker(t.get("memo") or "")
-        update_body = {"transaction": {"memo": new_memo or None}}
+        update = {"memo": new_memo or None}
+
+        # If the CSV confirms this row has cleared on Revolut, flip cleared too
+        iid = t.get("import_id")
+        csv_row = csv_state.get(iid) if iid else None
+        if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") != "cleared":
+            update["cleared"] = "cleared"
+            flipped += 1
+
         try:
             ynab_request(
                 "PATCH",
                 f"/budgets/{budget_id}/transactions/{t['id']}",
-                token, update_body,
+                token, {"transaction": update},
             )
             patched += 1
-            log.info("cleanup tx   id=%s memo: %r → %r", t["id"], t.get("memo"), new_memo)
+            log.info(
+                "cleanup tx   id=%s memo: %r → %r cleared: %s → %s",
+                t["id"], t.get("memo"), new_memo,
+                t.get("cleared"), update.get("cleared", t.get("cleared")),
+            )
         except Exception as e:
             print(f"    ⚠ Failed to patch {t['id']}: {e}")
 
-    print(f"   ✓ Cleaned {patched} memo(s).")
+    print(f"   ✓ Cleaned {patched} memo(s){f', flipped {flipped} to cleared' if flipped else ''}.")
     return patched
 
 
@@ -2090,7 +2142,19 @@ def main():
         if not budget_id or not account_id:
             print("Error: --budget-id and --account-id required to cleanup pending memos.")
             sys.exit(1)
-        cleanup_pending_memos(token, budget_id, account_id, dry_run=args.dry_run)
+        # Try to auto-detect a CSV for cross-reference (non-fatal if none found)
+        csv_for_cleanup = None
+        if args.csv_file:
+            csv_for_cleanup = Path(args.csv_file).expanduser().resolve()
+        else:
+            latest = find_latest_revolut_csv(csv_dir)
+            if latest:
+                csv_for_cleanup = latest.resolve()
+        cleanup_pending_memos(
+            token, budget_id, account_id,
+            csv_path=str(csv_for_cleanup) if csv_for_cleanup else None,
+            dry_run=args.dry_run,
+        )
         return
 
     # ── Reconcile from CSV running balance ──

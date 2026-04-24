@@ -10,6 +10,7 @@ User commands:
   /cleanup_pending   — Strip stale "(pending)" memos from cleared YNAB transactions
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
+  /auto_approve on|off — Toggle whether imported txns are auto-approved
   /crypto            — Sync crypto portfolio value → YNAB tracking account
   /crypto_setup      — Configure BTC xpub, ETH address, crypto tracking account
   /crypto_status     — Show current crypto configuration
@@ -54,7 +55,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.11"
+__version__ = "1.1.12"
 
 
 def get_version_info():
@@ -164,6 +165,7 @@ def init_user_db(db_path):
             crypto_account_name TEXT,
             btc_xpub            TEXT,
             eth_address         TEXT,
+            auto_approve        INTEGER NOT NULL DEFAULT 1,
             state               TEXT NOT NULL DEFAULT 'pending',
             temp_data           TEXT,
             created_at          TEXT NOT NULL,
@@ -177,6 +179,12 @@ def init_user_db(db_path):
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError:
             pass  # column already exists
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 1"
+        )
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     return conn
 
@@ -411,6 +419,8 @@ class RevolutYNABBot:
                         "Please send me your YNAB Personal Access Token.\n"
                         "(Get it from app.ynab.com → Account Settings → Developer Settings)",
                         None)
+            elif cmd == "/auto_approve":
+                self._handle_auto_approve(chat_id, sender_id, text)
             elif cmd == "/crypto":
                 self._handle_crypto(chat_id, sender_id)
             elif cmd == "/crypto_setup":
@@ -666,6 +676,35 @@ class RevolutYNABBot:
         ynab.log.info("bot: user %s onboarding complete — budget=%s account=%s",
                       sender_id, user["budget_name"], selected["name"])
 
+    # ── /auto_approve ────────────────────────────────────────────────────
+
+    def _handle_auto_approve(self, chat_id, sender_id, text):
+        """Show or toggle whether imported transactions are marked approved."""
+        parts = text.split()
+        arg = parts[1].lower() if len(parts) > 1 else ""
+
+        if arg in ("on", "true", "1", "yes"):
+            new_val = 1
+        elif arg in ("off", "false", "0", "no"):
+            new_val = 0
+        elif arg == "":
+            user = get_user(self.db, sender_id)
+            current = bool(user.get("auto_approve", 1)) if user else True
+            tg_send(self.token, chat_id,
+                    f"Auto-approve is currently *{'ON' if current else 'OFF'}*.\n\n"
+                    f"Usage: `/auto\\_approve on` or `/auto\\_approve off`\n"
+                    f"When OFF, imported transactions land in YNAB's inbox "
+                    f"as unapproved for manual review.")
+            return
+        else:
+            tg_send(self.token, chat_id,
+                    "Usage: `/auto\\_approve on` or `/auto\\_approve off`")
+            return
+
+        upsert_user(self.db, sender_id, auto_approve=new_val)
+        tg_send(self.token, chat_id,
+                f"✅ Auto-approve set to *{'ON' if new_val else 'OFF'}*.")
+
     # ── /help ────────────────────────────────────────────────────────────
 
     def _handle_help(self, chat_id, sender_id):
@@ -676,6 +715,7 @@ class RevolutYNABBot:
             "🧹 /cleanup\\_pending — Strip stale '(pending)' memos from cleared txns",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
+            "✅ /auto\\_approve `on|off` — Toggle auto-approval of imported txns",
             "🪙 /crypto — Sync crypto portfolio value to YNAB",
             "🛠 /crypto\\_setup — Configure BTC xpub / ETH address / tracking account",
             "🔍 /crypto\\_status — Show current crypto configuration",
@@ -747,6 +787,11 @@ class RevolutYNABBot:
         if not transactions:
             tg_send(self.token, chat_id, "CSV parsed but contains no transactions.", None)
             return
+
+        user = get_user(self.db, sender_id)
+        auto_approve = bool(user.get("auto_approve", 1)) if user else True
+        for tx in transactions:
+            tx["approved"] = auto_approve
 
         n_total = len(transactions)
         n_pending = sum(1 for t in transactions if t.get("cleared") != "cleared")

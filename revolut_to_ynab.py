@@ -510,6 +510,14 @@ def parse_revolut_csv(filepath):
                 print(f"  ⚠ Skipping row with invalid amount: {row.get('Amount')}")
                 continue
 
+            try:
+                fee_val = float(row.get("Fee", "0") or "0")
+            except ValueError:
+                fee_val = 0.0
+
+            if fee_val:
+                amount -= fee_val
+
             milliunit_amount = int(round(amount * 1000))
 
             payee = row.get("Description", "").strip()
@@ -524,9 +532,8 @@ def parse_revolut_csv(filepath):
                 memo_parts.append(tx_type)
             if state == "PENDING":
                 memo_parts.append("(pending)")
-            fee = row.get("Fee", "0")
-            if fee and float(fee) != 0:
-                memo_parts.append(f"Fee: {fee}")
+            if fee_val:
+                memo_parts.append(f"Fee: {fee_val}")
             memo = " | ".join(memo_parts) if memo_parts else ""
 
             # YNAB-native import_id format for deduplication

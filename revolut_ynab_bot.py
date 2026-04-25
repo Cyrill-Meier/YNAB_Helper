@@ -8,6 +8,9 @@ User commands:
   (send a CSV file)  — Import transactions into YNAB
   /reconcile         — Reconcile YNAB cleared balance against the last uploaded CSV
   /cleanup_pending   — Strip stale "(pending)" memos from cleared YNAB transactions
+  /dedupe            — Scan YNAB for orphaned duplicate imports in last CSV's range
+  /dedupe_delete ... — Delete selected orphans (e.g. "1,3,5" or "all")
+  /dedupe_cancel     — Discard the pending dedupe selection
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
   /auto_approve on|off — Toggle whether imported txns are auto-approved
@@ -55,7 +58,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.12"
+__version__ = "1.1.13"
 
 
 def get_version_info():
@@ -257,6 +260,9 @@ class RevolutYNABBot:
         self._tmp_dir = Path(tempfile.mkdtemp(prefix="revolut_bot_"))
         # Per-user last CSV cache: {telegram_id: Path}
         self._last_csv = {}
+        # Per-user dedupe candidates from the last /dedupe scan:
+        # {telegram_id: [orphan_dict, ...]}
+        self._dedupe_candidates = {}
         # In-memory guard against double-processing a single update_id
         # (belt-and-suspenders alongside the persisted offset).
         self._seen_updates = set()
@@ -408,6 +414,12 @@ class RevolutYNABBot:
                 self._handle_reconcile(chat_id, sender_id)
             elif cmd == "/cleanup_pending":
                 self._handle_cleanup_pending(chat_id, sender_id)
+            elif cmd == "/dedupe":
+                self._handle_dedupe(chat_id, sender_id)
+            elif cmd == "/dedupe_delete":
+                self._handle_dedupe_delete(chat_id, sender_id, text)
+            elif cmd == "/dedupe_cancel":
+                self._handle_dedupe_cancel(chat_id, sender_id)
             elif cmd == "/status":
                 self._handle_status(chat_id, sender_id)
             elif cmd == "/setup":
@@ -713,6 +725,7 @@ class RevolutYNABBot:
             "📎 *Send a CSV* — Import Revolut transactions into YNAB",
             "🧮 /reconcile — Reconcile YNAB balance against last CSV",
             "🧹 /cleanup\\_pending — Strip stale '(pending)' memos from cleared txns",
+            "🔎 /dedupe — Find orphaned duplicate imports for the last CSV",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
             "✅ /auto\\_approve `on|off` — Toggle auto-approval of imported txns",
@@ -950,6 +963,190 @@ class RevolutYNABBot:
             tg_send(self.token, chat_id,
                     f"✓ Cleaned {patched} stale '(pending)' memo"
                     f"{'s' if patched != 1 else ''}.", None)
+
+    # ── /dedupe ──────────────────────────────────────────────────────────
+
+    _DEDUPE_LIST_MAX = 50  # max candidates to show in one message
+
+    def _handle_dedupe(self, chat_id, sender_id):
+        """Scan YNAB for orphaned duplicate imports in the last CSV's date range."""
+        cfg = self._user_config(sender_id)
+        if not cfg:
+            tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
+            return
+
+        csv_path = self._last_csv.get(sender_id)
+        if not csv_path or not csv_path.exists():
+            tg_send(self.token, chat_id,
+                    "No CSV available. Send me a Revolut CSV first, "
+                    "then run /dedupe.", None)
+            return
+
+        tg_send(self.token, chat_id,
+                f"🔎 Scanning YNAB for orphaned imports in _{csv_path.name}_...",
+                None)
+
+        try:
+            report = ynab.find_orphaned_imports(
+                cfg["ynab_token"], cfg["budget_id"], cfg["account_id"],
+                str(csv_path),
+            )
+        except Exception as e:
+            ynab.log.error("bot: dedupe scan failed for user %s: %s",
+                           sender_id, traceback.format_exc())
+            tg_send(self.token, chat_id, f"Dedupe scan failed: {e}", None)
+            return
+
+        orphans = report["orphans"]
+        header = (
+            f"📅 Range: {report['start_date']} → {report['end_date']}\n"
+            f"📋 CSV: {report['csv_count']} txns | "
+            f"YNAB in range: {report['ynab_count_in_range']}\n"
+        )
+
+        if not orphans:
+            self._dedupe_candidates.pop(sender_id, None)
+            tg_send(self.token, chat_id,
+                    header + "\n✓ No orphaned imports found.", None)
+            return
+
+        # Cache candidates so /dedupe_delete can act on them by index
+        self._dedupe_candidates[sender_id] = orphans
+
+        lines = [header,
+                 f"⚠ Found *{len(orphans)}* orphaned import"
+                 f"{'s' if len(orphans) != 1 else ''} "
+                 f"(YNAB rows whose import\\_id no longer matches the CSV):\n"]
+        shown = orphans[:self._DEDUPE_LIST_MAX]
+        for i, o in enumerate(shown, 1):
+            amt = o["amount"] / 1000
+            payee = (o["payee_name"] or "?")[:30]
+            lines.append(f"`{i:>2}.` {o['date']}  {amt:>9.2f}  {payee}")
+        if len(orphans) > self._DEDUPE_LIST_MAX:
+            lines.append(f"\n…and {len(orphans) - self._DEDUPE_LIST_MAX} more "
+                         f"(use `/dedupe\\_delete all` to remove every orphan).")
+
+        lines.append(
+            "\nReply with:\n"
+            "  `/dedupe\\_delete 1,3,5` — delete specific rows\n"
+            "  `/dedupe\\_delete all` — delete all listed orphans\n"
+            "  `/dedupe\\_cancel` — discard the list"
+        )
+        tg_send(self.token, chat_id, "\n".join(lines))
+
+    def _handle_dedupe_cancel(self, chat_id, sender_id):
+        had = self._dedupe_candidates.pop(sender_id, None)
+        if had:
+            tg_send(self.token, chat_id, "🗑 Dedupe selection cleared.", None)
+        else:
+            tg_send(self.token, chat_id,
+                    "Nothing pending. Run /dedupe first to scan.", None)
+
+    def _handle_dedupe_delete(self, chat_id, sender_id, text):
+        """Delete orphans selected from the last /dedupe list."""
+        cfg = self._user_config(sender_id)
+        if not cfg:
+            tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
+            return
+
+        candidates = self._dedupe_candidates.get(sender_id) or []
+        if not candidates:
+            tg_send(self.token, chat_id,
+                    "No dedupe candidates pending. Run /dedupe first.", None)
+            return
+
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            tg_send(self.token, chat_id,
+                    "Usage: `/dedupe\\_delete 1,3,5` or `/dedupe\\_delete all`")
+            return
+        arg = parts[1].strip().lower()
+
+        if arg in ("all", "*"):
+            to_delete = list(candidates)
+        else:
+            indices = set()
+            try:
+                for piece in arg.replace(" ", "").split(","):
+                    if not piece:
+                        continue
+                    if "-" in piece:
+                        a, b = piece.split("-", 1)
+                        for i in range(int(a), int(b) + 1):
+                            indices.add(i)
+                    else:
+                        indices.add(int(piece))
+            except ValueError:
+                tg_send(self.token, chat_id,
+                        "Couldn't parse selection. Use numbers like `1,3,5` "
+                        "or a range like `2-4`, or `all`.")
+                return
+
+            invalid = [i for i in indices if i < 1 or i > len(candidates)]
+            if invalid:
+                tg_send(self.token, chat_id,
+                        f"Out-of-range index: {sorted(invalid)} "
+                        f"(valid 1–{len(candidates)}).")
+                return
+            to_delete = [candidates[i - 1] for i in sorted(indices)]
+
+        if not to_delete:
+            tg_send(self.token, chat_id, "Nothing selected.", None)
+            return
+
+        tg_send(self.token, chat_id,
+                f"🗑 Deleting {len(to_delete)} transaction"
+                f"{'s' if len(to_delete) != 1 else ''} from YNAB...", None)
+
+        conn = None
+        try:
+            conn = ynab.init_db(cfg["db_path"])
+        except Exception as e:
+            ynab.log.warning("bot: could not open local DB for dedupe: %s", e)
+
+        deleted = 0
+        failures = []
+        deleted_ids = set()
+        for o in to_delete:
+            try:
+                ynab.delete_ynab_transaction(
+                    conn, cfg["ynab_token"], cfg["budget_id"], o["id"],
+                )
+                deleted += 1
+                deleted_ids.add(o["id"])
+                ynab.log.info(
+                    "bot: dedupe deleted ynab_id=%s date=%s amt=%+.2f payee=%s "
+                    "import_id=%s user=%s",
+                    o["id"], o["date"], o["amount"] / 1000,
+                    o["payee_name"], o["import_id"], sender_id,
+                )
+            except Exception as e:
+                failures.append((o, str(e)))
+                ynab.log.error("bot: dedupe delete failed id=%s: %s", o["id"], e)
+
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        # Drop deleted entries from the cached list so a follow-up call only
+        # sees what remains.
+        remaining = [c for c in candidates if c["id"] not in deleted_ids]
+        if remaining:
+            self._dedupe_candidates[sender_id] = remaining
+        else:
+            self._dedupe_candidates.pop(sender_id, None)
+
+        msg = [f"✓ Deleted {deleted}/{len(to_delete)} transaction(s)."]
+        if failures:
+            msg.append(f"\n⚠ {len(failures)} failed:")
+            for o, err in failures[:5]:
+                msg.append(f"  • {o['date']} {o['payee_name'][:25]}: {err[:80]}")
+        if remaining:
+            msg.append(f"\n{len(remaining)} candidate(s) still pending. "
+                       f"Reply `/dedupe\\_delete ...` again or `/dedupe\\_cancel`.")
+        tg_send(self.token, chat_id, "\n".join(msg))
 
     # ── /status ──────────────────────────────────────────────────────────
 

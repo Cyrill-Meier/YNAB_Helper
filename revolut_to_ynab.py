@@ -480,6 +480,34 @@ def sync_from_ynab(conn, token, budget_id, account_id, since_date=None):
 
 # ─── Revolut CSV parsing ────────────────────────────────────────────────────
 
+_FILENAME_DATE_RANGE_RE = re.compile(
+    r"account-statement_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})", re.IGNORECASE,
+)
+
+
+def parse_csv_date_range(filepath):
+    """Return (start_iso, end_iso) covered by the CSV.
+
+    Tries the Revolut filename pattern
+    ``account-statement_YYYY-MM-DD_YYYY-MM-DD_*.csv`` first; falls back to
+    scanning the parsed transactions for the min/max date. Returns
+    ``(None, None)`` only if both methods fail.
+    """
+    name = Path(filepath).name
+    m = _FILENAME_DATE_RANGE_RE.search(name)
+    if m:
+        return m.group(1), m.group(2)
+
+    try:
+        txs = parse_revolut_csv(filepath)
+    except Exception:
+        return None, None
+    if not txs:
+        return None, None
+    dates = sorted(t["date"] for t in txs)
+    return dates[0], dates[-1]
+
+
 def parse_revolut_csv(filepath):
     """Parse a Revolut account statement CSV into a list of transaction dicts."""
     transactions = []
@@ -724,6 +752,84 @@ def cleanup_pending_memos(token, budget_id, account_id, csv_path=None, dry_run=F
 
     print(f"   ✓ Cleaned {patched} memo(s){f', flipped {flipped} to cleared' if flipped else ''}.")
     return patched
+
+
+def find_orphaned_imports(token, budget_id, account_id, csv_path):
+    """Find YNAB transactions in the CSV's date range that have no matching CSV row.
+
+    These are typically stale imports from an earlier run where the CSV amount
+    later changed (so the regenerated import_id no longer matches). We restrict
+    to transactions whose ``import_id`` starts with ``YNAB:`` (i.e. created by
+    this importer) so we don't flag manually-entered or other-source rows.
+
+    Returns a list of YNAB transaction dicts (id, date, amount, payee_name,
+    memo, import_id) that look like orphaned duplicates.
+    """
+    start_date, end_date = parse_csv_date_range(csv_path)
+    if not start_date or not end_date:
+        raise RuntimeError(
+            "Could not determine the CSV's date range from filename or contents."
+        )
+
+    csv_txs = parse_revolut_csv(csv_path)
+    csv_import_ids = {tx["import_id"] for tx in csv_txs}
+
+    path = (
+        f"/budgets/{budget_id}/accounts/{account_id}/transactions"
+        f"?since_date={start_date}"
+    )
+    result = ynab_request("GET", path, token)
+    ynab_txns = result.get("data", {}).get("transactions", [])
+
+    orphans = []
+    for t in ynab_txns:
+        if t.get("deleted"):
+            continue
+        date = t.get("date") or ""
+        if date < start_date or date > end_date:
+            continue
+        iid = t.get("import_id") or ""
+        if not iid.startswith("YNAB:"):
+            # Only touch rows we know we created
+            continue
+        if iid in csv_import_ids:
+            continue
+        orphans.append({
+            "id": t.get("id"),
+            "date": date,
+            "amount": t.get("amount", 0),
+            "payee_name": t.get("payee_name") or "",
+            "memo": t.get("memo") or "",
+            "import_id": iid,
+            "cleared": t.get("cleared"),
+        })
+
+    orphans.sort(key=lambda x: (x["date"], x["payee_name"]))
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "csv_count": len(csv_txs),
+        "ynab_count_in_range": sum(
+            1 for t in ynab_txns
+            if not t.get("deleted")
+            and start_date <= (t.get("date") or "") <= end_date
+        ),
+        "orphans": orphans,
+    }
+
+
+def delete_ynab_transaction(conn, token, budget_id, ynab_tx_id):
+    """Delete a YNAB transaction and remove its local DB row.
+
+    ``conn`` may be ``None`` to skip local DB cleanup. Raises on API failure.
+    """
+    ynab_request("DELETE", f"/budgets/{budget_id}/transactions/{ynab_tx_id}", token)
+    if conn is not None:
+        try:
+            conn.execute("DELETE FROM transactions WHERE ynab_tx_id = ?", (ynab_tx_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            log.warning("dedupe: could not remove local row for %s: %s", ynab_tx_id, e)
 
 
 def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=False):

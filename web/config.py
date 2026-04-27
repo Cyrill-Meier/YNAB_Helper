@@ -46,6 +46,10 @@ class WebConfig:
     session_absolute_ttl: int = 12 * 3600  # max wall-clock for any session
     allowed_ips: List = field(default_factory=list)  # ip_network objects
     data_dir: Path = field(default_factory=lambda: Path("./bot_data"))
+    # Bot token — used by /auth to call Telegram's deleteMessage on the
+    # original /login DM after the user signs in. Optional: if blank, the
+    # auto-delete is skipped silently.
+    bot_token: str = ""
 
     @classmethod
     def from_env(cls, data_dir):
@@ -62,6 +66,7 @@ class WebConfig:
             ),
             allowed_ips=_parse_networks(os.environ.get("WEB_UI_ALLOWED_IPS", "")),
             data_dir=Path(data_dir),
+            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
         )
         return cfg
 

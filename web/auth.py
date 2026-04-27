@@ -42,19 +42,41 @@ def issue_login_token(conn, telegram_id, ttl_seconds, ip=None, user_agent=None):
     return token
 
 
+def attach_tg_message(conn, token, tg_chat_id, tg_message_id):
+    """Record which Telegram message contained this login URL.
+
+    Used so that ``consume_login_token`` can hand the chat/message IDs
+    back to the web server, which then deletes the DM via Telegram's
+    ``deleteMessage`` once the user has successfully exchanged the URL
+    for a cookie session.
+    """
+    if not (tg_chat_id and tg_message_id):
+        return
+    conn.execute(
+        "UPDATE web_sessions SET tg_chat_id = ?, tg_message_id = ? "
+        "WHERE token_hash = ? AND kind = 'login'",
+        (int(tg_chat_id), int(tg_message_id), hash_token(token)),
+    )
+    conn.commit()
+
+
 def consume_login_token(conn, token, ip=None, user_agent=None,
                         session_ttl=1800, absolute_ttl=12 * 3600):
     """Validate + delete a one-shot login token, then mint a session token.
 
-    Returns (telegram_id, session_token, expires_at) on success, or None.
+    Returns ``(telegram_id, session_token, expires_at, tg_chat_id,
+    tg_message_id)`` on success, or ``None``. The tg_* fields may be
+    ``None`` if the bot didn't record them (e.g. older login tokens
+    minted before the column existed, or sendMessage didn't return the
+    message_id).
     """
     if not token:
         return None
     h = hash_token(token)
     now = time.time()
     row = conn.execute(
-        "SELECT telegram_id, expires_at FROM web_sessions "
-        "WHERE token_hash = ? AND kind = 'login'",
+        "SELECT telegram_id, expires_at, tg_chat_id, tg_message_id "
+        "FROM web_sessions WHERE token_hash = ? AND kind = 'login'",
         (h,),
     ).fetchone()
     if not row:
@@ -65,6 +87,8 @@ def consume_login_token(conn, token, ip=None, user_agent=None,
         conn.commit()
         return None
     telegram_id = row["telegram_id"]
+    tg_chat_id = row["tg_chat_id"] if "tg_chat_id" in row.keys() else None
+    tg_message_id = row["tg_message_id"] if "tg_message_id" in row.keys() else None
     # Burn the login token immediately — single use.
     conn.execute("DELETE FROM web_sessions WHERE token_hash = ?", (h,))
 
@@ -79,7 +103,7 @@ def consume_login_token(conn, token, ip=None, user_agent=None,
          (user_agent or "")[:200], (ip or "")[:64]),
     )
     conn.commit()
-    return telegram_id, session_token, expires
+    return telegram_id, session_token, expires, tg_chat_id, tg_message_id
 
 
 def lookup_session(conn, token, sliding_ttl=1800, absolute_ttl=12 * 3600):

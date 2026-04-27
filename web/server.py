@@ -261,8 +261,19 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
                 status_code=400,
             )
 
-        telegram_id, session_token, expires_at = res
+        telegram_id, session_token, expires_at, tg_chat_id, tg_msg_id = res
         log.info("web: session issued user=%s ip=%s", telegram_id, ip)
+
+        # Fire-and-forget: ask Telegram to delete the original /login DM
+        # so the URL doesn't sit forever in the user's chat history.
+        # Runs on a daemon thread so the redirect to /app isn't blocked
+        # by Telegram's response time.
+        if cfg.bot_token and tg_chat_id and tg_msg_id:
+            threading.Thread(
+                target=_delete_login_message,
+                args=(cfg.bot_token, tg_chat_id, tg_msg_id, log),
+                daemon=True,
+            ).start()
 
         resp = RedirectResponse(url="/app", status_code=302)
         # HttpOnly so JS can't read it; SameSite=Lax so the cross-site
@@ -714,6 +725,43 @@ def _user_summary(user):
         "auto_approve": bool(user.get("auto_approve", 1)),
         "session_expires_at": user.get("_session_expires_at"),
     }
+
+
+def _delete_login_message(bot_token, chat_id, message_id, log):
+    """Best-effort: delete the bot's /login DM after the user signs in.
+
+    Runs on a daemon thread; we never raise out of here. Telegram bots
+    can delete their own messages within 48 hours, so this should
+    succeed unless the user has already deleted the chat or revoked the
+    bot. Failures are logged at INFO and otherwise ignored.
+    """
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
+        body = json.dumps(
+            {"chat_id": int(chat_id), "message_id": int(message_id)}
+        ).encode("utf-8")
+        from urllib.request import Request
+        from urllib.error import HTTPError, URLError
+        from urllib.request import urlopen
+        req = Request(url, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urlopen(req, timeout=8) as resp:
+                _ = resp.read()
+            log.info(
+                "web: deleted /login DM chat=%s msg=%s after sign-in",
+                chat_id, message_id,
+            )
+        except HTTPError as e:
+            err = e.read().decode("utf-8", "replace")
+            log.info(
+                "web: deleteMessage chat=%s msg=%s failed (%s): %s",
+                chat_id, message_id, e.code, err[:200],
+            )
+        except URLError as e:
+            log.info("web: deleteMessage network error: %s", e)
+    except Exception as e:
+        log.warning("web: _delete_login_message crashed: %s", e)
 
 
 def _bot_version_line():

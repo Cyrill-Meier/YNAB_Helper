@@ -57,7 +57,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.15"
+__version__ = "1.1.16"
 
 
 def get_version_info():
@@ -124,8 +124,30 @@ def tg_send(token, chat_id, text, parse_mode="Markdown", reply_markup=None):
         # Only attach the keyboard to the final chunk
         if reply_markup is not None and i == len(chunks) - 1:
             data["reply_markup"] = reply_markup
-        last = tg_request(token, "sendMessage", data)
+        result = tg_request(token, "sendMessage", data)
+        # If Markdown parsing failed (e.g. an unmatched underscore inside
+        # the text), Telegram drops the whole message — making the bot
+        # appear silent. Retry once as plain text so the user always
+        # sees *something* and we don't have to chase every stray '_'.
+        if (parse_mode and not result.get("ok")
+                and _looks_like_parse_error(result.get("description", ""))):
+            ynab.log.warning(
+                "Telegram rejected Markdown; retrying without parse_mode. "
+                "Description: %s", result.get("description"),
+            )
+            data.pop("parse_mode", None)
+            result = tg_request(token, "sendMessage", data)
+        last = result
     return last
+
+
+def _looks_like_parse_error(description):
+    if not description:
+        return False
+    d = description.lower()
+    return ("can't parse entities" in d
+            or "can't find end" in d
+            or "parse_mode" in d)
 
 
 def tg_edit_message(token, chat_id, message_id, text=None,
@@ -139,7 +161,16 @@ def tg_edit_message(token, chat_id, message_id, text=None,
     if reply_markup is not None:
         data["reply_markup"] = reply_markup
     method = "editMessageText" if text is not None else "editMessageReplyMarkup"
-    return tg_request(token, method, data)
+    result = tg_request(token, method, data)
+    if (text is not None and parse_mode and not result.get("ok")
+            and _looks_like_parse_error(result.get("description", ""))):
+        ynab.log.warning(
+            "Telegram rejected Markdown on edit; retrying without parse_mode. "
+            "Description: %s", result.get("description"),
+        )
+        data.pop("parse_mode", None)
+        result = tg_request(token, method, data)
+    return result
 
 
 def tg_answer_callback(token, callback_query_id, text=None, show_alert=False):
@@ -1100,6 +1131,15 @@ class RevolutYNABBot:
 
         text, markup = self._render_dedupe_message(state)
         result = tg_send(self.token, chat_id, text, "Markdown", markup)
+        if not result or not result.get("ok"):
+            self._dedupe_candidates.pop(sender_id, None)
+            desc = (result or {}).get("description", "unknown error")
+            ynab.log.error("bot: dedupe keyboard send failed: %s", desc)
+            tg_send(self.token, chat_id,
+                    f"Couldn't post the dedupe picker: {desc}\n"
+                    f"Check the bot logs (`docker compose logs bot --tail 50`).",
+                    None)
+            return
         try:
             state["message_id"] = result["result"]["message_id"]
         except (KeyError, TypeError):
@@ -1151,7 +1191,7 @@ class RevolutYNABBot:
             f"YNAB in range: {report['ynab_count_in_range']}\n\n"
             f"⚠ Found *{total}* orphaned import"
             f"{'s' if total != 1 else ''} "
-            f"(YNAB rows whose import_id no longer matches the CSV).\n"
+            f"(YNAB rows whose `import_id` no longer matches the CSV).\n"
             f"Tick the rows to delete, then press 🗑."
         )
         if page_count > 1:

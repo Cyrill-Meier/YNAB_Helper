@@ -156,7 +156,11 @@
     telegramId: {{ user.telegram_id }},
   };
 </script>
-<script src="/static/app.js" defer></script>
+{# `app.js` must NOT be `defer` here. Per-page templates emit inline
+   `<script>RYNAB.boot(…)</script>` blocks below this tag, and inline
+   scripts run synchronously during parsing while deferred scripts run
+   after parsing finishes — so deferring app.js races the bootstraps. #}
+<script src="/static/app.js"></script>
 {% block extra_scripts %}{% endblock %}
 </body>
 </html>

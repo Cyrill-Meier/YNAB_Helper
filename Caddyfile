@@ -1,0 +1,44 @@
+# Caddy reverse proxy + automatic Let's Encrypt for the Revolut → YNAB
+# bot's web UI.
+#
+# IMPORTANT: replace `bot.example.com` below with your real hostname
+# before deploying. Caddy uses it both as the SNI / vhost match and as
+# the ACME identifier for the Let's Encrypt cert request.
+#
+# ──────────────────────────────────────────────────────────────────────
+# (Optional) Global options.
+# Uncomment `email` and put your address — Let's Encrypt sends expiry
+# warnings there if cert renewal ever fails.
+# ──────────────────────────────────────────────────────────────────────
+{
+	# email you@example.com
+	# acme_ca https://acme-v02.api.letsencrypt.org/directory   # default
+	# Uncomment for staging when iterating on Caddyfile changes:
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+bot.example.com {
+	# Reverse proxy to the bot's web UI on the internal docker network.
+	# The bot listens on 8080 inside its container; the service name
+	# `revolut-ynab-bot` resolves via Docker's DNS.
+	reverse_proxy revolut-ynab-bot:8080
+
+	# Sensible defaults: HSTS (1 year), referrer policy, no MIME sniffing.
+	# These are public-facing best practices for any HTTPS-only app.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+		# Don't leak that we're Caddy (cosmetic; doesn't change security).
+		-Server
+	}
+
+	# Compact log line per request — easy to grep in
+	# `docker compose logs caddy`. Comment out if you want zero access
+	# logs (Caddy's defaults are fine too).
+	log {
+		output stdout
+		format console
+	}
+}

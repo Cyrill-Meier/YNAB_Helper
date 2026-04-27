@@ -756,6 +756,14 @@ def serve_in_thread(config: WebConfig, bot_db_path, log: logging.Logger,
         port=config.port,
         log_level="warning",
         access_log=False,
+        # Caddy (and any future reverse proxy) sits in front of us and
+        # adds X-Forwarded-For / X-Forwarded-Proto. Tell uvicorn to honor
+        # those headers regardless of the immediate peer IP — without
+        # this, request.client.host returns Caddy's docker IP, breaking
+        # both audit logs and the per-IP rate limiter (everyone shares
+        # one bucket).
+        proxy_headers=True,
+        forwarded_allow_ips="*",
         # Keep the loop simple — no reload.
     )
     server = uvicorn.Server(cfg)

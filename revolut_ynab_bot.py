@@ -61,7 +61,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 
 def get_version_info():
@@ -140,11 +140,17 @@ def tg_request(token, method, data=None, timeout=60):
         return {"ok": False, "description": str(e)}
 
 
-def tg_send(token, chat_id, text, parse_mode="Markdown", reply_markup=None):
+def tg_send(token, chat_id, text, parse_mode="Markdown", reply_markup=None,
+            disable_link_preview=False):
     """Send a text message. Long messages are split at ~4000 chars.
 
     Returns the API result of the LAST chunk sent, so callers that supplied
     a ``reply_markup`` can read back ``message_id`` for later edits.
+
+    Set ``disable_link_preview=True`` to suppress Telegram's link-preview
+    crawler — required for messages that contain one-shot URL tokens
+    (the preview crawler hits the URL and burns the token before the
+    user can click it).
     """
     chunks = []
     while len(text) > 4000:
@@ -160,6 +166,11 @@ def tg_send(token, chat_id, text, parse_mode="Markdown", reply_markup=None):
         data = {"chat_id": chat_id, "text": chunk}
         if parse_mode:
             data["parse_mode"] = parse_mode
+        if disable_link_preview:
+            # New API name (Bot API 7.0+); older clients accept the legacy
+            # `disable_web_page_preview` field — set both for safety.
+            data["link_preview_options"] = {"is_disabled": True}
+            data["disable_web_page_preview"] = True
         # Only attach the keyboard to the final chunk
         if reply_markup is not None and i == len(chunks) - 1:
             data["reply_markup"] = reply_markup
@@ -1149,13 +1160,17 @@ class RevolutYNABBot:
             return
         url = web.login_url(token)
         ttl_min = max(1, web.login_ttl // 60)
+        # Disable link preview — Telegram's preview crawler would
+        # otherwise fetch the URL itself, validate the token, get a
+        # session cookie (which it discards), and leave the user with
+        # an "expired" link when they tap it.
         tg_send(self.token, chat_id, (
             f"🌐 *Web dashboard*\n\n"
             f"Tap to sign in (single-use, expires in ~{ttl_min} min):\n"
             f"{url}\n\n"
             f"_Don't forward this URL — anyone who clicks it before you "
             f"will land in your account._"
-        ), "Markdown")
+        ), "Markdown", disable_link_preview=True)
 
     def _handle_settings_callback(self, cq_id, sender_id, chat_id,
                                   message_id, action):

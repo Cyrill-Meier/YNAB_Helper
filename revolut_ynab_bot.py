@@ -39,7 +39,6 @@ import os
 import sqlite3
 import sys
 import time
-import tempfile
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -58,7 +57,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.14"
+__version__ = "1.1.15"
 
 
 def get_version_info():
@@ -289,9 +288,12 @@ class RevolutYNABBot:
         # cause Telegram to redeliver updates that were already processed.
         self._offset_path = self.data_dir / "telegram_offset"
         self.offset = self._load_offset()
-        self._tmp_dir = Path(tempfile.mkdtemp(prefix="revolut_bot_"))
-        # Per-user last CSV cache: {telegram_id: Path}
-        self._last_csv = {}
+        # Persist uploaded CSVs under the mounted volume so they survive
+        # container restarts (older code used tempfile.mkdtemp under /tmp,
+        # which Docker wipes on every redeploy — that's why /reconcile and
+        # /dedupe used to lose state after a deploy).
+        self._csv_cache_dir = self.data_dir / "csv_cache"
+        self._csv_cache_dir.mkdir(parents=True, exist_ok=True)
         # Per-user dedupe candidates from the last /dedupe scan:
         # {telegram_id: [orphan_dict, ...]}
         self._dedupe_candidates = {}
@@ -795,11 +797,33 @@ class RevolutYNABBot:
             "db_path": str(user_tx_db_path(self.data_dir, sender_id)),
         }
 
-    def _user_tmp_dir(self, sender_id):
-        """Get or create a per-user temp directory."""
-        d = self._tmp_dir / str(sender_id)
+    def _user_csv_dir(self, sender_id):
+        """Per-user directory for cached CSVs (persistent across restarts)."""
+        d = self._csv_cache_dir / str(sender_id)
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _last_csv_path(self, sender_id):
+        """Most recently uploaded CSV for this user, or None."""
+        d = self._user_csv_dir(sender_id)
+        try:
+            csvs = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() == ".csv"]
+        except OSError:
+            return None
+        if not csvs:
+            return None
+        return max(csvs, key=lambda p: p.stat().st_mtime)
+
+    def _prune_csv_cache(self, sender_id, keep):
+        """Remove all CSVs in the user's cache except `keep`."""
+        d = self._user_csv_dir(sender_id)
+        keep_path = Path(keep).resolve()
+        for p in d.iterdir():
+            try:
+                if p.is_file() and p.resolve() != keep_path:
+                    p.unlink()
+            except OSError as e:
+                ynab.log.warning("bot: could not prune %s: %s", p, e)
 
     # ── CSV import ───────────────────────────────────────────────────────
 
@@ -815,7 +839,7 @@ class RevolutYNABBot:
 
         tg_send(self.token, chat_id, f"📥 Downloading _{filename}_...", None)
 
-        dest = self._user_tmp_dir(sender_id) / filename
+        dest = self._user_csv_dir(sender_id) / filename
         if not tg_download_file(self.token, doc["file_id"], dest):
             tg_send(self.token, chat_id, "Failed to download the file.", None)
             return
@@ -824,9 +848,14 @@ class RevolutYNABBot:
             tg_send(self.token, chat_id,
                     "This doesn't look like a Revolut account statement CSV "
                     "(missing expected headers).", None)
+            try:
+                dest.unlink()
+            except OSError:
+                pass
             return
 
-        self._last_csv[sender_id] = dest
+        # Keep only the latest CSV per user so the cache doesn't grow.
+        self._prune_csv_cache(sender_id, dest)
         ynab.log.info("bot: received CSV %s from user %s", filename, sender_id)
 
         try:
@@ -910,7 +939,7 @@ class RevolutYNABBot:
     # ── /reconcile ───────────────────────────────────────────────────────
 
     def _handle_reconcile(self, chat_id, sender_id):
-        csv_path = self._last_csv.get(sender_id)
+        csv_path = self._last_csv_path(sender_id)
         if not csv_path or not csv_path.exists():
             tg_send(self.token, chat_id,
                     "No CSV available. Send me a Revolut CSV first.", None)
@@ -969,7 +998,7 @@ class RevolutYNABBot:
 
         # Use the last uploaded CSV to also flip cleared state where the CSV
         # confirms the row has cleared on Revolut's side.
-        csv_path = self._last_csv.get(sender_id)
+        csv_path = self._last_csv_path(sender_id)
         csv_arg = str(csv_path) if csv_path and csv_path.exists() else None
 
         hint = f" against _{csv_path.name}_" if csv_arg else " (no CSV — memo-only)"
@@ -1017,7 +1046,7 @@ class RevolutYNABBot:
             tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
             return
 
-        csv_path = self._last_csv.get(sender_id)
+        csv_path = self._last_csv_path(sender_id)
         if not csv_path or not csv_path.exists():
             tg_send(self.token, chat_id,
                     "No CSV available. Send me a Revolut CSV first, "
@@ -1483,7 +1512,7 @@ class RevolutYNABBot:
                 f"  Total balance:   {total:,.2f}",
             ]
 
-            csv_path = self._last_csv.get(sender_id)
+            csv_path = self._last_csv_path(sender_id)
             if csv_path and csv_path.exists():
                 bal = ynab.extract_csv_running_balance(str(csv_path))
                 if bal:

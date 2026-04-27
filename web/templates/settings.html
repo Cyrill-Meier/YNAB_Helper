@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Settings — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+  <div>
+    <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+      Per-user preferences for the bot. Changes apply on the next imported CSV.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <h2 class="font-medium">Auto-approve imported transactions</h2>
+        <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+          When on, new transactions land in YNAB as
+          <em>approved</em> — they appear directly in your register. When
+          off, they land in YNAB's inbox as
+          <em>unapproved</em> for manual review.
+        </p>
+      </div>
+      <button id="set-auto" type="button" role="switch" aria-checked="false"
+              class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full
+                     border-2 border-transparent transition-colors focus:outline-none
+                     focus:ring-2 focus:ring-brand-500/40 bg-slate-200 dark:bg-ink-700">
+        <span class="inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0
+                     transition-transform translate-x-0"></span>
+      </button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="font-medium">Active YNAB setup</h2>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+      To change token, budget, or account: open Telegram and send
+      <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-ink-700">/setup</code>.
+    </p>
+    <dl class="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">Budget</dt>
+        <dd class="font-medium" id="set-budget">—</dd>
+      </div>
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">Account</dt>
+        <dd class="font-medium" id="set-account">—</dd>
+      </div>
+    </dl>
+  </div>
+
+  <div class="card text-sm">
+    <div class="flex items-center justify-between">
+      <div>
+        <div class="font-medium">Sign out everywhere</div>
+        <div class="text-ink-500 dark:text-slate-400 mt-1">
+          Closes this session immediately.
+        </div>
+      </div>
+      <form method="post" action="/logout">
+        <button type="submit"
+                class="px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                       hover:bg-slate-100 dark:hover:bg-ink-700">Logout</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('settings');</script>
+{% endblock %}

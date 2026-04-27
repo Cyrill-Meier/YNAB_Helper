@@ -14,6 +14,7 @@ User commands:
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
   /settings          — Open an inline settings menu
+  /login             — Mint a one-shot URL to the web dashboard
   /auto_approve on|off — Toggle whether imported txns are auto-approved
   /crypto            — Sync crypto portfolio value → YNAB tracking account
   /crypto_setup      — Configure BTC xpub, ETH address, crypto tracking account
@@ -60,7 +61,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.18"
+__version__ = "1.2.0"
 
 
 def get_version_info():
@@ -97,6 +98,7 @@ USER_COMMANDS = [
     ("setup",           "Re-run YNAB setup (token / budget / account)"),
     ("settings",        "Open the settings menu"),
     ("auto_approve",    "Toggle auto-approval of imported txns"),
+    ("login",           "Get a one-shot URL to the web dashboard"),
     ("crypto",          "Sync crypto portfolio value to YNAB"),
     ("crypto_setup",    "Configure BTC xpub / ETH address / tracking acct"),
     ("crypto_status",   "Show current crypto configuration"),
@@ -321,8 +323,15 @@ USER_STATES = ("pending", "approved", "awaiting_token", "awaiting_budget",
 
 def init_user_db(db_path):
     """Create or open the user settings database."""
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL mode lets the bot's main thread write while the FastAPI worker
+    # threads read concurrently without "database is locked" errors.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error:
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             telegram_id         INTEGER PRIMARY KEY,
@@ -345,6 +354,29 @@ def init_user_db(db_path):
             updated_at          TEXT NOT NULL
         )
     """)
+    # Web sessions: both one-shot login URL tokens (kind='login', short
+    # TTL, deleted on first use) and longer-lived browser cookies
+    # (kind='session', sliding TTL). Stored hashed (SHA-256 hex) so a DB
+    # leak doesn't let an attacker hijack live sessions.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            token_hash   TEXT PRIMARY KEY,
+            telegram_id  INTEGER NOT NULL,
+            kind         TEXT NOT NULL CHECK (kind IN ('login','session')),
+            created_at   REAL NOT NULL,
+            expires_at   REAL NOT NULL,
+            user_agent   TEXT,
+            ip           TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_web_sessions_telegram "
+        "ON web_sessions(telegram_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_web_sessions_expires "
+        "ON web_sessions(expires_at)"
+    )
     # Idempotent migration for DBs created before crypto columns existed
     for col in ("crypto_account_id", "crypto_account_name",
                 "btc_xpub", "eth_address"):
@@ -620,6 +652,8 @@ class RevolutYNABBot:
                 self._handle_auto_approve(chat_id, sender_id, text)
             elif cmd == "/settings":
                 self._handle_settings(chat_id, sender_id)
+            elif cmd == "/login":
+                self._handle_login(chat_id, sender_id)
             elif cmd == "/crypto":
                 self._handle_crypto(chat_id, sender_id)
             elif cmd == "/crypto_setup":
@@ -1078,6 +1112,51 @@ class RevolutYNABBot:
         text, markup = self._render_settings_menu(sender_id)
         tg_send(self.token, chat_id, text, "Markdown", markup)
 
+    # ── /login ───────────────────────────────────────────────────────────
+    #
+    # Mints a one-shot URL token and replies with the link. We persist the
+    # token (hashed) in the same DB the FastAPI app reads, so the bot's
+    # main thread is the one issuing — but the consumer is the web server
+    # thread. WAL mode + busy_timeout make this race-safe.
+
+    def _handle_login(self, chat_id, sender_id):
+        web = getattr(self, "_web_config", None)
+        if web is None or not web.enabled:
+            tg_send(self.token, chat_id,
+                    "🔒 Web UI is disabled on this server.\n"
+                    "Set `WEB_UI_ENABLED=1` (and the matching env vars) "
+                    "in the bot's environment, then redeploy.",
+                    None)
+            return
+        if not web.public_url:
+            tg_send(self.token, chat_id,
+                    "Web UI is enabled but `WEB_UI_PUBLIC_URL` isn't set, "
+                    "so I don't know which URL to send you to.",
+                    None)
+            return
+        try:
+            from web import auth as web_auth
+            token = web_auth.issue_login_token(
+                self.db, sender_id,
+                ttl_seconds=web.login_ttl,
+                ip="bot",
+                user_agent="telegram",
+            )
+        except Exception as e:
+            ynab.log.error("bot: /login token issue failed: %s", e)
+            tg_send(self.token, chat_id,
+                    f"Couldn't mint a login token: {e}", None)
+            return
+        url = web.login_url(token)
+        ttl_min = max(1, web.login_ttl // 60)
+        tg_send(self.token, chat_id, (
+            f"🌐 *Web dashboard*\n\n"
+            f"Tap to sign in (single-use, expires in ~{ttl_min} min):\n"
+            f"{url}\n\n"
+            f"_Don't forward this URL — anyone who clicks it before you "
+            f"will land in your account._"
+        ), "Markdown")
+
     def _handle_settings_callback(self, cq_id, sender_id, chat_id,
                                   message_id, action):
         """Process a tap on the settings menu."""
@@ -1155,6 +1234,7 @@ class RevolutYNABBot:
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
             "⚙ /settings — Open the settings menu",
+            "🌐 /login — Get a one-shot URL to the web dashboard",
             "✅ `/auto_approve on|off` — Toggle auto-approval of imported txns",
             "🪙 /crypto — Sync crypto portfolio value to YNAB",
             "🛠 `/crypto_setup` — Configure BTC xpub / ETH address / tracking account",
@@ -2475,6 +2555,41 @@ def main():
             print(f"   Admin ({admin_id}) auto-registered from .env config.")
 
     bot = RevolutYNABBot(bot_token, admin_id, user_db, str(data_dir))
+
+    # ── Optional: web UI (FastAPI on a daemon thread) ────────────────────
+    try:
+        from web import WebConfig
+        from web import server as web_server
+    except ImportError as e:
+        ynab.log.warning("web: import failed (%s) — web UI disabled", e)
+        web_cfg = None
+    else:
+        web_cfg = WebConfig.from_env(data_dir)
+        problems = web_cfg.validate()
+        if web_cfg.enabled and problems:
+            for p in problems:
+                print(f"⚠ web: {p}")
+                ynab.log.warning("web: %s", p)
+            print("web: refusing to start with the above issues.")
+            web_cfg.enabled = False
+        if web_cfg.enabled:
+            try:
+                web_server.serve_in_thread(
+                    config=web_cfg,
+                    bot_db_path=user_db_path,
+                    log=ynab.log,
+                    on_ready=lambda: ynab.log.info(
+                        "web: serving on %s:%d (public=%s)",
+                        web_cfg.host, web_cfg.port, web_cfg.public_url,
+                    ),
+                )
+                print(f"   Web UI: http://{web_cfg.host}:{web_cfg.port} "
+                      f"(public {web_cfg.public_url or 'NOT SET'})")
+            except Exception as e:
+                ynab.log.error("web: failed to start: %s", e)
+                web_cfg.enabled = False
+    bot._web_config = web_cfg
+
     bot.run()
 
 

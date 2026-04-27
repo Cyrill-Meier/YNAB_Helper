@@ -11,10 +11,44 @@ services:
     environment:
       - TZ=Europe/Zurich
       - PYTHONUNBUFFERED=1
+    # The web UI listens on 8080 inside the container. We deliberately do
+    # NOT publish that port to the host — cloudflared (below) reaches it
+    # over the internal compose network. If you don't use cloudflared and
+    # want to expose it directly (e.g. behind your own reverse proxy),
+    # uncomment the ports block.
+    # ports:
+    #   - "127.0.0.1:8080:8080"
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 
-  # Auto-update: pulls new images and restarts the bot automatically
+  # ── Cloudflare Tunnel ─────────────────────────────────────────────────
+  # Reaches the web UI over the compose network and exposes it as
+  # https://<your-tunnel-hostname> (or a free *.trycloudflare.com URL).
+  # No public ports on the host required.
+  #
+  # Two ways to configure this:
+  #   (a) Recommended: a "named" tunnel created in Cloudflare Zero Trust
+  #       dashboard. Set CLOUDFLARE_TUNNEL_TOKEN in cloudflared.env and
+  #       point the public hostname's service at "http://revolut-ynab-bot:8080".
+  #   (b) Quick + ephemeral: a Cloudflare "quick tunnel" (no account
+  #       needed). Replace the `command` below with:
+  #         command: tunnel --no-autoupdate --url http://revolut-ynab-bot:8080
+  #       cloudflared will print a fresh *.trycloudflare.com URL on each
+  #       restart — fine for testing, useless for bookmarks.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    env_file:
+      - ./cloudflared.env
+    depends_on:
+      - revolut-ynab-bot
+    labels:
+      - "com.centurylinklabs.watchtower.scope=ynab"
+
+  # ── Auto-update ───────────────────────────────────────────────────────
+  # Pulls new images and restarts the bot/cloudflared automatically.
   watchtower:
     image: containrrr/watchtower
     container_name: watchtower

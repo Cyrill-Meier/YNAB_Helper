@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-end justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Dashboard</h1>
+      <p class="text-sm text-ink-500 dark:text-slate-400 mt-1" id="dash-subtitle">
+        Loading account…
+      </p>
+    </div>
+    <button id="dash-refresh"
+            class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                   hover:bg-slate-100 dark:hover:bg-ink-700">
+      ⟳ Refresh
+    </button>
+  </div>
+
+  {# ── Headline cards ─────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="card">
+      <div class="card-label">YNAB balance</div>
+      <div class="card-value" id="card-balance">—</div>
+      <div class="card-meta" id="card-balance-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Transactions tracked</div>
+      <div class="card-value" id="card-tracked">—</div>
+      <div class="card-meta" id="card-tracked-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Pending</div>
+      <div class="card-value" id="card-pending">—</div>
+      <div class="card-meta">Cleared once Revolut posts them</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Last CSV</div>
+      <div class="card-value text-base font-medium truncate" id="card-csv">—</div>
+      <div class="card-meta" id="card-csv-meta">&nbsp;</div>
+    </div>
+  </div>
+
+  {# ── Quick actions ──────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <a href="/app/upload" class="action">
+      <span class="action-icon">📥</span>
+      <span>Upload CSV</span>
+    </a>
+    <a href="/app/transactions" class="action">
+      <span class="action-icon">📒</span>
+      <span>Transactions</span>
+    </a>
+    <a href="/app/reconcile" class="action">
+      <span class="action-icon">🧮</span>
+      <span>Reconcile</span>
+    </a>
+    <a href="/app/dedupe" class="action">
+      <span class="action-icon">🔎</span>
+      <span>Dedupe</span>
+    </a>
+  </div>
+
+  {# ── Setup summary ──────────────────────────────────────────────────── #}
+  <div class="card">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-semibold">Active YNAB setup</h2>
+      <a href="/app/settings" class="text-sm text-brand-600 hover:underline">Change</a>
+    </div>
+    <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">Budget</dt>
+        <dd class="font-medium" id="meta-budget">—</dd>
+      </div>
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">Account</dt>
+        <dd class="font-medium" id="meta-account">—</dd>
+      </div>
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">Auto-approve imports</dt>
+        <dd class="font-medium" id="meta-auto">—</dd>
+      </div>
+      <div class="flex justify-between border-b border-slate-100 dark:border-ink-700 py-1.5">
+        <dt class="text-ink-500 dark:text-slate-400">First / last txn date</dt>
+        <dd class="font-medium" id="meta-range">—</dd>
+      </div>
+    </dl>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>
+  RYNAB.boot('dashboard');
+</script>
+{% endblock %}

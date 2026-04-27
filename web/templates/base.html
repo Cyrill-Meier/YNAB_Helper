@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en" class="h-full" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Revolut → YNAB{% endblock %}</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50:  '#ECFFFB',
+              100: '#C7FFF6',
+              500: '#0EE3C8',
+              600: '#0BB6A0',
+              700: '#0A9081',
+              900: '#063D38',
+            },
+            ink: {
+              900: '#0B0F14',
+              800: '#11171F',
+              700: '#1A222D',
+              600: '#283443',
+              500: '#475569',
+            },
+          },
+          boxShadow: {
+            soft: '0 1px 2px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06)',
+          },
+        },
+      },
+    };
+    // Apply theme before Tailwind paints to avoid a flash.
+    (function () {
+      const t = localStorage.getItem('theme');
+      const sys = matchMedia('(prefers-color-scheme: dark)').matches;
+      if (t === 'dark' || (!t && sys)) {
+        document.documentElement.classList.add('dark');
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style type="text/tailwindcss">
+    /* Cards & primitives */
+    .card        { @apply bg-white dark:bg-ink-800 border border-slate-200 dark:border-ink-700 rounded-2xl p-5 shadow-soft; }
+    .card-label  { @apply text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400; }
+    .card-value  { @apply mt-1 text-2xl font-semibold tracking-tight; }
+    .card-meta   { @apply mt-1 text-xs text-ink-500 dark:text-slate-400; }
+    /* Quick-action tiles */
+    .action      { @apply bg-white dark:bg-ink-800 border border-slate-200 dark:border-ink-700 rounded-2xl p-5
+                          flex items-center gap-3 hover:border-brand-500 hover:shadow-soft transition cursor-pointer
+                          text-sm font-medium; }
+    .action-icon { @apply w-9 h-9 rounded-lg bg-brand-500/10 grid place-items-center text-lg; }
+    /* Tables */
+    table th, table td { @apply align-middle; }
+    tbody tr:hover     { @apply bg-slate-50 dark:bg-ink-700/40; }
+    /* Toasts */
+    .toast       { @apply px-4 py-3 rounded-xl shadow-soft text-sm border max-w-sm; }
+    .toast.ok    { @apply bg-emerald-50 border-emerald-200 text-emerald-900 dark:bg-emerald-500/10 dark:border-emerald-500/20 dark:text-emerald-200; }
+    .toast.warn  { @apply bg-amber-50 border-amber-200 text-amber-900 dark:bg-amber-500/10 dark:border-amber-500/20 dark:text-amber-200; }
+    .toast.error { @apply bg-rose-50 border-rose-200 text-rose-900 dark:bg-rose-500/10 dark:border-rose-500/20 dark:text-rose-200; }
+    .toast.info  { @apply bg-slate-50 border-slate-200 text-slate-900 dark:bg-ink-700 dark:border-ink-600 dark:text-slate-100; }
+    /* Toggle (Settings page) */
+    button[role="switch"][aria-checked="true"]      { @apply bg-brand-500 dark:bg-brand-500; }
+    button[role="switch"][aria-checked="true"] > span { @apply translate-x-5; }
+  </style>
+</head>
+<body class="h-full bg-slate-50 text-ink-900 dark:bg-ink-900 dark:text-slate-100 antialiased">
+<div class="min-h-full flex flex-col">
+
+  {# ── Top nav ────────────────────────────────────────────────────────── #}
+  <header class="border-b border-slate-200 dark:border-ink-700 bg-white/80 dark:bg-ink-800/80 backdrop-blur sticky top-0 z-30">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
+      <a href="/app/dashboard" class="flex items-center gap-2 font-semibold tracking-tight">
+        <svg viewBox="0 0 32 32" class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" stroke-width="2.2">
+          <circle cx="16" cy="16" r="13" stroke-opacity="0.35"/>
+          <path d="M7 17l4 4 14-14" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="hidden sm:inline">Revolut → YNAB</span>
+      </a>
+      <nav class="hidden md:flex items-center gap-1 text-sm">
+        {% set tab = request.url.path %}
+        {% macro nav_item(href, label) %}
+          <a href="{{ href }}"
+             class="px-3 py-1.5 rounded-md transition
+                    {% if tab.startswith(href) %}
+                      bg-brand-50 text-brand-700 dark:bg-ink-700 dark:text-brand-500
+                    {% else %}
+                      text-ink-500 hover:text-ink-900 hover:bg-slate-100
+                      dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-ink-700
+                    {% endif %}">{{ label }}</a>
+        {% endmacro %}
+        {{ nav_item('/app/dashboard', 'Dashboard') }}
+        {{ nav_item('/app/transactions', 'Transactions') }}
+        {{ nav_item('/app/upload', 'Upload') }}
+        {{ nav_item('/app/reconcile', 'Reconcile') }}
+        {{ nav_item('/app/dedupe', 'Dedupe') }}
+        {{ nav_item('/app/settings', 'Settings') }}
+      </nav>
+      <div class="flex items-center gap-2">
+        <button id="theme-toggle" type="button"
+                aria-label="Toggle dark mode"
+                class="w-8 h-8 rounded-md flex items-center justify-center text-ink-500 hover:bg-slate-100 dark:hover:bg-ink-700">
+          <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-5 h-5 hidden dark:block"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" stroke-linecap="round"/></svg>
+          <svg id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="w-5 h-5 dark:hidden"><path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" stroke-linejoin="round"/></svg>
+        </button>
+        <form method="post" action="/logout">
+          <button type="submit"
+                  class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600 hover:bg-slate-100 dark:hover:bg-ink-700">
+            Logout
+          </button>
+        </form>
+      </div>
+    </div>
+    {# ── Mobile tab strip ─────────────────────────────────────────────── #}
+    <nav class="md:hidden border-t border-slate-200 dark:border-ink-700 overflow-x-auto">
+      <div class="flex items-center gap-1 px-4 py-2 text-sm whitespace-nowrap">
+        {% set tab = request.url.path %}
+        {{ nav_item('/app/dashboard', 'Dashboard') }}
+        {{ nav_item('/app/transactions', 'Transactions') }}
+        {{ nav_item('/app/upload', 'Upload') }}
+        {{ nav_item('/app/reconcile', 'Reconcile') }}
+        {{ nav_item('/app/dedupe', 'Dedupe') }}
+        {{ nav_item('/app/settings', 'Settings') }}
+      </div>
+    </nav>
+  </header>
+
+  {# ── Main ───────────────────────────────────────────────────────────── #}
+  <main class="flex-1 mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8 py-6 lg:py-10">
+    {% block content %}{% endblock %}
+  </main>
+
+  {# ── Footer ─────────────────────────────────────────────────────────── #}
+  <footer class="border-t border-slate-200 dark:border-ink-700 py-3 text-xs text-ink-500 dark:text-slate-500">
+    <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 flex justify-between">
+      <span>{{ version }}</span>
+      <span>
+        Logged in as <code class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-ink-700">{{ user.first_name or user.username or user.telegram_id }}</code>
+      </span>
+    </div>
+  </footer>
+</div>
+
+{# ── Toast container ─────────────────────────────────────────────────── #}
+<div id="toasts" class="fixed top-4 right-4 z-50 flex flex-col gap-2"></div>
+
+<script>
+  // Make CSRF token + telegram-id available to all scripts.
+  window.RYNAB = {
+    csrfToken: "{{ csrf_token }}",
+    telegramId: {{ user.telegram_id }},
+  };
+</script>
+<script src="/static/app.js" defer></script>
+{% block extra_scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,18 @@
+/* Plain CSS that doesn't depend on Tailwind's @apply (which needs a build
+   step or the CDN's <style type="text/tailwindcss"> block). The
+   Tailwind-aware rules live in base.html. */
+
+.spinner {
+  width: 1rem; height: 1rem;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 9999px;
+  animation: rynab-spin 0.7s linear infinite;
+}
+@keyframes rynab-spin { to { transform: rotate(360deg); } }
+
+@keyframes rynab-toast-in {
+  from { transform: translateY(-8px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.toast { animation: rynab-toast-in 0.2s ease-out; }

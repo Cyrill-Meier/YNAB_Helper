@@ -4,51 +4,54 @@ services:
     container_name: revolut-ynab-bot
     restart: unless-stopped
     volumes:
-      # Your .env file with secrets (create on the NAS, NOT from Git)
+      # Your .env file with secrets (create on the host, NOT from Git)
       - ./bot.env:/app/.env:ro
       # Persistent storage for user DB + per-user transaction DBs
       - ./bot_data:/app/bot_data
     environment:
       - TZ=Europe/Zurich
       - PYTHONUNBUFFERED=1
-    # The web UI listens on 8080 inside the container. We deliberately do
-    # NOT publish that port to the host — cloudflared (below) reaches it
-    # over the internal compose network. If you don't use cloudflared and
-    # want to expose it directly (e.g. behind your own reverse proxy),
-    # uncomment the ports block.
-    # ports:
-    #   - "127.0.0.1:8080:8080"
+    # The web UI listens on 8080 inside the container. Caddy below reaches
+    # it over the internal compose network; we deliberately do NOT publish
+    # that port to the host.
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 
-  # ── Cloudflare Tunnel ─────────────────────────────────────────────────
-  # Reaches the web UI over the compose network and exposes it as
-  # https://<your-tunnel-hostname> (or a free *.trycloudflare.com URL).
-  # No public ports on the host required.
+  # ── Caddy reverse proxy ───────────────────────────────────────────────
+  # Terminates TLS on ports 80/443 and forwards traffic to the bot's web
+  # UI on the internal docker network. Auto-provisions and renews
+  # Let's Encrypt certificates — no certbot, no nginx.conf reloads.
   #
-  # Two ways to configure this:
-  #   (a) Recommended: a "named" tunnel created in Cloudflare Zero Trust
-  #       dashboard. Set CLOUDFLARE_TUNNEL_TOKEN in cloudflared.env and
-  #       point the public hostname's service at "http://revolut-ynab-bot:8080".
-  #   (b) Quick + ephemeral: a Cloudflare "quick tunnel" (no account
-  #       needed). Replace the `command` below with:
-  #         command: tunnel --no-autoupdate --url http://revolut-ynab-bot:8080
-  #       cloudflared will print a fresh *.trycloudflare.com URL on each
-  #       restart — fine for testing, useless for bookmarks.
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: cloudflared
+  # REQUIREMENTS:
+  #   1. The DNS record for the public hostname (e.g. bot.example.com)
+  #      must point at this host's public IP.
+  #   2. Inbound TCP 80 + TCP 443 must be open in your cloud firewall
+  #      (AWS Security Group / Lightsail Networking tab / Hetzner cloud
+  #      firewall / etc.). Port 80 is required for Let's Encrypt's
+  #      HTTP-01 challenge; you cannot skip it.
+  #
+  # The Caddyfile next to this compose file declares which hostnames are
+  # served and where they proxy to.
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
     restart: unless-stopped
-    command: tunnel --no-autoupdate run
-    env_file:
-      - ./cloudflared.env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Persisting these keeps the issued cert across restarts so we
+      # don't hit Let's Encrypt's per-week rate limits.
+      - caddy_data:/data
+      - caddy_config:/config
     depends_on:
       - revolut-ynab-bot
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 
   # ── Auto-update ───────────────────────────────────────────────────────
-  # Pulls new images and restarts the bot/cloudflared automatically.
+  # Pulls new bot images and restarts the bot/caddy automatically.
   watchtower:
     image: containrrr/watchtower
     container_name: watchtower
@@ -63,3 +66,7 @@ services:
       - TZ=Europe/Zurich
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
+
+volumes:
+  caddy_data:
+  caddy_config:

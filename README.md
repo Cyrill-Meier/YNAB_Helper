@@ -107,64 +107,77 @@ Stop everything with `docker compose down`. Persistent data lives in `./bot_data
 
 ## Web dashboard (optional)
 
-Alongside the Telegram bot, the same container can run a FastAPI web app at `https://<your-tunnel>/` with:
+Alongside the Telegram bot, the same container can run a FastAPI web app with:
 
 - A clean dashboard (balance, transaction count, last import, last CSV)
 - Searchable / paginated transactions table
-- Drag-and-drop CSV upload (mirrors `/import` behaviour from Telegram)
+- Drag-and-drop CSV upload (mirrors the Telegram CSV flow)
 - One-click reconcile
 - A much nicer dedupe view (multi-select with checkboxes, bulk delete with confirm)
 - Settings (auto-approve toggle)
 
 Auth is **bot-mediated** — no password, no email. Send `/login` in Telegram, the bot replies with a single-use URL that expires in 5 minutes. Click it once → cookie session → done.
 
-### 1. Pick how the web UI gets HTTPS
+The included `docker-compose.yml` bundles a **Caddy** sidecar that terminates HTTPS on port 443 and reverse-proxies to the bot's web UI on the internal network. Caddy auto-provisions and renews Let's Encrypt certificates — no certbot, no nginx config reloads.
 
-The included `docker-compose.yml` bundles a `cloudflared` sidecar that publishes the in-container port 8080 over a Cloudflare Tunnel. **No public ports on the host. No domain required for testing.**
+### 1. Point a DNS record at the host
 
-Two ways to wire cloudflared:
+Create an A record (or AAAA, or CNAME) for the hostname you want, e.g. `bot.example.com` → your host's public IP. Verify with:
 
-**(a) Named tunnel (recommended)** — needs a free Cloudflare account.
-
-1. In Cloudflare Zero Trust → *Networks* → *Tunnels* → *Create a tunnel* → Cloudflared → name it (e.g. `revolut-ynab`).
-2. Copy the generated **token** (starts with `eyJ…`).
-3. On the host:
-   ```bash
-   echo "TUNNEL_TOKEN=eyJ..." > ~/ynab-bot/cloudflared.env
-   ```
-4. Add a *Public hostname* in the dashboard:
-   - Subdomain: `ynab` (whatever you like)
-   - Domain: any domain you've added to Cloudflare
-   - Service: `http://revolut-ynab-bot:8080`
-
-That hostname is what you set as `WEB_UI_PUBLIC_URL` (next step).
-
-**(b) Quick tunnel (testing only)** — no account, fresh `*.trycloudflare.com` URL on every restart.
-
-Edit `docker-compose.yml`, replace the cloudflared `command:` line with:
-```yaml
-    command: tunnel --no-autoupdate --url http://revolut-ynab-bot:8080
+```bash
+dig +short bot.example.com
 ```
-Watch the logs: `docker compose logs cloudflared` — the URL is in there.
 
-### 2. Configure the web UI in `bot.env`
+### 2. Open ports 80 and 443 on the cloud firewall
+
+Caddy needs both: port 80 for Let's Encrypt's HTTP-01 challenge, port 443 for the actual site. Note that the host's UFW (or equivalent) is irrelevant if your cloud provider firewall is closed.
+
+| Provider | Where to open |
+| --- | --- |
+| AWS Lightsail | Lightsail console → instance → *Networking* → add HTTP + HTTPS rules |
+| AWS EC2 | EC2 console → Security Groups → inbound: 80/tcp + 443/tcp from 0.0.0.0/0 |
+| Hetzner Cloud | Cloud console → Firewalls → inbound: TCP 80 + TCP 443 |
+| DigitalOcean | Networking → Firewalls → inbound: TCP 80 + TCP 443 |
+| Bare-metal / no cloud firewall | `sudo ufw allow 80,443/tcp` |
+
+### 3. Edit the `Caddyfile`
+
+In your deploy directory (next to `docker-compose.yml`), put a `Caddyfile` with your hostname:
+
+```caddyfile
+bot.example.com {
+    reverse_proxy revolut-ynab-bot:8080
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Frame-Options "DENY"
+        -Server
+    }
+}
+```
+
+Use the [`Caddyfile`](Caddyfile) from this repo as a starting point. Set the global `email` directive to your address if you want Let's Encrypt expiry warnings.
+
+### 4. Configure the web UI in `bot.env`
 
 ```bash
 WEB_UI_ENABLED=1
-WEB_UI_PUBLIC_URL=https://ynab.your-domain.example.com
+WEB_UI_PUBLIC_URL=https://bot.example.com
 # Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 WEB_UI_SECRET_KEY=put_a_random_48_byte_string_here
 ```
 
-Optional knobs (defaults shown): `WEB_UI_HOST=0.0.0.0`, `WEB_UI_PORT=8080`, `WEB_UI_LOGIN_TTL=300`, `WEB_UI_SESSION_TTL=1800`. See `.env.example` for the full list.
+Optional knobs (defaults shown): `WEB_UI_HOST=0.0.0.0`, `WEB_UI_PORT=8080`, `WEB_UI_LOGIN_TTL=300`, `WEB_UI_SESSION_TTL=1800`, `WEB_UI_ALLOWED_IPS=` (comma-separated CIDRs). See `.env.example` for the full list.
 
-### 3. Restart and use it
+### 5. Restart
 
 ```bash
 docker compose up -d
+docker compose logs --tail=30 caddy
 ```
 
-In Telegram, send `/login` → tap the URL the bot replies with → you're in.
+You'll see Caddy provision the cert (~30 s on first run; subsequent restarts reuse the cert from the persistent `caddy_data` volume). In Telegram, send `/login` → tap the URL → you're in.
 
 ### Security notes
 
@@ -172,7 +185,9 @@ In Telegram, send `/login` → tap the URL the bot replies with → you're in.
 - Session cookies are HttpOnly, `SameSite=Lax`, and `Secure` when the public URL is HTTPS.
 - All state-changing endpoints require a CSRF header derived from the session cookie (double-submit pattern).
 - A simple in-process rate limiter caps `/auth` at 10 attempts/minute/IP.
-- Optional `WEB_UI_ALLOWED_IPS` env var if you want to limit further (e.g. only your home network when running on LAN).
+- Caddy adds HSTS, `X-Content-Type-Options`, `Referrer-Policy`, and `X-Frame-Options: DENY` to every response.
+- Optional `WEB_UI_ALLOWED_IPS` env var if you want to limit further (e.g. only your home network).
+- Don't forget — the `caddy_data` named volume holds the issued certificate. Keep it; rebuilding it from scratch hits Let's Encrypt's per-week issuance rate limits.
 
 ---
 

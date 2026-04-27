@@ -61,7 +61,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"
 
 
 def get_version_info():
@@ -388,6 +388,14 @@ def init_user_db(db_path):
         "CREATE INDEX IF NOT EXISTS idx_web_sessions_expires "
         "ON web_sessions(expires_at)"
     )
+    # Idempotent migration: tg_* columns let us auto-delete the /login DM
+    # after the user successfully exchanges the URL for a session.
+    for col in ("tg_chat_id INTEGER", "tg_message_id INTEGER"):
+        name = col.split()[0]
+        try:
+            conn.execute(f"ALTER TABLE web_sessions ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     # Idempotent migration for DBs created before crypto columns existed
     for col in ("crypto_account_id", "crypto_account_name",
                 "btc_xpub", "eth_address"):
@@ -1164,13 +1172,32 @@ class RevolutYNABBot:
         # otherwise fetch the URL itself, validate the token, get a
         # session cookie (which it discards), and leave the user with
         # an "expired" link when they tap it.
-        tg_send(self.token, chat_id, (
+        result = tg_send(self.token, chat_id, (
             f"🌐 *Web dashboard*\n\n"
             f"Tap to sign in (single-use, expires in ~{ttl_min} min):\n"
             f"{url}\n\n"
             f"_Don't forward this URL — anyone who clicks it before you "
-            f"will land in your account._"
+            f"will land in your account. The bot will delete this "
+            f"message automatically once you sign in._"
         ), "Markdown", disable_link_preview=True)
+        # Record (chat_id, message_id) on the token row so the web
+        # server can delete this DM after the user signs in. Best-effort:
+        # if Telegram didn't return a message_id, we just skip the
+        # auto-delete.
+        try:
+            sent_msg = (result or {}).get("result") or {}
+            sent_chat_id = (sent_msg.get("chat") or {}).get("id")
+            sent_msg_id = sent_msg.get("message_id")
+            if sent_chat_id and sent_msg_id:
+                from web import auth as web_auth
+                web_auth.attach_tg_message(
+                    self.db, token, sent_chat_id, sent_msg_id,
+                )
+        except Exception as e:
+            ynab.log.warning(
+                "bot: could not record /login message_id (%s) — "
+                "auto-delete on sign-in won't fire for this token", e,
+            )
 
     def _handle_settings_callback(self, cq_id, sender_id, chat_id,
                                   message_id, action):

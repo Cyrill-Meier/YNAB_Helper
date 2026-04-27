@@ -23,6 +23,8 @@ Admin commands:
   /approve <user_id> — Approve a pending user
   /deny <user_id>    — Deny a pending user
   /users             — List all users and their states
+  /ip                — Show the host's public IP and hostname
+  /logs [N]          — Download the bot log file (optionally last N lines)
 
 Setup:
   1. Message @BotFather on Telegram → /newbot → copy the token
@@ -57,7 +59,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.16"
+__version__ = "1.1.17"
 
 
 def get_version_info():
@@ -180,6 +182,77 @@ def tg_answer_callback(token, callback_query_id, text=None, show_alert=False):
         data["text"] = text[:200]
         data["show_alert"] = show_alert
     return tg_request(token, "answerCallbackQuery", data)
+
+
+def tg_send_document(token, chat_id, file_path, caption=None,
+                     filename=None, parse_mode=None):
+    """Send a file as a Telegram document via multipart/form-data.
+
+    Telegram caps bot-API document uploads at 50 MB. Caller is
+    responsible for staying under that.
+    """
+    import uuid
+    file_path = Path(file_path)
+    try:
+        file_bytes = file_path.read_bytes()
+    except OSError as e:
+        ynab.log.error("tg_send_document: cannot read %s: %s", file_path, e)
+        return {"ok": False, "description": str(e)}
+
+    safe_name = (filename or file_path.name).replace('"', "_")
+    boundary = f"----RevolutYNABBotBoundary{uuid.uuid4().hex}"
+    crlf = b"\r\n"
+
+    parts = []
+
+    def add_field(name, value):
+        parts.append(f"--{boundary}".encode())
+        parts.append(crlf)
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"'.encode()
+        )
+        parts.append(crlf + crlf)
+        parts.append(str(value).encode("utf-8"))
+        parts.append(crlf)
+
+    add_field("chat_id", chat_id)
+    if caption:
+        add_field("caption", caption)
+        if parse_mode:
+            add_field("parse_mode", parse_mode)
+
+    parts.append(f"--{boundary}".encode())
+    parts.append(crlf)
+    parts.append(
+        f'Content-Disposition: form-data; name="document"; '
+        f'filename="{safe_name}"'.encode()
+    )
+    parts.append(crlf)
+    parts.append(b"Content-Type: application/octet-stream")
+    parts.append(crlf + crlf)
+    parts.append(file_bytes)
+    parts.append(crlf)
+    parts.append(f"--{boundary}--".encode())
+    parts.append(crlf)
+
+    body = b"".join(parts)
+    url = f"{TELEGRAM_API.format(token=token)}/sendDocument"
+    req = Request(url, data=body, method="POST")
+    req.add_header(
+        "Content-Type", f"multipart/form-data; boundary={boundary}"
+    )
+    req.add_header("Content-Length", str(len(body)))
+
+    try:
+        with urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode())
+    except HTTPError as e:
+        err_body = e.read().decode()
+        ynab.log.error("Telegram sendDocument error %d: %s", e.code, err_body)
+        return {"ok": False, "description": err_body}
+    except (URLError, OSError) as e:
+        ynab.log.error("Telegram sendDocument network error: %s", e)
+        return {"ok": False, "description": str(e)}
 
 
 def tg_download_file(token, file_id, dest_path):
@@ -401,6 +474,12 @@ class RevolutYNABBot:
             elif text.startswith("/users"):
                 self._admin_list_users(chat_id)
                 return
+            elif text.startswith("/ip"):
+                self._admin_ip(chat_id)
+                return
+            elif text.startswith("/logs"):
+                self._admin_logs(chat_id, text)
+                return
 
         # ── Look up or create the user ───────────────────────────────────
         user = get_user(self.db, sender_id)
@@ -603,6 +682,143 @@ class RevolutYNABBot:
                 f"{icon} `{u['telegram_id']}` {name}{uname} [{u['state']}]{acct}"
             )
         tg_send(self.token, chat_id, "\n".join(lines))
+
+    # ── Admin: /ip ───────────────────────────────────────────────────────
+
+    def _admin_ip(self, chat_id):
+        """Report the bot host's outbound public IP and identity."""
+        import socket
+
+        public_ip = "(unknown — egress lookup failed)"
+        for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+            try:
+                req = Request(url, headers={"User-Agent": "revolut-ynab-bot"})
+                with urlopen(req, timeout=8) as resp:
+                    candidate = resp.read().decode().strip()
+                if candidate:
+                    public_ip = candidate
+                    break
+            except (HTTPError, URLError, OSError) as e:
+                ynab.log.warning("admin /ip: %s failed: %s", url, e)
+
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            hostname = "(unknown)"
+
+        # Best-effort: also list non-loopback local IPs (useful for LAN debug)
+        local_ips = []
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            for fam, _, _, _, sockaddr in infos:
+                ip = sockaddr[0]
+                if ip and not ip.startswith("127.") and ip != "::1":
+                    if ip not in local_ips:
+                        local_ips.append(ip)
+        except Exception:
+            pass
+
+        lines = [
+            "🌐 *Bot host info*",
+            f"Public IP: `{public_ip}`",
+            f"Hostname: `{hostname}`",
+        ]
+        if local_ips:
+            lines.append("Local IPs: " + ", ".join(f"`{x}`" for x in local_ips))
+        tg_send(self.token, chat_id, "\n".join(lines))
+
+    # ── Admin: /logs ─────────────────────────────────────────────────────
+
+    def _resolve_log_file(self):
+        """Find the path the bot's file-log handler writes to, if any."""
+        for h in ynab.log.handlers:
+            base = getattr(h, "baseFilename", None)
+            if base:
+                return Path(base)
+        env_path = os.environ.get("LOG_FILE")
+        if env_path:
+            return Path(env_path).expanduser()
+        return None
+
+    def _admin_logs(self, chat_id, text):
+        """Send the bot log file as a download. `/logs N` → last N lines."""
+        log_path = self._resolve_log_file()
+        if not log_path or not log_path.exists():
+            tg_send(self.token, chat_id,
+                    "No log file is configured (or it doesn't exist yet).\n"
+                    "Set `LOG_FILE` in the env to enable file logging.",
+                    None)
+            return
+
+        parts = text.split()
+        tail_n = None
+        if len(parts) >= 2:
+            try:
+                tail_n = int(parts[1])
+                if tail_n <= 0:
+                    raise ValueError
+            except ValueError:
+                tg_send(self.token, chat_id,
+                        "Usage: `/logs` (full file) or `/logs N` "
+                        "(last N lines).")
+                return
+
+        size = log_path.stat().st_size
+        # Telegram's bot-API document limit is 50 MB. Auto-tail if larger.
+        TG_DOC_LIMIT = 45 * 1024 * 1024  # leave headroom
+        auto_tailed = False
+        if tail_n is None and size > TG_DOC_LIMIT:
+            tail_n = 100_000
+            auto_tailed = True
+            tg_send(self.token, chat_id,
+                    f"Log is {size / 1024 / 1024:.1f} MB — sending the last "
+                    f"{tail_n:,} lines instead.",
+                    None)
+
+        upload_path = log_path
+        tmp_path = None
+        line_count = None
+        if tail_n is not None:
+            from collections import deque
+            try:
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    last = list(deque(f, maxlen=tail_n))
+            except OSError as e:
+                tg_send(self.token, chat_id, f"Couldn't read log: {e}", None)
+                return
+            line_count = len(last)
+            tmp_path = self.data_dir / f"_logs_tail_{os.getpid()}.log"
+            try:
+                tmp_path.write_text("".join(last), encoding="utf-8")
+            except OSError as e:
+                tg_send(self.token, chat_id, f"Couldn't write temp log: {e}",
+                        None)
+                return
+            upload_path = tmp_path
+
+        if line_count is not None:
+            label = "full file" if not auto_tailed and tail_n is None else \
+                    f"last {line_count:,} lines"
+            caption = f"📜 {log_path.name} — {label}"
+        else:
+            caption = (f"📜 {log_path.name} "
+                       f"({size / 1024:.1f} KB, full file)")
+
+        result = tg_send_document(
+            self.token, chat_id, upload_path,
+            caption=caption, filename=log_path.name,
+        )
+
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+        if not result.get("ok"):
+            tg_send(self.token, chat_id,
+                    f"Failed to send log: {result.get('description', 'unknown')}",
+                    None)
 
     # ── Onboarding: token ────────────────────────────────────────────────
 
@@ -811,6 +1027,8 @@ class RevolutYNABBot:
                 "/approve <id> — Approve a pending user",
                 "/deny <id> — Deny a user",
                 "/users — List all registered users",
+                "/ip — Show this host's public IP / hostname",
+                "/logs `[N]` — Download bot log file (or last N lines)",
             ])
         tg_send(self.token, chat_id, "\n".join(lines))
 

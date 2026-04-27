@@ -13,6 +13,7 @@ User commands:
   /dedupe_cancel     — Discard the pending dedupe selection
   /status            — Show YNAB account balance and last import info
   /setup             — Re-run onboarding (change token / budget / account)
+  /settings          — Open an inline settings menu
   /auto_approve on|off — Toggle whether imported txns are auto-approved
   /crypto            — Sync crypto portfolio value → YNAB tracking account
   /crypto_setup      — Configure BTC xpub, ETH address, crypto tracking account
@@ -59,7 +60,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.17"
+__version__ = "1.1.18"
 
 
 def get_version_info():
@@ -75,6 +76,40 @@ def format_version_line():
     """Compact one-line version string for /help and logs."""
     v = get_version_info()
     return f"v{v['version']} ({v['sha']}, {v['date']})"
+
+
+# ─── Bot command registry ──────────────────────────────────────────────────
+#
+# Pushed to Telegram via setMyCommands at startup so users get an autocomplete
+# list when they type "/" — without us having to keep BotFather in sync. Two
+# scopes:
+#   • "default" — everyone sees these
+#   • BotCommandScopeChat for the admin — admin sees these PLUS the admin set
+#
+# Descriptions: Telegram caps each at 256 chars; keep them short and
+# action-first so they read well in the autocomplete dropdown.
+
+USER_COMMANDS = [
+    ("reconcile",       "Reconcile YNAB balance against the last CSV"),
+    ("cleanup_pending", "Strip stale (pending) memos from cleared txns"),
+    ("dedupe",          "Find orphaned duplicate imports in YNAB"),
+    ("status",          "Show YNAB account balance & last import"),
+    ("setup",           "Re-run YNAB setup (token / budget / account)"),
+    ("settings",        "Open the settings menu"),
+    ("auto_approve",    "Toggle auto-approval of imported txns"),
+    ("crypto",          "Sync crypto portfolio value to YNAB"),
+    ("crypto_setup",    "Configure BTC xpub / ETH address / tracking acct"),
+    ("crypto_status",   "Show current crypto configuration"),
+    ("help",            "Show available commands"),
+]
+
+ADMIN_EXTRA_COMMANDS = [
+    ("approve", "Approve a pending user (/approve <id>)"),
+    ("deny",    "Deny a user (/deny <id>)"),
+    ("users",   "List registered users"),
+    ("ip",      "Show this host's public IP and hostname"),
+    ("logs",    "Download the bot log file (or last N lines)"),
+]
 
 
 # ─── Telegram API helpers ───────────────────────────────────────────────────
@@ -583,6 +618,8 @@ class RevolutYNABBot:
                         None)
             elif cmd == "/auto_approve":
                 self._handle_auto_approve(chat_id, sender_id, text)
+            elif cmd == "/settings":
+                self._handle_settings(chat_id, sender_id)
             elif cmd == "/crypto":
                 self._handle_crypto(chat_id, sender_id)
             elif cmd == "/crypto_setup":
@@ -869,8 +906,10 @@ class RevolutYNABBot:
         lines = ["✅ Token valid! Select your budget:\n"]
         for i, b in enumerate(budget_list, 1):
             lines.append(f"  {i}. {b['name']}")
-        lines.append("\nReply with the number.")
-        tg_send(self.token, chat_id, "\n".join(lines), None)
+        lines.append("\nTap a button below — or reply with the number.")
+        markup = self._reply_keyboard([b["name"] for b in budget_list],
+                                      placeholder="Tap your budget")
+        tg_send(self.token, chat_id, "\n".join(lines), None, markup)
 
     # ── Onboarding: budget ───────────────────────────────────────────────
 
@@ -886,19 +925,17 @@ class RevolutYNABBot:
                     "Something went wrong. Please send your YNAB token again.", None)
             return
 
-        # Parse selection
-        try:
-            idx = int(text) - 1
-            if idx < 0 or idx >= len(budget_list):
-                raise ValueError
-        except ValueError:
-            lines = ["Please reply with the number of your budget:\n"]
+        # Resolve selection: either an exact (case-insensitive) name match
+        # against a reply-keyboard button, or a 1-based number from the body.
+        selected = self._match_choice(text, budget_list, key="name")
+        if not selected:
+            lines = ["Please tap your budget — or reply with the number:\n"]
             for i, b in enumerate(budget_list, 1):
                 lines.append(f"  {i}. {b['name']}")
-            tg_send(self.token, chat_id, "\n".join(lines), None)
+            markup = self._reply_keyboard([b["name"] for b in budget_list],
+                                          placeholder="Tap your budget")
+            tg_send(self.token, chat_id, "\n".join(lines), None, markup)
             return
-
-        selected = budget_list[idx]
 
         # Fetch accounts for this budget
         try:
@@ -928,8 +965,10 @@ class RevolutYNABBot:
         for i, a in enumerate(account_list, 1):
             bal = a["balance"] / 1000
             lines.append(f"  {i}. {a['name']} ({a['type']}) — {bal:,.2f}")
-        lines.append("\nReply with the number.")
-        tg_send(self.token, chat_id, "\n".join(lines))
+        lines.append("\nTap an account below — or reply with the number.")
+        markup = self._reply_keyboard([a["name"] for a in account_list],
+                                      placeholder="Tap your account")
+        tg_send(self.token, chat_id, "\n".join(lines), reply_markup=markup)
 
     # ── Onboarding: account ──────────────────────────────────────────────
 
@@ -944,19 +983,16 @@ class RevolutYNABBot:
                     "Something went wrong. Please send your YNAB token again.", None)
             return
 
-        try:
-            idx = int(text) - 1
-            if idx < 0 or idx >= len(account_list):
-                raise ValueError
-        except ValueError:
-            lines = ["Please reply with the number of your account:\n"]
+        selected = self._match_choice(text, account_list, key="name")
+        if not selected:
+            lines = ["Please tap your account — or reply with the number:\n"]
             for i, a in enumerate(account_list, 1):
                 bal = a["balance"] / 1000
                 lines.append(f"  {i}. {a['name']} ({a['type']}) — {bal:,.2f}")
-            tg_send(self.token, chat_id, "\n".join(lines), None)
+            markup = self._reply_keyboard([a["name"] for a in account_list],
+                                          placeholder="Tap your account")
+            tg_send(self.token, chat_id, "\n".join(lines), None, markup)
             return
-
-        selected = account_list[idx]
 
         upsert_user(self.db, sender_id,
                     account_id=selected["id"],
@@ -964,13 +1000,14 @@ class RevolutYNABBot:
                     state="ready",
                     temp_data=None)
 
+        # Remove the reply keyboard now that selection is complete.
         tg_send(self.token, chat_id, (
             f"🎉 All set!\n\n"
             f"  Budget:  {user['budget_name']}\n"
             f"  Account: {selected['name']}\n\n"
             f"You can now send me Revolut CSV files to import.\n"
             f"Type /help to see all commands."
-        ), None)
+        ), None, {"remove_keyboard": True})
 
         ynab.log.info("bot: user %s onboarding complete — budget=%s account=%s",
                       sender_id, user["budget_name"], selected["name"])
@@ -1004,6 +1041,108 @@ class RevolutYNABBot:
         tg_send(self.token, chat_id,
                 f"✅ Auto-approve set to *{'ON' if new_val else 'OFF'}*.")
 
+    # ── /settings ────────────────────────────────────────────────────────
+    #
+    # Inline-keyboard menu — fulfills the global "/settings" command Telegram
+    # asks every bot to support. Surfaces the per-user settings (auto_approve,
+    # crypto setup, full re-setup) in one tap-friendly screen instead of
+    # scattering them across separate commands.
+
+    def _render_settings_menu(self, sender_id):
+        """Build (text, reply_markup) for the settings menu."""
+        user = get_user(self.db, sender_id) or {}
+        auto = bool(user.get("auto_approve", 1))
+
+        text = (
+            "⚙ *Settings*\n\n"
+            "Tap an option below to change it. Changes take effect on the "
+            "next imported CSV."
+        )
+        keyboard = [
+            [{
+                "text": (f"{'✅' if auto else '⬜'} Auto-approve imports: "
+                         f"{'ON' if auto else 'OFF'}"),
+                # callback_data flips the value
+                "callback_data": f"st:auto:{0 if auto else 1}",
+            }],
+            [{"text": "🪙 Crypto setup",
+              "callback_data": "st:crypto"}],
+            [{"text": "🔧 Re-run YNAB setup",
+              "callback_data": "st:setup"}],
+            [{"text": "✖ Close",
+              "callback_data": "st:close"}],
+        ]
+        return text, {"inline_keyboard": keyboard}
+
+    def _handle_settings(self, chat_id, sender_id):
+        text, markup = self._render_settings_menu(sender_id)
+        tg_send(self.token, chat_id, text, "Markdown", markup)
+
+    def _handle_settings_callback(self, cq_id, sender_id, chat_id,
+                                  message_id, action):
+        """Process a tap on the settings menu."""
+        if action == "close":
+            tg_answer_callback(self.token, cq_id, "Closed.")
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text="⚙ Settings closed.",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+            return
+
+        if action.startswith("auto:"):
+            try:
+                new_val = int(action.split(":", 1)[1])
+            except ValueError:
+                tg_answer_callback(self.token, cq_id)
+                return
+            upsert_user(self.db, sender_id, auto_approve=1 if new_val else 0)
+            tg_answer_callback(
+                self.token, cq_id,
+                f"Auto-approve {'enabled' if new_val else 'disabled'}.",
+            )
+            text, markup = self._render_settings_menu(sender_id)
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text=text, reply_markup=markup)
+            except Exception as e:
+                ynab.log.warning("bot: settings re-render failed: %s", e)
+            return
+
+        if action == "crypto":
+            tg_answer_callback(self.token, cq_id, "Opening crypto setup…")
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text="⚙ Settings closed — opening crypto setup.",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+            self._handle_crypto_setup(chat_id, sender_id)
+            return
+
+        if action == "setup":
+            tg_answer_callback(self.token, cq_id, "Restarting setup…")
+            upsert_user(self.db, sender_id, state="awaiting_token",
+                        ynab_token=None, budget_id=None, budget_name=None,
+                        account_id=None, account_name=None, temp_data=None)
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text="⚙ Settings closed — restarting YNAB setup.",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+            tg_send(self.token, chat_id,
+                    "Let's set up your account again.\n\n"
+                    "Please send me your YNAB Personal Access Token.\n"
+                    "(Get it from app.ynab.com → Account Settings → "
+                    "Developer Settings)",
+                    None)
+            return
+
+        # Unknown — just clear spinner
+        tg_answer_callback(self.token, cq_id)
+
     # ── /help ────────────────────────────────────────────────────────────
 
     def _handle_help(self, chat_id, sender_id):
@@ -1015,6 +1154,7 @@ class RevolutYNABBot:
             "🔎 /dedupe — Find orphaned duplicate imports for the last CSV",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
+            "⚙ /settings — Open the settings menu",
             "✅ `/auto_approve on|off` — Toggle auto-approval of imported txns",
             "🪙 /crypto — Sync crypto portfolio value to YNAB",
             "🛠 `/crypto_setup` — Configure BTC xpub / ETH address / tracking account",
@@ -1031,6 +1171,57 @@ class RevolutYNABBot:
                 "/logs `[N]` — Download bot log file (or last N lines)",
             ])
         tg_send(self.token, chat_id, "\n".join(lines))
+
+    # ── Reply-keyboard helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _reply_keyboard(labels, placeholder=None, columns=1):
+        """Build a one-time ReplyKeyboardMarkup with the given labels.
+
+        Telegram caps button labels at ~64 chars; longer ones get truncated
+        in the UI. We don't enforce that here — caller picks short labels.
+        """
+        if not labels:
+            return None
+        rows = []
+        if columns <= 1:
+            rows = [[{"text": str(l)}] for l in labels]
+        else:
+            for i in range(0, len(labels), columns):
+                rows.append([{"text": str(l)} for l in labels[i:i + columns]])
+        markup = {
+            "keyboard": rows,
+            "one_time_keyboard": True,   # hide after the user taps a button
+            "resize_keyboard": True,     # shrink to fit content
+            "selective": True,           # only show to the recipient
+        }
+        if placeholder:
+            markup["input_field_placeholder"] = placeholder[:64]
+        return markup
+
+    @staticmethod
+    def _match_choice(text, items, key):
+        """Resolve a user reply to one item in a list.
+
+        Accepts either an exact (case-insensitive, whitespace-trimmed) match
+        on `item[key]` or a 1-based number indexing into `items`. Returns
+        the matching item or None.
+        """
+        if not text or not items:
+            return None
+        # Exact-name match — the reply-keyboard happy path.
+        norm = text.strip().casefold()
+        for it in items:
+            if str(it.get(key, "")).strip().casefold() == norm:
+                return it
+        # Legacy/typed fallback: 1-based number.
+        try:
+            idx = int(text.strip()) - 1
+        except ValueError:
+            return None
+        if 0 <= idx < len(items):
+            return items[idx]
+        return None
 
     # ── Helpers to get user config ───────────────────────────────────────
 
@@ -1456,6 +1647,12 @@ class RevolutYNABBot:
 
         if data.startswith("dd:"):
             self._handle_dedupe_callback(
+                cq_id, sender_id, chat_id, message_id, data[3:]
+            )
+            return
+
+        if data.startswith("st:"):
+            self._handle_settings_callback(
                 cq_id, sender_id, chat_id, message_id, data[3:]
             )
             return
@@ -2111,12 +2308,54 @@ class RevolutYNABBot:
 
     # ── Main loop ────────────────────────────────────────────────────────
 
+    def _register_bot_commands(self):
+        """Push command lists to Telegram so users get /-autocomplete.
+
+        Two scopes are pushed:
+          - "default" — every user sees the regular command set
+          - BotCommandScopeChat for the admin — admin sees user + admin sets
+
+        Failures are logged at WARNING but never crash startup; the bot still
+        works without autocomplete.
+        """
+        user_cmds = [{"command": c, "description": d} for c, d in USER_COMMANDS]
+        admin_cmds = [{"command": c, "description": d}
+                      for c, d in USER_COMMANDS + ADMIN_EXTRA_COMMANDS]
+
+        # Default scope (visible to everyone). We always overwrite so removed
+        # commands disappear from clients and renamed descriptions update.
+        result = tg_request(self.token, "setMyCommands", {
+            "commands": user_cmds,
+            "scope": {"type": "default"},
+        })
+        if not result.get("ok"):
+            ynab.log.warning("bot: setMyCommands(default) failed: %s",
+                             result.get("description"))
+
+        # Admin-chat override
+        result = tg_request(self.token, "setMyCommands", {
+            "commands": admin_cmds,
+            "scope": {"type": "chat", "chat_id": self.admin_id},
+        })
+        if not result.get("ok"):
+            ynab.log.warning("bot: setMyCommands(admin) failed: %s",
+                             result.get("description"))
+        else:
+            ynab.log.info(
+                "bot: registered %d user commands (default scope) and "
+                "%d admin commands (chat scope=%s)",
+                len(user_cmds), len(admin_cmds), self.admin_id,
+            )
+
     def run(self):
         """Start the bot with long-polling."""
         me = tg_request(self.token, "getMe")
         if not me.get("ok"):
             print("Error: invalid Telegram bot token.")
             sys.exit(1)
+        # Register / refresh slash-command autocomplete with Telegram.
+        # Cheap idempotent call — safe to run on every restart.
+        self._register_bot_commands()
         bot_name = me["result"].get("username", "?")
         version_line = format_version_line()
         print(f"🤖 Bot @{bot_name} started ({version_line}) admin={self.admin_id}")

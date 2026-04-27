@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Reconcile — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+  <div>
+    <h1 class="text-2xl font-semibold tracking-tight">Reconcile</h1>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+      Compare YNAB's cleared balance against the most recent CSV. If they
+      differ, the bot creates a single adjustment so they line up exactly.
+    </p>
+  </div>
+
+  <div class="card">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <div class="text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400">Last CSV</div>
+        <div class="font-medium" id="rec-csv">—</div>
+      </div>
+      <button id="rec-run"
+              class="px-4 py-2 rounded-md bg-brand-500 hover:bg-brand-600 text-white font-medium
+                     focus:outline-none focus:ring-2 focus:ring-brand-500/40 disabled:opacity-50">
+        Run reconcile
+      </button>
+    </div>
+
+    <div id="rec-result" class="hidden mt-4">
+      <div class="rounded-md border border-slate-200 dark:border-ink-700 bg-slate-50 dark:bg-ink-800
+                  p-4 text-sm font-mono whitespace-pre-wrap" id="rec-output"></div>
+    </div>
+
+    <div id="rec-empty" class="text-sm text-ink-500 dark:text-slate-400">
+      Nothing to show yet — press <span class="font-medium text-ink-900 dark:text-slate-100">Run reconcile</span>
+      to compare.
+    </div>
+  </div>
+
+  <div class="card text-sm text-ink-500 dark:text-slate-400">
+    <div class="font-medium text-ink-900 dark:text-slate-100 mb-1">When you'd want this</div>
+    Reconcile is useful after a manual edit in YNAB or when the running
+    total looks off. The bot reads the running balance from the CSV's last
+    row and compares it to the YNAB account. If they match, it does
+    nothing. If not, it logs a single adjustment transaction so they
+    agree, and you can investigate the diff at your leisure.
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('reconcile');</script>
+{% endblock %}

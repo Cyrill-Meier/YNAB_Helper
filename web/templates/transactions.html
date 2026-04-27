@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Transactions — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-5">
+  <div>
+    <h1 class="text-2xl font-semibold tracking-tight">Transactions</h1>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+      Everything the bot has imported into YNAB for this account.
+    </p>
+  </div>
+
+  {# ── Filters ────────────────────────────────────────────────────────── #}
+  <div class="card flex flex-col gap-3 sm:flex-row sm:items-center">
+    <div class="flex-1 relative">
+      <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-ink-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3" stroke-linecap="round"/></svg>
+      <input id="tx-search" type="search" placeholder="Search payee or memo…"
+             autocomplete="off"
+             class="w-full pl-9 pr-3 py-2 rounded-md border border-slate-200 dark:border-ink-600
+                    bg-white dark:bg-ink-800 placeholder:text-ink-500
+                    focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+    </div>
+    <select id="tx-state"
+            class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                   py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+      <option value="all">All states</option>
+      <option value="cleared">Cleared</option>
+      <option value="uncleared">Pending</option>
+    </select>
+    <select id="tx-sort"
+            class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                   py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+      <option value="-date">Newest first</option>
+      <option value="date">Oldest first</option>
+      <option value="-amount">Largest first</option>
+      <option value="amount">Smallest first</option>
+      <option value="payee_name">Payee A→Z</option>
+    </select>
+  </div>
+
+  {# ── Table ─────────────────────────────────────────────────────────── #}
+  <div class="card p-0 overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 dark:bg-ink-700/50 text-ink-500 dark:text-slate-400">
+          <tr>
+            <th class="text-left px-4 py-2 font-medium">Date</th>
+            <th class="text-left px-4 py-2 font-medium">Payee</th>
+            <th class="text-right px-4 py-2 font-medium">Amount</th>
+            <th class="text-left px-4 py-2 font-medium">Memo</th>
+            <th class="text-left px-4 py-2 font-medium">State</th>
+          </tr>
+        </thead>
+        <tbody id="tx-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+    <div id="tx-empty" class="hidden text-center py-12 text-ink-500 dark:text-slate-400">
+      No transactions match your filter.
+    </div>
+    <div id="tx-loading" class="text-center py-12 text-ink-500 dark:text-slate-400">
+      <span class="spinner inline-block"></span>
+      <span class="ml-2">Loading…</span>
+    </div>
+  </div>
+
+  {# ── Pagination ────────────────────────────────────────────────────── #}
+  <div class="flex items-center justify-between text-sm">
+    <div id="tx-summary" class="text-ink-500 dark:text-slate-400"></div>
+    <div class="flex items-center gap-2">
+      <button id="tx-prev" type="button"
+              class="px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                     hover:bg-slate-100 dark:hover:bg-ink-700 disabled:opacity-40">‹ Prev</button>
+      <button id="tx-next" type="button"
+              class="px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                     hover:bg-slate-100 dark:hover:bg-ink-700 disabled:opacity-40">Next ›</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('transactions');</script>
+{% endblock %}

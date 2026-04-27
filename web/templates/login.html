@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en" class="h-full" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in — Revolut → YNAB</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class', theme: { extend: { colors: { brand: { 500: '#0EE3C8', 600: '#0BB6A0' } } } } };
+    (function () {
+      const t = localStorage.getItem('theme');
+      const sys = matchMedia('(prefers-color-scheme: dark)').matches;
+      if (t === 'dark' || (!t && sys)) document.documentElement.classList.add('dark');
+    })();
+  </script>
+</head>
+<body class="h-full bg-slate-50 dark:bg-[#0B0F14] text-slate-900 dark:text-slate-100 antialiased">
+  <div class="min-h-full flex items-center justify-center p-4">
+    <div class="w-full max-w-md">
+      <div class="text-center mb-8">
+        <div class="mx-auto w-14 h-14 rounded-2xl bg-brand-500/10 flex items-center justify-center mb-4">
+          <svg viewBox="0 0 32 32" class="w-8 h-8 text-brand-500" fill="none" stroke="currentColor" stroke-width="2.2">
+            <circle cx="16" cy="16" r="13" stroke-opacity="0.35"/>
+            <path d="M7 17l4 4 14-14" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <h1 class="text-2xl font-semibold tracking-tight">Revolut → YNAB</h1>
+        <p class="text-slate-500 dark:text-slate-400 text-sm mt-1">Sign in via your Telegram bot</p>
+      </div>
+
+      <div class="bg-white dark:bg-[#11171F] border border-slate-200 dark:border-[#1A222D] rounded-2xl p-6 shadow-sm">
+        <ol class="space-y-3 text-sm">
+          <li class="flex gap-3">
+            <span class="flex-none w-6 h-6 rounded-full bg-brand-500 text-white grid place-items-center font-medium text-xs">1</span>
+            <span>Open Telegram and chat with your bot.</span>
+          </li>
+          <li class="flex gap-3">
+            <span class="flex-none w-6 h-6 rounded-full bg-brand-500 text-white grid place-items-center font-medium text-xs">2</span>
+            <span>Send <code class="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1A222D]">/login</code>.</span>
+          </li>
+          <li class="flex gap-3">
+            <span class="flex-none w-6 h-6 rounded-full bg-brand-500 text-white grid place-items-center font-medium text-xs">3</span>
+            <span>Tap the URL the bot sends you back. It's single-use and expires in a few minutes.</span>
+          </li>
+        </ol>
+
+        {% if message %}
+          <div class="mt-6 px-3 py-2 rounded-md text-sm border
+                      bg-amber-50 border-amber-200 text-amber-800
+                      dark:bg-amber-500/10 dark:border-amber-500/20 dark:text-amber-300">
+            {{ message }}
+          </div>
+        {% endif %}
+      </div>
+
+      <p class="text-center text-xs text-slate-500 dark:text-slate-500 mt-6">
+        Auth happens in Telegram — no password is stored here.
+      </p>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Dedupe — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-end justify-between gap-4 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Dedupe</h1>
+      <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+        Find YNAB rows whose <code class="px-1 py-0.5 rounded bg-slate-100 dark:bg-ink-700">import_id</code>
+        no longer matches the latest CSV — typically leftovers from an earlier
+        import where the amount changed (Revolut sometimes settles a different
+        amount than it pre-authorized).
+      </p>
+    </div>
+    <button id="dd-scan"
+            class="px-4 py-2 rounded-md bg-brand-500 hover:bg-brand-600 text-white font-medium
+                   focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+      Scan
+    </button>
+  </div>
+
+  <div id="dd-meta" class="card hidden">
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+      <div>
+        <div class="text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400">Range</div>
+        <div class="font-medium" id="dd-range">—</div>
+      </div>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400">CSV rows</div>
+        <div class="font-medium" id="dd-csv-count">—</div>
+      </div>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400">YNAB in range</div>
+        <div class="font-medium" id="dd-ynab-count">—</div>
+      </div>
+      <div>
+        <div class="text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400">Orphans</div>
+        <div class="font-medium" id="dd-orphan-count">—</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="dd-empty" class="card hidden text-center py-10 text-ink-500 dark:text-slate-400">
+    🎉 No orphaned imports found in the CSV's date range.
+  </div>
+
+  <div id="dd-results" class="card p-0 overflow-hidden hidden">
+    <div class="px-4 py-3 border-b border-slate-200 dark:border-ink-700 flex items-center gap-2 flex-wrap">
+      <label class="flex items-center gap-2 text-sm">
+        <input id="dd-select-all" type="checkbox" class="rounded border-slate-300 dark:border-ink-600 text-brand-500 focus:ring-brand-500">
+        <span>Select all</span>
+      </label>
+      <span class="text-sm text-ink-500 dark:text-slate-400" id="dd-selected-count">0 selected</span>
+      <div class="ml-auto flex items-center gap-2">
+        <button id="dd-deselect"
+                class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                       hover:bg-slate-100 dark:hover:bg-ink-700">Clear</button>
+        <button id="dd-delete"
+                class="text-sm px-3 py-1.5 rounded-md bg-rose-600 text-white hover:bg-rose-700
+                       disabled:opacity-50">Delete selected</button>
+      </div>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 dark:bg-ink-700/50 text-ink-500 dark:text-slate-400">
+          <tr>
+            <th class="px-4 py-2 w-8"></th>
+            <th class="text-left px-4 py-2 font-medium">Date</th>
+            <th class="text-left px-4 py-2 font-medium">Payee</th>
+            <th class="text-right px-4 py-2 font-medium">Amount</th>
+            <th class="text-left px-4 py-2 font-medium">Memo</th>
+            <th class="text-left px-4 py-2 font-medium">Cleared</th>
+          </tr>
+        </thead>
+        <tbody id="dd-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="dd-initial" class="card text-center py-10 text-ink-500 dark:text-slate-400">
+    Press <span class="font-medium text-ink-900 dark:text-slate-100">Scan</span> to look for orphans.
+  </div>
+</div>
+
+{# ── Confirm modal ─────────────────────────────────────────────────── #}
+<div id="dd-modal" class="hidden fixed inset-0 z-40 bg-black/40 grid place-items-center p-4">
+  <div class="bg-white dark:bg-ink-800 rounded-2xl shadow-soft w-full max-w-md p-5">
+    <h3 class="text-lg font-semibold">Delete <span id="dd-modal-count">N</span> transaction(s)?</h3>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-2">
+      This permanently removes them from YNAB. There's no undo.
+    </p>
+    <div class="mt-5 flex justify-end gap-2">
+      <button id="dd-modal-cancel"
+              class="px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                     hover:bg-slate-100 dark:hover:bg-ink-700">Cancel</button>
+      <button id="dd-modal-confirm"
+              class="px-3 py-1.5 rounded-md bg-rose-600 text-white hover:bg-rose-700">
+        Yes, delete
+      </button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('dedupe');</script>
+{% endblock %}

@@ -180,8 +180,16 @@ def get_config():
 def init_db(db_path=None):
     """Initialize the SQLite database for tracking imported transactions."""
     path = db_path or DEFAULT_DB_PATH
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL lets the web UI (separate threads) read concurrently while the
+    # bot's main loop writes. busy_timeout retries lock contention rather
+    # than instantly failing.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error:
+        pass
 
     # Main transactions table — stores both pushed (from Revolut CSV)
     # and pulled (from YNAB sync) transactions

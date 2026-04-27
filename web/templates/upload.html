@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Upload — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+  <div>
+    <h1 class="text-2xl font-semibold tracking-tight">Upload CSV</h1>
+    <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+      Drop a Revolut account-statement CSV here. The same import pipeline
+      runs as via Telegram — it'll diff against the local DB and only push
+      new or changed rows to YNAB.
+    </p>
+  </div>
+
+  <div class="card p-0 overflow-hidden">
+    <label id="up-drop"
+           class="flex flex-col items-center justify-center text-center px-6 py-14 cursor-pointer
+                  transition border-2 border-dashed border-slate-200 dark:border-ink-700
+                  hover:border-brand-500 hover:bg-brand-500/5">
+      <svg class="w-10 h-10 text-ink-500 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+        <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div class="font-medium">Drop a CSV here, or click to choose a file</div>
+      <div class="text-xs text-ink-500 dark:text-slate-400 mt-1">
+        Up to 25 MB. Filenames like <code class="bg-slate-100 dark:bg-ink-700 rounded px-1">account-statement_*.csv</code> work best.
+      </div>
+      <input id="up-input" type="file" accept=".csv,text/csv" class="hidden">
+    </label>
+  </div>
+
+  <div id="up-result" class="card hidden">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-medium">Import result</h2>
+      <span id="up-result-name" class="text-sm text-ink-500 dark:text-slate-400 truncate max-w-xs"></span>
+    </div>
+    <pre id="up-output"
+         class="rounded-md border border-slate-200 dark:border-ink-700 bg-slate-50 dark:bg-ink-800
+                p-4 text-sm font-mono whitespace-pre-wrap"></pre>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('upload');</script>
+{% endblock %}

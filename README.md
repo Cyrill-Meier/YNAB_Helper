@@ -8,6 +8,7 @@ A personal-finance assistant that pulls data from Revolut, your Ledger/Ethereum 
 ## Contents
 
 - [Quick start (Telegram bot via Docker)](#quick-start-telegram-bot-via-docker)
+- [Web dashboard (optional)](#web-dashboard-optional)
 - [Commands](#commands)
 - [Crypto portfolio sync](#crypto-portfolio-sync)
 - [Interactive Brokers NAV sync](#interactive-brokers-nav-sync)
@@ -101,6 +102,77 @@ docker compose up -d
 The bot sends you a startup DM with the running version number. Watchtower polls GHCR every 5 minutes and auto-updates the bot on new releases.
 
 Stop everything with `docker compose down`. Persistent data lives in `./bot_data/` and survives restarts and image updates.
+
+---
+
+## Web dashboard (optional)
+
+Alongside the Telegram bot, the same container can run a FastAPI web app at `https://<your-tunnel>/` with:
+
+- A clean dashboard (balance, transaction count, last import, last CSV)
+- Searchable / paginated transactions table
+- Drag-and-drop CSV upload (mirrors `/import` behaviour from Telegram)
+- One-click reconcile
+- A much nicer dedupe view (multi-select with checkboxes, bulk delete with confirm)
+- Settings (auto-approve toggle)
+
+Auth is **bot-mediated** — no password, no email. Send `/login` in Telegram, the bot replies with a single-use URL that expires in 5 minutes. Click it once → cookie session → done.
+
+### 1. Pick how the web UI gets HTTPS
+
+The included `docker-compose.yml` bundles a `cloudflared` sidecar that publishes the in-container port 8080 over a Cloudflare Tunnel. **No public ports on the host. No domain required for testing.**
+
+Two ways to wire cloudflared:
+
+**(a) Named tunnel (recommended)** — needs a free Cloudflare account.
+
+1. In Cloudflare Zero Trust → *Networks* → *Tunnels* → *Create a tunnel* → Cloudflared → name it (e.g. `revolut-ynab`).
+2. Copy the generated **token** (starts with `eyJ…`).
+3. On the host:
+   ```bash
+   echo "TUNNEL_TOKEN=eyJ..." > ~/ynab-bot/cloudflared.env
+   ```
+4. Add a *Public hostname* in the dashboard:
+   - Subdomain: `ynab` (whatever you like)
+   - Domain: any domain you've added to Cloudflare
+   - Service: `http://revolut-ynab-bot:8080`
+
+That hostname is what you set as `WEB_UI_PUBLIC_URL` (next step).
+
+**(b) Quick tunnel (testing only)** — no account, fresh `*.trycloudflare.com` URL on every restart.
+
+Edit `docker-compose.yml`, replace the cloudflared `command:` line with:
+```yaml
+    command: tunnel --no-autoupdate --url http://revolut-ynab-bot:8080
+```
+Watch the logs: `docker compose logs cloudflared` — the URL is in there.
+
+### 2. Configure the web UI in `bot.env`
+
+```bash
+WEB_UI_ENABLED=1
+WEB_UI_PUBLIC_URL=https://ynab.your-domain.example.com
+# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+WEB_UI_SECRET_KEY=put_a_random_48_byte_string_here
+```
+
+Optional knobs (defaults shown): `WEB_UI_HOST=0.0.0.0`, `WEB_UI_PORT=8080`, `WEB_UI_LOGIN_TTL=300`, `WEB_UI_SESSION_TTL=1800`. See `.env.example` for the full list.
+
+### 3. Restart and use it
+
+```bash
+docker compose up -d
+```
+
+In Telegram, send `/login` → tap the URL the bot replies with → you're in.
+
+### Security notes
+
+- Login URL tokens are **single-use** and stored hashed (SHA-256) in the bot DB.
+- Session cookies are HttpOnly, `SameSite=Lax`, and `Secure` when the public URL is HTTPS.
+- All state-changing endpoints require a CSRF header derived from the session cookie (double-submit pattern).
+- A simple in-process rate limiter caps `/auth` at 10 attempts/minute/IP.
+- Optional `WEB_UI_ALLOWED_IPS` env var if you want to limit further (e.g. only your home network when running on LAN).
 
 ---
 

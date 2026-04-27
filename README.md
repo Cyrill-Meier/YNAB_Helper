@@ -29,6 +29,18 @@ This is the canonical deployment: a small Linux host running Docker, pulling the
 1. In Telegram, search for **@BotFather** → send `/newbot` → follow the prompts → copy the bot token.
 2. Search for **@userinfobot** → send `/start` → copy your numeric user ID. That's your admin ID.
 
+#### Optional — polish the bot's profile in BotFather
+
+The bot pushes its slash-command list to Telegram automatically on every startup (via `setMyCommands`), so users get autocomplete when they type `/` — and admin-only commands are scoped to the admin chat. The remaining BotFather settings are pure UX polish; do them once:
+
+| BotFather menu | What to set |
+| --- | --- |
+| `/mybots` → *Edit Bot* → *Edit Description* | Short intro shown above an empty chat. e.g. *"Forward your Revolut CSV → it lands in YNAB."* |
+| *Edit About* | One-liner shown in the bot's profile. e.g. *"Personal Revolut → YNAB importer with crypto + IBKR sync."* |
+| *Edit Botpic* | A 512×512 image. The Revolut/YNAB logos work fine; or anything recognizable. |
+| `/setcommands` | **Skip** — the bot does this itself. Don't override it here or your edits will be overwritten on the next restart. |
+| *Bot Settings* → *Menu Button* | Default ("show commands") is fine. The bot's commands feed straight into this. |
+
 ### 2. Prepare the host
 
 On a fresh Ubuntu 24.04 VM (Lightsail, EC2, Hetzner, etc.):

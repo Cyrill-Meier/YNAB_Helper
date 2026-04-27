@@ -23,15 +23,23 @@ bot.example.com {
 	# `revolut-ynab-bot` resolves via Docker's DNS.
 	reverse_proxy revolut-ynab-bot:8080
 
-	# Sensible defaults: HSTS (1 year), referrer policy, no MIME sniffing.
-	# These are public-facing best practices for any HTTPS-only app.
+	# Sensible defaults for an HTTPS-only personal app.
+	#
+	# `'unsafe-inline'` is required for Tailwind's CDN play-mode (which
+	# reads its config from an inline <script>) and for the per-page
+	# inline `<script>RYNAB.boot('…')</script>` bootstrap. To remove
+	# `'unsafe-inline'` later, precompile Tailwind into a static CSS
+	# file and move the page-bootstrap into app.js.
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		X-Frame-Options "DENY"
-		# Don't leak that we're Caddy (cosmetic; doesn't change security).
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), usb=(), payment=(), accelerometer=(), gyroscope=(), magnetometer=()"
+		# Don't leak the proxy stack (cosmetic, not security).
 		-Server
+		-Via
 	}
 
 	# Compact log line per request — easy to grep in

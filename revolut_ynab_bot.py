@@ -58,7 +58,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 
 
 def get_version_info():
@@ -102,8 +102,12 @@ def tg_request(token, method, data=None, timeout=60):
         return {"ok": False, "description": str(e)}
 
 
-def tg_send(token, chat_id, text, parse_mode="Markdown"):
-    """Send a text message. Long messages are split at ~4000 chars."""
+def tg_send(token, chat_id, text, parse_mode="Markdown", reply_markup=None):
+    """Send a text message. Long messages are split at ~4000 chars.
+
+    Returns the API result of the LAST chunk sent, so callers that supplied
+    a ``reply_markup`` can read back ``message_id`` for later edits.
+    """
     chunks = []
     while len(text) > 4000:
         split = text.rfind("\n", 0, 4000)
@@ -113,11 +117,39 @@ def tg_send(token, chat_id, text, parse_mode="Markdown"):
         text = text[split:].lstrip("\n")
     chunks.append(text)
 
-    for chunk in chunks:
+    last = None
+    for i, chunk in enumerate(chunks):
         data = {"chat_id": chat_id, "text": chunk}
         if parse_mode:
             data["parse_mode"] = parse_mode
-        tg_request(token, "sendMessage", data)
+        # Only attach the keyboard to the final chunk
+        if reply_markup is not None and i == len(chunks) - 1:
+            data["reply_markup"] = reply_markup
+        last = tg_request(token, "sendMessage", data)
+    return last
+
+
+def tg_edit_message(token, chat_id, message_id, text=None,
+                    parse_mode="Markdown", reply_markup=None):
+    """Edit an existing bot message (text + reply_markup)."""
+    data = {"chat_id": chat_id, "message_id": message_id}
+    if text is not None:
+        data["text"] = text
+        if parse_mode:
+            data["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        data["reply_markup"] = reply_markup
+    method = "editMessageText" if text is not None else "editMessageReplyMarkup"
+    return tg_request(token, method, data)
+
+
+def tg_answer_callback(token, callback_query_id, text=None, show_alert=False):
+    """Acknowledge a callback_query so Telegram dismisses the loading spinner."""
+    data = {"callback_query_id": callback_query_id}
+    if text:
+        data["text"] = text[:200]
+        data["show_alert"] = show_alert
+    return tg_request(token, "answerCallbackQuery", data)
 
 
 def tg_download_file(token, file_id, dest_path):
@@ -294,7 +326,7 @@ class RevolutYNABBot:
         data = {
             "offset": self.offset,
             "timeout": 30,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         result = tg_request(self.token, "getUpdates", data, timeout=35)
         if not result.get("ok"):
@@ -309,6 +341,12 @@ class RevolutYNABBot:
 
     def handle_update(self, update):
         """Route an incoming update to the right handler."""
+        # Inline-keyboard button click
+        cq = update.get("callback_query")
+        if cq:
+            self._handle_callback_query(cq)
+            return
+
         msg = update.get("message")
         if not msg:
             return
@@ -704,13 +742,13 @@ class RevolutYNABBot:
             current = bool(user.get("auto_approve", 1)) if user else True
             tg_send(self.token, chat_id,
                     f"Auto-approve is currently *{'ON' if current else 'OFF'}*.\n\n"
-                    f"Usage: `/auto\\_approve on` or `/auto\\_approve off`\n"
+                    f"Usage: `/auto_approve on` or `/auto_approve off`\n"
                     f"When OFF, imported transactions land in YNAB's inbox "
                     f"as unapproved for manual review.")
             return
         else:
             tg_send(self.token, chat_id,
-                    "Usage: `/auto\\_approve on` or `/auto\\_approve off`")
+                    "Usage: `/auto_approve on` or `/auto_approve off`")
             return
 
         upsert_user(self.db, sender_id, auto_approve=new_val)
@@ -724,14 +762,14 @@ class RevolutYNABBot:
             f"*Revolut → YNAB Bot* — {format_version_line()}\n",
             "📎 *Send a CSV* — Import Revolut transactions into YNAB",
             "🧮 /reconcile — Reconcile YNAB balance against last CSV",
-            "🧹 /cleanup\\_pending — Strip stale '(pending)' memos from cleared txns",
+            "🧹 `/cleanup_pending` — Strip stale '(pending)' memos from cleared txns",
             "🔎 /dedupe — Find orphaned duplicate imports for the last CSV",
             "📊 /status — Show YNAB account balance & last import",
             "🔧 /setup — Re-run setup (change token / budget / account)",
-            "✅ /auto\\_approve `on|off` — Toggle auto-approval of imported txns",
+            "✅ `/auto_approve on|off` — Toggle auto-approval of imported txns",
             "🪙 /crypto — Sync crypto portfolio value to YNAB",
-            "🛠 /crypto\\_setup — Configure BTC xpub / ETH address / tracking account",
-            "🔍 /crypto\\_status — Show current crypto configuration",
+            "🛠 `/crypto_setup` — Configure BTC xpub / ETH address / tracking account",
+            "🔍 `/crypto_status` — Show current crypto configuration",
             "❓ /help — This message",
         ]
         if sender_id == self.admin_id:
@@ -965,8 +1003,12 @@ class RevolutYNABBot:
                     f"{'s' if patched != 1 else ''}.", None)
 
     # ── /dedupe ──────────────────────────────────────────────────────────
+    #
+    # UX: an inline-keyboard "checkbox list" — each orphaned YNAB transaction
+    # is a toggleable button (⬜ / ✅). Action row at the bottom: select all,
+    # clear, delete (with live count), and cancel. Long lists paginate.
 
-    _DEDUPE_LIST_MAX = 50  # max candidates to show in one message
+    _DEDUPE_PAGE_SIZE = 6  # rows of toggle buttons per page
 
     def _handle_dedupe(self, chat_id, sender_id):
         """Scan YNAB for orphaned duplicate imports in the last CSV's date range."""
@@ -983,7 +1025,7 @@ class RevolutYNABBot:
             return
 
         tg_send(self.token, chat_id,
-                f"🔎 Scanning YNAB for orphaned imports in _{csv_path.name}_...",
+                f"🔎 Scanning YNAB for orphaned imports in {csv_path.name}…",
                 None)
 
         try:
@@ -998,105 +1040,265 @@ class RevolutYNABBot:
             return
 
         orphans = report["orphans"]
-        header = (
-            f"📅 Range: {report['start_date']} → {report['end_date']}\n"
-            f"📋 CSV: {report['csv_count']} txns | "
-            f"YNAB in range: {report['ynab_count_in_range']}\n"
-        )
 
         if not orphans:
             self._dedupe_candidates.pop(sender_id, None)
             tg_send(self.token, chat_id,
-                    header + "\n✓ No orphaned imports found.", None)
+                    f"📅 Range: {report['start_date']} → {report['end_date']}\n"
+                    f"📋 CSV: {report['csv_count']} txns | "
+                    f"YNAB in range: {report['ynab_count_in_range']}\n\n"
+                    f"✓ No orphaned imports found.",
+                    None)
             return
 
-        # Cache candidates so /dedupe_delete can act on them by index
-        self._dedupe_candidates[sender_id] = orphans
+        # Initialize selection state and store everything we need to re-render
+        # the keyboard from a callback later.
+        state = {
+            "items": orphans,
+            "selected": set(),       # set of indices into items
+            "page": 0,
+            "chat_id": chat_id,
+            "message_id": None,      # filled in below
+            "confirming": False,
+            "report": {
+                "start_date": report["start_date"],
+                "end_date": report["end_date"],
+                "csv_count": report["csv_count"],
+                "ynab_count_in_range": report["ynab_count_in_range"],
+            },
+        }
+        self._dedupe_candidates[sender_id] = state
 
-        lines = [header,
-                 f"⚠ Found *{len(orphans)}* orphaned import"
-                 f"{'s' if len(orphans) != 1 else ''} "
-                 f"(YNAB rows whose import\\_id no longer matches the CSV):\n"]
-        shown = orphans[:self._DEDUPE_LIST_MAX]
-        for i, o in enumerate(shown, 1):
-            amt = o["amount"] / 1000
-            payee = (o["payee_name"] or "?")[:30]
-            lines.append(f"`{i:>2}.` {o['date']}  {amt:>9.2f}  {payee}")
-        if len(orphans) > self._DEDUPE_LIST_MAX:
-            lines.append(f"\n…and {len(orphans) - self._DEDUPE_LIST_MAX} more "
-                         f"(use `/dedupe\\_delete all` to remove every orphan).")
+        text, markup = self._render_dedupe_message(state)
+        result = tg_send(self.token, chat_id, text, "Markdown", markup)
+        try:
+            state["message_id"] = result["result"]["message_id"]
+        except (KeyError, TypeError):
+            ynab.log.warning("bot: dedupe send returned no message_id; "
+                             "callbacks will still work but edits may fail")
 
-        lines.append(
-            "\nReply with:\n"
-            "  `/dedupe\\_delete 1,3,5` — delete specific rows\n"
-            "  `/dedupe\\_delete all` — delete all listed orphans\n"
-            "  `/dedupe\\_cancel` — discard the list"
+    # ── Keyboard rendering ───────────────────────────────────────────────
+
+    @staticmethod
+    def _fmt_orphan_button(orphan, selected):
+        """Compact label for one orphan toggle button."""
+        amt = orphan["amount"] / 1000
+        payee = (orphan["payee_name"] or "?")[:18]
+        # MM-DD is enough — the full range is shown in the header.
+        date_short = orphan["date"][5:]  # 'YYYY-MM-DD' → 'MM-DD'
+        check = "✅" if selected else "⬜"
+        return f"{check} {date_short}  {amt:>8.2f}  {payee}"
+
+    def _render_dedupe_message(self, state):
+        """Build (text, reply_markup) for the current dedupe state."""
+        report = state["report"]
+        items = state["items"]
+        selected = state["selected"]
+        total = len(items)
+
+        if state.get("confirming"):
+            n = len(selected)
+            text = (
+                f"⚠ *Confirm deletion*\n\n"
+                f"Delete *{n}* transaction{'s' if n != 1 else ''} from YNAB?\n"
+                f"This cannot be undone."
+            )
+            keyboard = [[
+                {"text": f"✅ Yes, delete {n}", "callback_data": "dd:ok"},
+                {"text": "↩ Back", "callback_data": "dd:back"},
+            ]]
+            return text, {"inline_keyboard": keyboard}
+
+        page_size = self._DEDUPE_PAGE_SIZE
+        page_count = max(1, (total + page_size - 1) // page_size)
+        page = max(0, min(state["page"], page_count - 1))
+        state["page"] = page
+        start = page * page_size
+        end = min(start + page_size, total)
+
+        text = (
+            f"📅 *Range:* {report['start_date']} → {report['end_date']}\n"
+            f"📋 CSV: {report['csv_count']} | "
+            f"YNAB in range: {report['ynab_count_in_range']}\n\n"
+            f"⚠ Found *{total}* orphaned import"
+            f"{'s' if total != 1 else ''} "
+            f"(YNAB rows whose import_id no longer matches the CSV).\n"
+            f"Tick the rows to delete, then press 🗑."
         )
-        tg_send(self.token, chat_id, "\n".join(lines))
+        if page_count > 1:
+            text += f"\n\nPage {page + 1}/{page_count}"
 
-    def _handle_dedupe_cancel(self, chat_id, sender_id):
-        had = self._dedupe_candidates.pop(sender_id, None)
-        if had:
-            tg_send(self.token, chat_id, "🗑 Dedupe selection cleared.", None)
-        else:
-            tg_send(self.token, chat_id,
-                    "Nothing pending. Run /dedupe first to scan.", None)
+        keyboard = []
+        for idx in range(start, end):
+            label = self._fmt_orphan_button(items[idx], idx in selected)
+            keyboard.append([
+                {"text": label, "callback_data": f"dd:t:{idx}"}
+            ])
 
-    def _handle_dedupe_delete(self, chat_id, sender_id, text):
-        """Delete orphans selected from the last /dedupe list."""
+        if page_count > 1:
+            nav = []
+            if page > 0:
+                nav.append({"text": "« Prev", "callback_data": f"dd:p:{page - 1}"})
+            nav.append({"text": f"{page + 1}/{page_count}",
+                        "callback_data": "dd:noop"})
+            if page < page_count - 1:
+                nav.append({"text": "Next »", "callback_data": f"dd:p:{page + 1}"})
+            keyboard.append(nav)
+
+        n_sel = len(selected)
+        keyboard.append([
+            {"text": "✅ All", "callback_data": "dd:all"},
+            {"text": "⬜ None", "callback_data": "dd:none"},
+        ])
+        keyboard.append([
+            {"text": f"🗑 Delete ({n_sel})", "callback_data": "dd:del"},
+            {"text": "✖ Cancel", "callback_data": "dd:c"},
+        ])
+        return text, {"inline_keyboard": keyboard}
+
+    # ── Callback queries ─────────────────────────────────────────────────
+
+    def _handle_callback_query(self, cq):
+        """Dispatch inline-keyboard button clicks."""
+        cq_id = cq.get("id")
+        sender_id = cq.get("from", {}).get("id")
+        data = cq.get("data") or ""
+        msg = cq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        message_id = msg.get("message_id")
+
+        if data.startswith("dd:"):
+            self._handle_dedupe_callback(
+                cq_id, sender_id, chat_id, message_id, data[3:]
+            )
+            return
+
+        # Unknown callback — just ack so spinner clears
+        tg_answer_callback(self.token, cq_id)
+
+    def _handle_dedupe_callback(self, cq_id, sender_id, chat_id, message_id, action):
+        """Process a dedupe button click."""
+        state = self._dedupe_candidates.get(sender_id)
+        if not state:
+            tg_answer_callback(self.token, cq_id,
+                               "This list has expired. Run /dedupe again.",
+                               show_alert=True)
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text="_Dedupe list expired._",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+            return
+
+        # Keep message_id current — handles the case where _handle_dedupe
+        # couldn't read it back from sendMessage.
+        state["message_id"] = message_id
+        state["chat_id"] = chat_id
+
+        if action == "noop":
+            tg_answer_callback(self.token, cq_id)
+            return
+
+        if action == "c":
+            self._dedupe_candidates.pop(sender_id, None)
+            tg_answer_callback(self.token, cq_id, "Cancelled.")
+            try:
+                tg_edit_message(self.token, chat_id, message_id,
+                                text="✖ Dedupe cancelled.",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+            return
+
+        if action == "all":
+            state["selected"] = set(range(len(state["items"])))
+            tg_answer_callback(self.token, cq_id, "All selected.")
+            self._refresh_dedupe_message(state)
+            return
+
+        if action == "none":
+            state["selected"].clear()
+            tg_answer_callback(self.token, cq_id, "Cleared.")
+            self._refresh_dedupe_message(state)
+            return
+
+        if action.startswith("t:"):
+            try:
+                idx = int(action[2:])
+            except ValueError:
+                tg_answer_callback(self.token, cq_id)
+                return
+            if 0 <= idx < len(state["items"]):
+                if idx in state["selected"]:
+                    state["selected"].remove(idx)
+                else:
+                    state["selected"].add(idx)
+            tg_answer_callback(self.token, cq_id)
+            self._refresh_dedupe_message(state)
+            return
+
+        if action.startswith("p:"):
+            try:
+                page = int(action[2:])
+            except ValueError:
+                tg_answer_callback(self.token, cq_id)
+                return
+            state["page"] = page
+            tg_answer_callback(self.token, cq_id)
+            self._refresh_dedupe_message(state)
+            return
+
+        if action == "del":
+            if not state["selected"]:
+                tg_answer_callback(self.token, cq_id, "Nothing selected.",
+                                   show_alert=True)
+                return
+            state["confirming"] = True
+            tg_answer_callback(self.token, cq_id)
+            self._refresh_dedupe_message(state)
+            return
+
+        if action == "back":
+            state["confirming"] = False
+            tg_answer_callback(self.token, cq_id)
+            self._refresh_dedupe_message(state)
+            return
+
+        if action == "ok":
+            self._execute_dedupe_delete(cq_id, sender_id, state)
+            return
+
+        tg_answer_callback(self.token, cq_id)
+
+    def _refresh_dedupe_message(self, state):
+        """Re-render the dedupe message in place from current state."""
+        text, markup = self._render_dedupe_message(state)
+        try:
+            tg_edit_message(self.token, state["chat_id"], state["message_id"],
+                            text=text, reply_markup=markup)
+        except Exception as e:
+            ynab.log.warning("bot: dedupe edit failed: %s", e)
+
+    def _execute_dedupe_delete(self, cq_id, sender_id, state):
+        """Perform the YNAB deletes for currently selected items."""
         cfg = self._user_config(sender_id)
         if not cfg:
-            tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
+            tg_answer_callback(self.token, cq_id, "Setup incomplete.",
+                               show_alert=True)
             return
 
-        candidates = self._dedupe_candidates.get(sender_id) or []
-        if not candidates:
-            tg_send(self.token, chat_id,
-                    "No dedupe candidates pending. Run /dedupe first.", None)
-            return
-
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip():
-            tg_send(self.token, chat_id,
-                    "Usage: `/dedupe\\_delete 1,3,5` or `/dedupe\\_delete all`")
-            return
-        arg = parts[1].strip().lower()
-
-        if arg in ("all", "*"):
-            to_delete = list(candidates)
-        else:
-            indices = set()
-            try:
-                for piece in arg.replace(" ", "").split(","):
-                    if not piece:
-                        continue
-                    if "-" in piece:
-                        a, b = piece.split("-", 1)
-                        for i in range(int(a), int(b) + 1):
-                            indices.add(i)
-                    else:
-                        indices.add(int(piece))
-            except ValueError:
-                tg_send(self.token, chat_id,
-                        "Couldn't parse selection. Use numbers like `1,3,5` "
-                        "or a range like `2-4`, or `all`.")
-                return
-
-            invalid = [i for i in indices if i < 1 or i > len(candidates)]
-            if invalid:
-                tg_send(self.token, chat_id,
-                        f"Out-of-range index: {sorted(invalid)} "
-                        f"(valid 1–{len(candidates)}).")
-                return
-            to_delete = [candidates[i - 1] for i in sorted(indices)]
-
+        items = state["items"]
+        to_delete = [items[i] for i in sorted(state["selected"])
+                     if 0 <= i < len(items)]
         if not to_delete:
-            tg_send(self.token, chat_id, "Nothing selected.", None)
+            tg_answer_callback(self.token, cq_id, "Nothing selected.",
+                               show_alert=True)
+            state["confirming"] = False
+            self._refresh_dedupe_message(state)
             return
 
-        tg_send(self.token, chat_id,
-                f"🗑 Deleting {len(to_delete)} transaction"
-                f"{'s' if len(to_delete) != 1 else ''} from YNAB...", None)
+        tg_answer_callback(self.token, cq_id, f"Deleting {len(to_delete)}…")
 
         conn = None
         try:
@@ -1106,14 +1308,12 @@ class RevolutYNABBot:
 
         deleted = 0
         failures = []
-        deleted_ids = set()
         for o in to_delete:
             try:
                 ynab.delete_ynab_transaction(
                     conn, cfg["ynab_token"], cfg["budget_id"], o["id"],
                 )
                 deleted += 1
-                deleted_ids.add(o["id"])
                 ynab.log.info(
                     "bot: dedupe deleted ynab_id=%s date=%s amt=%+.2f payee=%s "
                     "import_id=%s user=%s",
@@ -1130,23 +1330,133 @@ class RevolutYNABBot:
             except Exception:
                 pass
 
-        # Drop deleted entries from the cached list so a follow-up call only
-        # sees what remains.
-        remaining = [c for c in candidates if c["id"] not in deleted_ids]
-        if remaining:
-            self._dedupe_candidates[sender_id] = remaining
-        else:
-            self._dedupe_candidates.pop(sender_id, None)
+        # Drop the picker and report.
+        self._dedupe_candidates.pop(sender_id, None)
+        lines = [f"✓ Deleted {deleted}/{len(to_delete)} transaction(s)."]
+        if failures:
+            lines.append(f"\n⚠ {len(failures)} failed:")
+            for o, err in failures[:5]:
+                lines.append(f"  • {o['date']} {o['payee_name'][:25]}: {err[:80]}")
+        try:
+            tg_edit_message(self.token, state["chat_id"], state["message_id"],
+                            text="\n".join(lines),
+                            reply_markup={"inline_keyboard": []})
+        except Exception:
+            tg_send(self.token, state["chat_id"], "\n".join(lines))
 
+    # ── Text-command fallbacks (used by /dedupe_cancel etc.) ─────────────
+
+    def _handle_dedupe_cancel(self, chat_id, sender_id):
+        state = self._dedupe_candidates.pop(sender_id, None)
+        if state and state.get("message_id"):
+            try:
+                tg_edit_message(self.token, state["chat_id"],
+                                state["message_id"],
+                                text="✖ Dedupe cancelled.",
+                                reply_markup={"inline_keyboard": []})
+            except Exception:
+                pass
+        if state:
+            tg_send(self.token, chat_id, "🗑 Dedupe selection cleared.", None)
+        else:
+            tg_send(self.token, chat_id,
+                    "Nothing pending. Run /dedupe first to scan.", None)
+
+    def _handle_dedupe_delete(self, chat_id, sender_id, text):
+        """Legacy text-based delete (e.g. /dedupe_delete all). Buttons preferred."""
+        state = self._dedupe_candidates.get(sender_id)
+        if not state:
+            tg_send(self.token, chat_id,
+                    "No dedupe candidates pending. Run /dedupe first.", None)
+            return
+        items = state["items"]
+
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            tg_send(self.token, chat_id,
+                    "Tip: use the buttons above. "
+                    "Or send /dedupe_delete 1,3,5 / /dedupe_delete all.",
+                    None)
+            return
+        arg = parts[1].strip().lower()
+
+        if arg in ("all", "*"):
+            state["selected"] = set(range(len(items)))
+        else:
+            indices = set()
+            try:
+                for piece in arg.replace(" ", "").split(","):
+                    if not piece:
+                        continue
+                    if "-" in piece:
+                        a, b = piece.split("-", 1)
+                        for i in range(int(a), int(b) + 1):
+                            indices.add(i)
+                    else:
+                        indices.add(int(piece))
+            except ValueError:
+                tg_send(self.token, chat_id,
+                        "Couldn't parse selection. Use 1,3,5 or 2-4 or all.",
+                        None)
+                return
+            invalid = [i for i in indices if i < 1 or i > len(items)]
+            if invalid:
+                tg_send(self.token, chat_id,
+                        f"Out-of-range index: {sorted(invalid)} "
+                        f"(valid 1–{len(items)}).", None)
+                return
+            state["selected"] = {i - 1 for i in indices}
+
+        # Skip the confirmation step for the explicit text command — the
+        # user already typed exactly what they want.
+        cq_state = type("X", (), {})()  # not used; reuse the helper directly
+        # Build a fake context so we can reuse _execute_dedupe_delete logic
+        # without a real callback id.
+        cfg = self._user_config(sender_id)
+        if not cfg:
+            tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
+            return
+
+        to_delete = [items[i] for i in sorted(state["selected"])
+                     if 0 <= i < len(items)]
+        if not to_delete:
+            tg_send(self.token, chat_id, "Nothing selected.", None)
+            return
+        tg_send(self.token, chat_id,
+                f"🗑 Deleting {len(to_delete)} transaction"
+                f"{'s' if len(to_delete) != 1 else ''}…", None)
+
+        conn = None
+        try:
+            conn = ynab.init_db(cfg["db_path"])
+        except Exception as e:
+            ynab.log.warning("bot: could not open local DB for dedupe: %s", e)
+
+        deleted = 0
+        failures = []
+        for o in to_delete:
+            try:
+                ynab.delete_ynab_transaction(
+                    conn, cfg["ynab_token"], cfg["budget_id"], o["id"],
+                )
+                deleted += 1
+            except Exception as e:
+                failures.append((o, str(e)))
+                ynab.log.error("bot: dedupe delete failed id=%s: %s", o["id"], e)
+
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self._dedupe_candidates.pop(sender_id, None)
         msg = [f"✓ Deleted {deleted}/{len(to_delete)} transaction(s)."]
         if failures:
             msg.append(f"\n⚠ {len(failures)} failed:")
             for o, err in failures[:5]:
                 msg.append(f"  • {o['date']} {o['payee_name'][:25]}: {err[:80]}")
-        if remaining:
-            msg.append(f"\n{len(remaining)} candidate(s) still pending. "
-                       f"Reply `/dedupe\\_delete ...` again or `/dedupe\\_cancel`.")
-        tg_send(self.token, chat_id, "\n".join(msg))
+        tg_send(self.token, chat_id, "\n".join(msg), None)
 
     # ── /status ──────────────────────────────────────────────────────────
 
@@ -1211,13 +1521,13 @@ class RevolutYNABBot:
         if not user.get("crypto_account_id"):
             tg_send(self.token, chat_id,
                     "🪙 Crypto tracking isn't configured yet.\n"
-                    "Run /crypto\\_setup to pick a tracking account and add "
+                    "Run `/crypto_setup` to pick a tracking account and add "
                     "your BTC xpub or ETH address.")
             return
         if not user.get("btc_xpub") and not user.get("eth_address"):
             tg_send(self.token, chat_id,
                     "No BTC xpub or ETH address on file. "
-                    "Run /crypto\\_setup to add one.")
+                    "Run `/crypto_setup` to add one.")
             return
 
         tg_send(self.token, chat_id,
@@ -1322,7 +1632,7 @@ class RevolutYNABBot:
         else:
             parts.append("ETH address:   _(not set)_")
 
-        parts.append("\nUse /crypto\\_setup to change these.")
+        parts.append("\nUse `/crypto_setup` to change these.")
         tg_send(self.token, chat_id, "\n".join(parts))
 
     # ── /crypto_setup: start onboarding flow ────────────────────────────
@@ -1351,7 +1661,7 @@ class RevolutYNABBot:
                     "Create one in YNAB first:\n"
                     "  app.ynab.com → Add Account → *Tracking* → "
                     "Asset → name it e.g. 'Crypto'.\n"
-                    "Then run /crypto\\_setup again.")
+                    "Then run `/crypto_setup` again.")
             return
 
         account_list = [{"id": a["id"], "name": a["name"],
@@ -1385,7 +1695,7 @@ class RevolutYNABBot:
         if not account_list:
             upsert_user(self.db, sender_id, state="ready", temp_data=None)
             tg_send(self.token, chat_id,
-                    "Something went wrong. Run /crypto\\_setup again.")
+                    "Something went wrong. Run `/crypto_setup` again.")
             return
 
         try:
@@ -1504,7 +1814,7 @@ class RevolutYNABBot:
             parts.append(f"ETH: `{a[:8]}...{a[-6:]}`")
         if not user.get("btc_xpub") and not user.get("eth_address"):
             parts.append("\n⚠ No BTC or ETH configured — /crypto won't do anything.")
-            parts.append("Run /crypto\\_setup again to add one.")
+            parts.append("Run `/crypto_setup` again to add one.")
         else:
             parts.append("\nRun /crypto anytime to sync your portfolio value to YNAB.")
         tg_send(self.token, chat_id, "\n".join(parts))

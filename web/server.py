@@ -443,7 +443,11 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             return {"items": [], "total": 0, "page": page,
                     "page_size": page_size}
 
-        where = ["deleted = 0 OR deleted IS NULL"]
+        # NOTE: parens are load-bearing — without them, joining this
+        # clause with " AND " plus a second OR clause hits SQL operator
+        # precedence (AND > OR) and the second filter becomes effectively
+        # ignored. See PENTEST_REPORT.md M-1.
+        where = ["(deleted = 0 OR deleted IS NULL)"]
         params = []
         if q:
             like = f"%{q}%"
@@ -565,13 +569,47 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             } for o in report["orphans"]],
         }
 
+    # Each delete fans out to a YNAB DELETE call; YNAB rate-limits at
+    # 200/hour. Capping the array length here protects the user's quota
+    # from a runaway client (or a compromised session) hammering it. See
+    # PENTEST_REPORT.md L-1.
+    DEDUPE_DELETE_MAX = 200
+
     @app.post("/api/dedupe/delete")
     def _api_dedupe_delete(payload: dict, request: Request,
                            user=Depends(_authed_csrf)):
-        ids = payload.get("ids") or []
-        if not isinstance(ids, list) or not ids:
+        raw_ids = payload.get("ids") or []
+        if not isinstance(raw_ids, list) or not raw_ids:
             return JSONResponse(
                 {"error": "no_ids", "message": "No transaction IDs given."},
+                status_code=400,
+            )
+        # Validate + dedupe + cap. YNAB tx IDs are UUIDs (~36 chars);
+        # anything dramatically longer is junk and we reject the whole
+        # request rather than silently dropping items.
+        ids = []
+        seen = set()
+        for x in raw_ids:
+            if not isinstance(x, str):
+                return JSONResponse(
+                    {"error": "bad_ids",
+                     "message": "Every id must be a string."},
+                    status_code=400,
+                )
+            if len(x) > 64 or not x.strip():
+                return JSONResponse(
+                    {"error": "bad_ids",
+                     "message": "An id is empty or implausibly long."},
+                    status_code=400,
+                )
+            if x not in seen:
+                seen.add(x)
+                ids.append(x)
+        if len(ids) > DEDUPE_DELETE_MAX:
+            return JSONResponse(
+                {"error": "too_many_ids",
+                 "message": f"At most {DEDUPE_DELETE_MAX} transactions per "
+                            f"request (YNAB rate limit). Got {len(ids)}."},
                 status_code=400,
             )
         cfg: WebConfig = request.app.state.config

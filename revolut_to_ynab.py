@@ -516,15 +516,36 @@ def parse_csv_date_range(filepath):
     return dates[0], dates[-1]
 
 
+#: Revolut "Product" column values we treat as the main checking account.
+#: Anything else (Savings pockets, Vault, Crypto, Wealth) is skipped — those
+#: are tracked separately in YNAB (or not at all). Without this filter,
+#: e.g. a closed Savings pocket's `0.00` closing-transaction row at the
+#: bottom of the CSV is the "latest" row reconcile reads, and the bot
+#: pushes YNAB to 0.
+TRACKED_PRODUCTS = frozenset(("Current",))
+
+
 def parse_revolut_csv(filepath):
-    """Parse a Revolut account statement CSV into a list of transaction dicts."""
+    """Parse a Revolut account statement CSV into a list of transaction dicts.
+
+    Only rows whose ``Product`` column is in :data:`TRACKED_PRODUCTS` are
+    kept. Other products (Savings pockets, Crypto, Wealth, …) are
+    silently dropped — they're either tracked elsewhere in YNAB or
+    intentionally not tracked at all.
+    """
     transactions = []
     occurrence_counter = {}  # key: "amount:date" → count
+    skipped_products = {}    # for the log line at the end
 
     with open(filepath, "r", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
 
         for row in reader:
+            product = (row.get("Product") or "").strip()
+            if product and product not in TRACKED_PRODUCTS:
+                skipped_products[product] = skipped_products.get(product, 0) + 1
+                continue
+
             date_str = row.get("Started Date", "").strip()
             if not date_str:
                 continue
@@ -590,6 +611,13 @@ def parse_revolut_csv(filepath):
                 "import_id": import_id,
                 "_state": state,  # keep original state for DB tracking
             })
+
+    if skipped_products:
+        details = ", ".join(f"{k}={v}" for k, v in sorted(skipped_products.items()))
+        log.info(
+            "parse_revolut_csv: skipped non-Current rows by Product (%s)",
+            details,
+        )
 
     return transactions
 
@@ -1969,13 +1997,21 @@ def brokerage_sync(token, budget_id, brokerage_account_id, ibkr_base_url,
 def extract_csv_running_balance(filepath):
     """Find the most recent row in a Revolut CSV that has a non-empty Balance.
 
-    Returns a dict: {"balance": float, "date": "YYYY-MM-DD", "currency": "CHF"}
-    or None if the CSV has no populated Balance column.
+    Restricted to rows whose ``Product`` is in :data:`TRACKED_PRODUCTS`
+    so that e.g. a closed Savings pocket's 0.00 closing entry at the
+    bottom of the CSV doesn't get picked up as the "latest" running
+    balance and trigger reconcile to push YNAB toward zero.
+
+    Returns a dict: ``{"balance": float, "date": "YYYY-MM-DD", "currency": "CHF"}``
+    or None if no such row exists.
     """
     with open(filepath, "r", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
 
     for row in reversed(rows):
+        product = (row.get("Product") or "").strip()
+        if product and product not in TRACKED_PRODUCTS:
+            continue
         bal = (row.get("Balance") or "").strip()
         if not bal:
             continue

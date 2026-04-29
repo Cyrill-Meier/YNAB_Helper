@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -99,6 +100,75 @@ def _open_user_db(path):
 
 def _user_tx_db_path(data_dir, telegram_id):
     return Path(data_dir) / f"transactions_{int(telegram_id)}.db"
+
+
+# Tracks the last YNAB→local sync per (telegram_id) inside this process.
+# It's belt-and-suspenders alongside server_knowledge in the DB; the
+# DB-side mechanism handles correctness across restarts, this just
+# stops us hammering YNAB when the user clicks around fast.
+_SYNC_THROTTLE_SECONDS = 30
+_last_sync_at = {}
+_sync_locks = {}
+_sync_locks_lock = threading.Lock()
+
+
+def _maybe_sync_categories(cfg, user, log, force=False):
+    """Pull recent YNAB transactions (incl. categories) into the local DB.
+
+    YNAB exposes a delta protocol via ``server_knowledge`` so subsequent
+    calls only return what changed — this is cheap to call on most
+    page loads. We additionally throttle in-process to ~once per 30 s
+    per user so a flurry of clicks doesn't fan out into N requests.
+
+    Errors are logged and swallowed; the caller still gets to render
+    a degraded view (no categories rather than a 500).
+    """
+    tg_id = user["telegram_id"]
+    now = time.time()
+    if not force and (now - _last_sync_at.get(tg_id, 0)) < _SYNC_THROTTLE_SECONDS:
+        return False
+    # Single in-flight sync per user — avoid two concurrent calls
+    # racing on the same DB / server_knowledge row.
+    with _sync_locks_lock:
+        lock = _sync_locks.setdefault(tg_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        if not force and (now - _last_sync_at.get(tg_id, 0)) < _SYNC_THROTTLE_SECONDS:
+            return False  # someone else just did it
+        db_path = _user_tx_db_path(cfg.data_dir, tg_id)
+        if not db_path.exists():
+            return False
+        import revolut_to_ynab as ynab
+        conn = ynab.init_db(str(db_path))
+        try:
+            buf = io.StringIO()
+            old = sys.stdout
+            sys.stdout = buf
+            try:
+                ynab.sync_from_ynab(
+                    conn, user["ynab_token"], user["budget_id"],
+                    user["account_id"],
+                )
+            finally:
+                sys.stdout = old
+        except Exception as e:
+            log.warning("web: sync_from_ynab failed for user=%s: %s", tg_id, e)
+            return False
+        finally:
+            conn.close()
+        _last_sync_at[tg_id] = time.time()
+        return True
+    finally:
+        lock.release()
+
+
+# Spending charts ignore amounts close to zero (e.g. transfers, the
+# "Closing transaction" rows after the Product=Current filter still
+# allows mirror-leg pocket transfers to remain). We also exclude
+# positive amounts from spending breakdowns — those are deposits /
+# refunds and would skew per-category totals.
+_SPENDING_MIN_ABS_MILLI = 1   # any non-zero spend
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -349,6 +419,14 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
     def _upload_page(request: Request, user=Depends(_current_user)):
         return _page(request, "upload.html", {}, user)
 
+    @app.get("/app/spending", response_class=HTMLResponse)
+    def _spending_page(request: Request, user=Depends(_current_user)):
+        return _page(request, "spending.html", {}, user)
+
+    @app.get("/app/subscriptions", response_class=HTMLResponse)
+    def _subscriptions_page(request: Request, user=Depends(_current_user)):
+        return _page(request, "subscriptions.html", {}, user)
+
     # ── JSON API (auth required for everything below) ───────────────
 
     @app.get("/api/me")
@@ -423,13 +501,20 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
     @app.get("/api/transactions")
     def _api_transactions(
         request: Request,
-        q: str = "", state: str = "all",
+        q: str = "", state: str = "all", category: str = "",
         page: int = 1, page_size: int = 50,
         sort: str = "-date",
         user=Depends(_current_user),
     ):
-        """Paginated, searchable transaction list — reads the user's DB."""
+        """Paginated, searchable transaction list — reads the user's DB.
+
+        Filters: ``q`` (payee/memo substring), ``state`` (all/cleared/
+        uncleared), ``category`` (exact match — pass the empty sentinel
+        ``"__none__"`` to filter for uncategorized rows).
+        """
         cfg: WebConfig = request.app.state.config
+        # Pull fresh categories from YNAB (delta-synced, throttled).
+        _maybe_sync_categories(cfg, user, log)
         page = max(1, int(page))
         page_size = min(200, max(1, int(page_size)))
         sort_field = sort.lstrip("-")
@@ -457,6 +542,12 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             where.append("cleared = 'cleared'")
         elif state == "uncleared":
             where.append("(cleared != 'cleared' OR cleared IS NULL)")
+        if category:
+            if category == "__none__":
+                where.append("(category_name IS NULL OR category_name = '')")
+            else:
+                where.append("category_name = ?")
+                params.append(category)
         where_sql = " AND ".join(where)
 
         conn = _open_user_db(path)
@@ -468,7 +559,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             offset = (page - 1) * page_size
             rows = conn.execute(
                 f"SELECT date, amount, payee_name, memo, cleared, "
-                f"       ynab_tx_id, imported_at "
+                f"       category_name, ynab_tx_id, imported_at "
                 f"FROM transactions WHERE {where_sql} "
                 f"ORDER BY {sort_field} {sort_dir}, imported_at DESC "
                 f"LIMIT ? OFFSET ?",
@@ -484,6 +575,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
                 "payee_name": r["payee_name"] or "",
                 "memo": r["memo"] or "",
                 "cleared": r["cleared"] or "",
+                "category_name": r["category_name"] or "",
                 "ynab_tx_id": r["ynab_tx_id"],
                 "imported_at": r["imported_at"],
             } for r in rows],
@@ -491,6 +583,252 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             "page": page,
             "page_size": page_size,
         }
+
+    @app.get("/api/categories")
+    def _api_categories(request: Request, user=Depends(_current_user)):
+        """Distinct categories present in the user's local DB.
+
+        Returns each category with row count and total spend (negative
+        amounts only) over all time. Used to populate the Transactions
+        page filter dropdown and as input to the Spending page legend.
+        """
+        cfg: WebConfig = request.app.state.config
+        _maybe_sync_categories(cfg, user, log)
+        path = _user_tx_db_path(cfg.data_dir, user["telegram_id"])
+        if not path.exists():
+            return {"items": [], "uncategorized": 0}
+        conn = _open_user_db(path)
+        try:
+            rows = conn.execute("""
+                SELECT
+                    COALESCE(NULLIF(category_name, ''), '') AS name,
+                    COUNT(*) AS n,
+                    SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS spent
+                FROM transactions
+                WHERE (deleted = 0 OR deleted IS NULL)
+                GROUP BY name
+                ORDER BY name COLLATE NOCASE
+            """).fetchall()
+        finally:
+            conn.close()
+        items = []
+        uncat = 0
+        for r in rows:
+            if not r["name"]:
+                uncat = r["n"]
+                continue
+            items.append({
+                "name": r["name"],
+                "count": r["n"],
+                "spent": (r["spent"] or 0) / 1000,
+            })
+        return {"items": items, "uncategorized": uncat}
+
+    @app.get("/api/spending")
+    def _api_spending(request: Request, months: int = 6,
+                      user=Depends(_current_user)):
+        """Per-category spending totals for the last N months.
+
+        Returns a row per (year, month, category_name) plus a summary
+        per-category and a flat list of all months in scope. Frontend
+        uses this for both the per-category month-over-month bars and
+        the top-N list. Negative amounts only — positive rows
+        (deposits, refunds) would skew the breakdown.
+        """
+        cfg: WebConfig = request.app.state.config
+        _maybe_sync_categories(cfg, user, log)
+        months = max(1, min(24, int(months)))
+        # Floor-clamp the start to the 1st of (today - months) so we
+        # always cover full months on the boundary.
+        from datetime import date
+        today = date.today()
+        # Months back, clamped to month-start
+        start_month = (today.month - months) % 12 or 12
+        start_year = today.year - ((months - today.month) // 12 if today.month <= months else 0)
+        # Simpler: just go back by N months naively
+        start = date(today.year, today.month, 1)
+        for _ in range(months):
+            start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
+        path = _user_tx_db_path(cfg.data_dir, user["telegram_id"])
+        if not path.exists():
+            return {"months": [], "by_category": {}, "totals": {}}
+        conn = _open_user_db(path)
+        try:
+            rows = conn.execute("""
+                SELECT
+                    substr(date, 1, 7) AS ym,
+                    COALESCE(NULLIF(category_name, ''), '(uncategorized)') AS category,
+                    SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spent_milli,
+                    COUNT(CASE WHEN amount < 0 THEN 1 END) AS n
+                FROM transactions
+                WHERE date >= ?
+                  AND (deleted = 0 OR deleted IS NULL)
+                GROUP BY ym, category
+                ORDER BY ym DESC, spent_milli DESC
+            """, (start.isoformat(),)).fetchall()
+        finally:
+            conn.close()
+
+        # Distinct months in window, oldest first
+        all_months = []
+        seen_m = set()
+        cur = start
+        while cur <= today:
+            ym = f"{cur.year:04d}-{cur.month:02d}"
+            if ym not in seen_m:
+                seen_m.add(ym); all_months.append(ym)
+            # advance one month
+            ny, nm = (cur.year + 1, 1) if cur.month == 12 else (cur.year, cur.month + 1)
+            cur = date(ny, nm, 1)
+
+        by_cat = {}        # category -> {ym: spent}
+        per_month = {ym: 0.0 for ym in all_months}
+        for r in rows:
+            cat = r["category"]
+            ym = r["ym"]
+            spent = (r["spent_milli"] or 0) / 1000
+            if spent <= 0:
+                continue
+            by_cat.setdefault(cat, {ym2: 0.0 for ym2 in all_months})
+            by_cat[cat][ym] = by_cat[cat].get(ym, 0.0) + spent
+            per_month[ym] = per_month.get(ym, 0.0) + spent
+
+        # Aggregate totals per category over the whole window
+        totals = []
+        for cat, by_ym in by_cat.items():
+            total = sum(by_ym.values())
+            totals.append({
+                "category": cat,
+                "total": total,
+                "by_month": [by_ym.get(m, 0.0) for m in all_months],
+            })
+        totals.sort(key=lambda x: x["total"], reverse=True)
+
+        return {
+            "months": all_months,
+            "per_month_total": [per_month[m] for m in all_months],
+            "categories": totals,
+        }
+
+    @app.get("/api/subscriptions")
+    def _api_subscriptions(request: Request, lookback_months: int = 6,
+                           min_occurrences: int = 3,
+                           user=Depends(_current_user)):
+        """Detect recurring transactions from the user's history.
+
+        Heuristic: group rows by ``payee_name`` (case-insensitive,
+        whitespace-stripped). Within each group, sort by date and
+        compute deltas between consecutive transactions. If the
+        median delta sits in [25, 35] days and there are at least
+        ``min_occurrences`` rows, the group is flagged as a likely
+        monthly subscription. Yearly cadence ([350, 380]) is also
+        flagged. Amount changes between consecutive occurrences are
+        surfaced so price-creep is visible.
+        """
+        cfg: WebConfig = request.app.state.config
+        _maybe_sync_categories(cfg, user, log)
+        from datetime import date
+        from statistics import median
+        lookback_months = max(1, min(24, int(lookback_months)))
+        min_occurrences = max(2, min(12, int(min_occurrences)))
+
+        # Window
+        start = date.today()
+        for _ in range(lookback_months):
+            start = (start.replace(day=1) - timedelta(days=1)).replace(day=1)
+
+        path = _user_tx_db_path(cfg.data_dir, user["telegram_id"])
+        if not path.exists():
+            return {"items": [], "lookback_months": lookback_months}
+        conn = _open_user_db(path)
+        try:
+            rows = conn.execute("""
+                SELECT date, amount, payee_name, category_name, memo
+                FROM transactions
+                WHERE date >= ?
+                  AND amount < 0
+                  AND (deleted = 0 OR deleted IS NULL)
+                  AND payee_name IS NOT NULL
+                  AND payee_name != ''
+                ORDER BY payee_name, date
+            """, (start.isoformat(),)).fetchall()
+        finally:
+            conn.close()
+
+        # Group by normalized payee
+        groups = {}
+        for r in rows:
+            key = (r["payee_name"] or "").strip().lower()
+            if not key:
+                continue
+            groups.setdefault(key, []).append(r)
+
+        out = []
+        for key, txs in groups.items():
+            if len(txs) < min_occurrences:
+                continue
+            # Compute date deltas
+            dates = [datetime.strptime(t["date"], "%Y-%m-%d").date() for t in txs]
+            deltas = [(dates[i+1] - dates[i]).days for i in range(len(dates) - 1)]
+            if not deltas:
+                continue
+            med = median(deltas)
+            cadence = None
+            if 25 <= med <= 35:
+                cadence = "monthly"
+            elif 12 <= med <= 16:
+                cadence = "biweekly"
+            elif 6 <= med <= 8:
+                cadence = "weekly"
+            elif 350 <= med <= 380:
+                cadence = "yearly"
+            if cadence is None:
+                continue
+            # Amount stability: extract the unsigned amount sequence (most recent last)
+            amounts = [(-t["amount"]) / 1000 for t in txs]
+            mn, mx = min(amounts), max(amounts)
+            # Allow ±5 cents as identical (rounding) and call anything else
+            # a price change — track the latest two distinct values
+            distinct = []
+            for a in amounts:
+                if not distinct or abs(distinct[-1] - a) > 0.05:
+                    distinct.append(a)
+            price_changed = len(distinct) > 1
+            # Use the canonical (display) payee name from the most
+            # recent transaction
+            display_name = txs[-1]["payee_name"]
+            categories = sorted({(t["category_name"] or "(uncategorized)") for t in txs})
+            out.append({
+                "payee_name": display_name,
+                "cadence": cadence,
+                "median_days": med,
+                "occurrences": len(txs),
+                "first": dates[0].isoformat(),
+                "last": dates[-1].isoformat(),
+                "amount_min": mn,
+                "amount_max": mx,
+                "amount_latest": amounts[-1],
+                "amount_history": amounts,
+                "price_changed": price_changed,
+                "categories": [c for c in categories if c],
+            })
+        # Sort: monthly first, then by latest amount descending
+        cadence_order = {"weekly": 0, "biweekly": 1, "monthly": 2, "yearly": 3}
+        out.sort(key=lambda x: (cadence_order.get(x["cadence"], 9),
+                                -x["amount_latest"]))
+        return {"items": out, "lookback_months": lookback_months}
+
+    @app.post("/api/sync")
+    def _api_sync(user=Depends(_authed_csrf), request: Request = None):
+        """Force a fresh YNAB → local sync (bypasses the throttle).
+
+        Used by the 'Refresh from YNAB' button. Returns whether the
+        sync actually ran (it can still skip if a concurrent sync
+        was already in flight).
+        """
+        cfg: WebConfig = request.app.state.config
+        ran = _maybe_sync_categories(cfg, user, log, force=True)
+        return {"ok": True, "synced": bool(ran)}
 
     @app.post("/api/reconcile")
     def _api_reconcile(request: Request, user=Depends(_authed_csrf)):

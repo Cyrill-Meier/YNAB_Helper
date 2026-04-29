@@ -96,6 +96,8 @@
         {% endmacro %}
         {{ nav_item('/app/dashboard', 'Dashboard') }}
         {{ nav_item('/app/transactions', 'Transactions') }}
+        {{ nav_item('/app/spending', 'Spending') }}
+        {{ nav_item('/app/subscriptions', 'Subscriptions') }}
         {{ nav_item('/app/upload', 'Upload') }}
         {{ nav_item('/app/reconcile', 'Reconcile') }}
         {{ nav_item('/app/dedupe', 'Dedupe') }}
@@ -122,6 +124,8 @@
         {% set tab = request.url.path %}
         {{ nav_item('/app/dashboard', 'Dashboard') }}
         {{ nav_item('/app/transactions', 'Transactions') }}
+        {{ nav_item('/app/spending', 'Spending') }}
+        {{ nav_item('/app/subscriptions', 'Subscriptions') }}
         {{ nav_item('/app/upload', 'Upload') }}
         {{ nav_item('/app/reconcile', 'Reconcile') }}
         {{ nav_item('/app/dedupe', 'Dedupe') }}

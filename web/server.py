@@ -453,9 +453,11 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             ynab_balance = balance_milli / 1000
         except Exception as e:
             log.warning("web: balance fetch failed for %s: %s", tg_id, e)
-        # Local DB stats
+        # Local DB stats. Reconciled rows count as cleared — see the
+        # similar comment in /api/transactions about YNAB's three-value
+        # `cleared` enum (cleared / reconciled / uncleared).
         path = _user_tx_db_path(cfg.data_dir, tg_id)
-        stats = {"total": 0, "cleared": 0, "uncleared": 0,
+        stats = {"total": 0, "cleared": 0, "reconciled": 0, "uncleared": 0,
                  "last_import": None, "first_date": None, "last_date": None}
         if path.exists():
             conn = _open_user_db(path)
@@ -463,13 +465,17 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
                 row = conn.execute(
                     "SELECT count(*) c, "
                     " sum(case when cleared='cleared' then 1 else 0 end) cc, "
-                    " sum(case when cleared!='cleared' then 1 else 0 end) cu, "
+                    " sum(case when cleared='reconciled' then 1 else 0 end) cr, "
+                    " sum(case when cleared='uncleared' OR cleared IS NULL "
+                    "          then 1 else 0 end) cu, "
                     " min(date) mi, max(date) ma, "
-                    " max(imported_at) li FROM transactions"
+                    " max(imported_at) li FROM transactions "
+                    "WHERE deleted = 0 OR deleted IS NULL"
                 ).fetchone()
                 if row:
                     stats["total"] = row["c"] or 0
                     stats["cleared"] = row["cc"] or 0
+                    stats["reconciled"] = row["cr"] or 0
                     stats["uncleared"] = row["cu"] or 0
                     stats["last_import"] = row["li"]
                     stats["first_date"] = row["mi"]
@@ -543,10 +549,16 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             like = f"%{q}%"
             where.append("(payee_name LIKE ? OR memo LIKE ?)")
             params.extend([like, like])
+        # YNAB's `cleared` column is a three-value enum:
+        # cleared, reconciled, uncleared. Reconciled means
+        # "cleared and locked by a reconcile pass" — it's MORE
+        # cleared than just cleared. So:
+        #   state=cleared   → matches cleared OR reconciled
+        #   state=uncleared → matches uncleared OR NULL only
         if state == "cleared":
-            where.append("cleared = 'cleared'")
+            where.append("cleared IN ('cleared', 'reconciled')")
         elif state == "uncleared":
-            where.append("(cleared != 'cleared' OR cleared IS NULL)")
+            where.append("(cleared = 'uncleared' OR cleared IS NULL)")
         if category:
             if category == "__none__":
                 where.append("(category_name IS NULL OR category_name = '')")

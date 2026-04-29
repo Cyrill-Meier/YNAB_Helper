@@ -226,11 +226,22 @@
         const rows = d.items.map(t => {
           const cls = t.amount < 0 ? "text-rose-600 dark:text-rose-400"
                                    : "text-emerald-600 dark:text-emerald-400";
-          const stateBadge = t.cleared === "cleared"
-            ? `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
-                          bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">cleared</span>`
-            : `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
+          // YNAB's "cleared" column has three values: cleared, reconciled,
+          // uncleared. Treat the first two as cleared (reconciled is just
+          // "cleared and locked"). Render reconciled with a distinct
+          // indigo badge so it remains visually distinguishable.
+          let stateBadge;
+          if (t.cleared === "reconciled") {
+            stateBadge = `<span class="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded-full
+                          bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300"
+                          title="Cleared and locked by reconciliation">🔒 reconciled</span>`;
+          } else if (t.cleared === "cleared") {
+            stateBadge = `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
+                          bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">cleared</span>`;
+          } else {
+            stateBadge = `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
                           bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">pending</span>`;
+          }
           const catCell = t.category_name
             ? `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
                             bg-slate-100 text-slate-700 dark:bg-ink-700 dark:text-slate-300">${escHTML(t.category_name)}</span>`

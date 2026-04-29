@@ -113,15 +113,20 @@ _sync_locks_lock = threading.Lock()
 
 
 def _maybe_sync_categories(cfg, user, log, force=False):
-    """Pull recent YNAB transactions (incl. categories) into the local DB.
+    """Pull recent YNAB data (accounts + budget-wide transactions).
 
-    YNAB exposes a delta protocol via ``server_knowledge`` so subsequent
-    calls only return what changed — this is cheap to call on most
-    page loads. We additionally throttle in-process to ~once per 30 s
-    per user so a flurry of clicks doesn't fan out into N requests.
+    Despite the historical name, this now syncs:
+      1. Accounts — via sync_accounts_from_ynab (cheap, ~1 GET)
+      2. Transactions across every account — via sync_budget_transactions
+         (single GET, delta-paginated through server_knowledge)
 
-    Errors are logged and swallowed; the caller still gets to render
-    a degraded view (no categories rather than a 500).
+    YNAB's delta protocol means subsequent calls only return what
+    changed, so this is cheap to call on most page loads. We additionally
+    throttle in-process to ~once per 30 s per user so a flurry of clicks
+    doesn't fan out into N requests.
+
+    Errors are logged and swallowed; the caller still gets to render a
+    degraded view rather than a 500.
     """
     tg_id = user["telegram_id"]
     now = time.time()
@@ -146,21 +151,71 @@ def _maybe_sync_categories(cfg, user, log, force=False):
             old = sys.stdout
             sys.stdout = buf
             try:
-                ynab.sync_from_ynab(
-                    conn, user["ynab_token"], user["budget_id"],
-                    user["account_id"],
-                )
+                # 1. Accounts — discovers new ones, marks deletions/closures
+                try:
+                    ynab.sync_accounts_from_ynab(
+                        conn, user["ynab_token"], user["budget_id"],
+                    )
+                except Exception as e:
+                    log.warning("web: sync_accounts_from_ynab failed user=%s: %s",
+                                tg_id, e)
+                # 2. Budget-wide transactions (all accounts, one call)
+                try:
+                    ynab.sync_budget_transactions(
+                        conn, user["ynab_token"], user["budget_id"],
+                        primary_account_id=user.get("account_id") or "",
+                    )
+                except Exception as e:
+                    log.warning("web: sync_budget_transactions failed user=%s: %s",
+                                tg_id, e)
+                # 3. Legacy single-account sync — still useful for the
+                #    primary account because it shares a server_knowledge
+                #    slot with the dedupe path.
+                try:
+                    ynab.sync_from_ynab(
+                        conn, user["ynab_token"], user["budget_id"],
+                        user["account_id"],
+                    )
+                except Exception as e:
+                    log.warning("web: sync_from_ynab (primary) failed user=%s: %s",
+                                tg_id, e)
             finally:
                 sys.stdout = old
-        except Exception as e:
-            log.warning("web: sync_from_ynab failed for user=%s: %s", tg_id, e)
-            return False
         finally:
             conn.close()
         _last_sync_at[tg_id] = time.time()
         return True
     finally:
         lock.release()
+
+
+def _parse_account_filter(raw):
+    """Parse a comma-separated ``accounts=`` query param.
+
+    Returns a list of account_id strings (deduped, stripped of empty
+    items) or ``[]`` for the default "all accounts" behaviour.
+    """
+    if not raw:
+        return []
+    seen = []
+    for piece in str(raw).split(","):
+        p = piece.strip()
+        if p and p not in seen:
+            seen.append(p)
+    return seen
+
+
+def _account_where_clause(account_filter):
+    """Render an SQL fragment + params that filter rows to the given accounts.
+
+    Returns ``("", [])`` for the default-all case so callers can tack
+    it onto an existing WHERE. Otherwise an ``account_id IN (?, ?, …)``
+    clause with the right number of placeholders.
+    """
+    if not account_filter:
+        return "", []
+    placeholders = ",".join("?" for _ in account_filter)
+    return f"account_id IN ({placeholders})", list(account_filter)
 
 
 # Spending charts ignore amounts close to zero (e.g. transfers, the
@@ -424,6 +479,10 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
     def _upload_page(request: Request, user=Depends(_current_user)):
         return _page(request, "upload.html", {}, user)
 
+    @app.get("/app/accounts", response_class=HTMLResponse)
+    def _accounts_page(request: Request, user=Depends(_current_user)):
+        return _page(request, "accounts.html", {}, user)
+
     @app.get("/app/spending", response_class=HTMLResponse)
     def _spending_page(request: Request, user=Depends(_current_user)):
         return _page(request, "spending.html", {}, user)
@@ -439,10 +498,17 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
         return _user_summary(user)
 
     @app.get("/api/dashboard")
-    def _api_dashboard(request: Request, user=Depends(_current_user)):
+    def _api_dashboard(request: Request, accounts: str = "",
+                       user=Depends(_current_user)):
         cfg: WebConfig = request.app.state.config
+        _maybe_sync_categories(cfg, user, log)
         tg_id = user["telegram_id"]
+        account_filter = _parse_account_filter(accounts)
         # Pull a balance from YNAB (cheap, single GET) — degrade gracefully.
+        # Note: this is the user's *primary* account balance. The account-
+        # filter applies to local-DB stats; the headline balance card on
+        # the dashboard always shows the primary, since that's the one
+        # the bot writes to via CSV import.
         ynab_balance = None
         currency = "?"
         try:
@@ -462,6 +528,8 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
         if path.exists():
             conn = _open_user_db(path)
             try:
+                acct_clause, acct_params = _account_where_clause(account_filter)
+                where_extra = f" AND {acct_clause}" if acct_clause else ""
                 row = conn.execute(
                     "SELECT count(*) c, "
                     " sum(case when cleared='cleared' then 1 else 0 end) cc, "
@@ -470,7 +538,8 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
                     "          then 1 else 0 end) cu, "
                     " min(date) mi, max(date) ma, "
                     " max(imported_at) li FROM transactions "
-                    "WHERE deleted = 0 OR deleted IS NULL"
+                    "WHERE (deleted = 0 OR deleted IS NULL)" + where_extra,
+                    acct_params,
                 ).fetchone()
                 if row:
                     stats["total"] = row["c"] or 0
@@ -513,6 +582,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
     def _api_transactions(
         request: Request,
         q: str = "", state: str = "all", category: str = "",
+        accounts: str = "",
         page: int = 1, page_size: int = 50,
         sort: str = "-date",
         user=Depends(_current_user),
@@ -521,7 +591,8 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
 
         Filters: ``q`` (payee/memo substring), ``state`` (all/cleared/
         uncleared), ``category`` (exact match — pass the empty sentinel
-        ``"__none__"`` to filter for uncategorized rows).
+        ``"__none__"`` to filter for uncategorized rows), ``accounts``
+        (comma-separated YNAB account ids; default = all).
         """
         cfg: WebConfig = request.app.state.config
         # Pull fresh categories from YNAB (delta-synced, throttled).
@@ -543,11 +614,15 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
         # clause with " AND " plus a second OR clause hits SQL operator
         # precedence (AND > OR) and the second filter becomes effectively
         # ignored. See PENTEST_REPORT.md M-1.
-        where = ["(deleted = 0 OR deleted IS NULL)"]
+        #
+        # All column refs are prefixed `t.` because the SELECT below
+        # joins `transactions t` with `accounts a` and several columns
+        # (deleted, account_id) exist on both tables.
+        where = ["(t.deleted = 0 OR t.deleted IS NULL)"]
         params = []
         if q:
             like = f"%{q}%"
-            where.append("(payee_name LIKE ? OR memo LIKE ?)")
+            where.append("(t.payee_name LIKE ? OR t.memo LIKE ?)")
             params.extend([like, like])
         # YNAB's `cleared` column is a three-value enum:
         # cleared, reconciled, uncleared. Reconciled means
@@ -556,29 +631,40 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
         #   state=cleared   → matches cleared OR reconciled
         #   state=uncleared → matches uncleared OR NULL only
         if state == "cleared":
-            where.append("cleared IN ('cleared', 'reconciled')")
+            where.append("t.cleared IN ('cleared', 'reconciled')")
         elif state == "uncleared":
-            where.append("(cleared = 'uncleared' OR cleared IS NULL)")
+            where.append("(t.cleared = 'uncleared' OR t.cleared IS NULL)")
         if category:
             if category == "__none__":
-                where.append("(category_name IS NULL OR category_name = '')")
+                where.append("(t.category_name IS NULL OR t.category_name = '')")
             else:
-                where.append("category_name = ?")
+                where.append("t.category_name = ?")
                 params.append(category)
+        acct_clause, acct_params = _account_where_clause(_parse_account_filter(accounts))
+        if acct_clause:
+            where.append(acct_clause.replace("account_id", "t.account_id"))
+            params.extend(acct_params)
         where_sql = " AND ".join(where)
 
         conn = _open_user_db(path)
         try:
             total = conn.execute(
-                f"SELECT count(*) FROM transactions WHERE {where_sql}",
+                f"SELECT count(*) FROM transactions t WHERE {where_sql}",
                 params,
             ).fetchone()[0]
             offset = (page - 1) * page_size
+            # Same WHERE clause used for total + page query. account_id
+            # is the only column that exists on both joined tables, and
+            # the where-builder above already prefixes it as t.account_id.
             rows = conn.execute(
-                f"SELECT date, amount, payee_name, memo, cleared, "
-                f"       category_name, ynab_tx_id, imported_at "
-                f"FROM transactions WHERE {where_sql} "
-                f"ORDER BY {sort_field} {sort_dir}, imported_at DESC "
+                f"SELECT t.date, t.amount, t.payee_name, t.memo, t.cleared, "
+                f"       t.category_name, t.ynab_tx_id, t.imported_at, "
+                f"       t.account_id, a.name AS account_name, "
+                f"       a.classification AS account_classification "
+                f"FROM transactions t "
+                f"LEFT JOIN accounts a ON a.account_id = t.account_id "
+                f"WHERE {where_sql} "
+                f"ORDER BY t.{sort_field} {sort_dir}, t.imported_at DESC "
                 f"LIMIT ? OFFSET ?",
                 [*params, page_size, offset],
             ).fetchall()
@@ -595,14 +681,84 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
                 "category_name": r["category_name"] or "",
                 "ynab_tx_id": r["ynab_tx_id"],
                 "imported_at": r["imported_at"],
+                "account_id": r["account_id"] or "",
+                "account_name": r["account_name"] or "",
+                "account_classification": r["account_classification"] or "",
             } for r in rows],
             "total": total,
             "page": page,
             "page_size": page_size,
         }
 
+    @app.get("/api/accounts")
+    def _api_accounts(request: Request, user=Depends(_current_user)):
+        """Return every YNAB account known to this user, with status.
+
+        Schema returned per item:
+            id, name, type, classification ('cash'|'credit'|'tracking'),
+            on_budget, closed, deleted, balance, cleared_balance,
+            uncleared_balance, last_seen_at, last_activity (last
+            transaction date), tx_count (over all stored transactions),
+            is_primary (whether this is the user's CSV-import account)
+        """
+        cfg: WebConfig = request.app.state.config
+        _maybe_sync_categories(cfg, user, log)
+        path = _user_tx_db_path(cfg.data_dir, user["telegram_id"])
+        if not path.exists():
+            return {"items": []}
+        primary = user.get("account_id") or ""
+        conn = _open_user_db(path)
+        try:
+            # Single LEFT JOIN to surface aggregate stats per account
+            rows = conn.execute("""
+                SELECT
+                    a.account_id, a.name, a.type, a.classification,
+                    a.on_budget, a.closed, a.deleted, a.balance,
+                    a.cleared_balance, a.uncleared_balance,
+                    a.last_seen_at, a.note,
+                    (SELECT COUNT(*) FROM transactions t
+                       WHERE t.account_id = a.account_id
+                         AND (t.deleted = 0 OR t.deleted IS NULL))
+                      AS tx_count,
+                    (SELECT MAX(t.date) FROM transactions t
+                       WHERE t.account_id = a.account_id
+                         AND (t.deleted = 0 OR t.deleted IS NULL))
+                      AS last_activity
+                FROM accounts a
+                ORDER BY
+                    a.deleted ASC,
+                    a.closed ASC,
+                    CASE a.classification
+                         WHEN 'cash' THEN 0
+                         WHEN 'credit' THEN 1
+                         WHEN 'tracking' THEN 2
+                         ELSE 3 END,
+                    a.name COLLATE NOCASE
+            """).fetchall()
+        finally:
+            conn.close()
+        items = [{
+            "id": r["account_id"],
+            "name": r["name"] or "(unnamed)",
+            "type": r["type"] or "",
+            "classification": r["classification"] or "tracking",
+            "on_budget": bool(r["on_budget"]),
+            "closed": bool(r["closed"]),
+            "deleted": bool(r["deleted"]),
+            "balance": (r["balance"] or 0) / 1000,
+            "cleared_balance": (r["cleared_balance"] or 0) / 1000,
+            "uncleared_balance": (r["uncleared_balance"] or 0) / 1000,
+            "tx_count": r["tx_count"] or 0,
+            "last_activity": r["last_activity"],
+            "last_seen_at": r["last_seen_at"],
+            "is_primary": r["account_id"] == primary,
+            "note": r["note"] or "",
+        } for r in rows]
+        return {"items": items, "primary_account_id": primary}
+
     @app.get("/api/categories")
-    def _api_categories(request: Request, user=Depends(_current_user)):
+    def _api_categories(request: Request, accounts: str = "",
+                        user=Depends(_current_user)):
         """Distinct categories present in the user's local DB.
 
         Returns each category with row count and total spend (negative
@@ -616,16 +772,21 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             return {"items": [], "uncategorized": 0}
         conn = _open_user_db(path)
         try:
-            rows = conn.execute("""
-                SELECT
-                    COALESCE(NULLIF(category_name, ''), '') AS name,
-                    COUNT(*) AS n,
-                    SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS spent
-                FROM transactions
-                WHERE (deleted = 0 OR deleted IS NULL)
-                GROUP BY name
-                ORDER BY name COLLATE NOCASE
-            """).fetchall()
+            acct_clause, acct_params = _account_where_clause(
+                _parse_account_filter(accounts)
+            )
+            extra = f" AND {acct_clause}" if acct_clause else ""
+            rows = conn.execute(
+                "SELECT "
+                "  COALESCE(NULLIF(category_name, ''), '') AS name, "
+                "  COUNT(*) AS n, "
+                "  SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS spent "
+                "FROM transactions "
+                "WHERE (deleted = 0 OR deleted IS NULL)" + extra +
+                " GROUP BY name "
+                "ORDER BY name COLLATE NOCASE",
+                acct_params,
+            ).fetchall()
         finally:
             conn.close()
         items = []
@@ -643,6 +804,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
 
     @app.get("/api/spending")
     def _api_spending(request: Request, months: int = 6,
+                      accounts: str = "",
                       user=Depends(_current_user)):
         """Per-category spending totals for the last N months.
 
@@ -671,18 +833,23 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             return {"months": [], "by_category": {}, "totals": {}}
         conn = _open_user_db(path)
         try:
-            rows = conn.execute("""
-                SELECT
-                    substr(date, 1, 7) AS ym,
-                    COALESCE(NULLIF(category_name, ''), '(uncategorized)') AS category,
-                    SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spent_milli,
-                    COUNT(CASE WHEN amount < 0 THEN 1 END) AS n
-                FROM transactions
-                WHERE date >= ?
-                  AND (deleted = 0 OR deleted IS NULL)
-                GROUP BY ym, category
-                ORDER BY ym DESC, spent_milli DESC
-            """, (start.isoformat(),)).fetchall()
+            acct_clause, acct_params = _account_where_clause(
+                _parse_account_filter(accounts)
+            )
+            extra = f" AND {acct_clause}" if acct_clause else ""
+            rows = conn.execute(
+                "SELECT "
+                "  substr(date, 1, 7) AS ym, "
+                "  COALESCE(NULLIF(category_name, ''), '(uncategorized)') AS category, "
+                "  SUM(CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS spent_milli, "
+                "  COUNT(CASE WHEN amount < 0 THEN 1 END) AS n "
+                "FROM transactions "
+                "WHERE date >= ? "
+                "  AND (deleted = 0 OR deleted IS NULL)" + extra +
+                " GROUP BY ym, category "
+                "ORDER BY ym DESC, spent_milli DESC",
+                [start.isoformat(), *acct_params],
+            ).fetchall()
         finally:
             conn.close()
 
@@ -730,6 +897,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
     @app.get("/api/subscriptions")
     def _api_subscriptions(request: Request, lookback_months: int = 6,
                            min_occurrences: int = 3,
+                           accounts: str = "",
                            user=Depends(_current_user)):
         """Detect recurring transactions from the user's history.
 
@@ -759,16 +927,21 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             return {"items": [], "lookback_months": lookback_months}
         conn = _open_user_db(path)
         try:
-            rows = conn.execute("""
-                SELECT date, amount, payee_name, category_name, memo
-                FROM transactions
-                WHERE date >= ?
-                  AND amount < 0
-                  AND (deleted = 0 OR deleted IS NULL)
-                  AND payee_name IS NOT NULL
-                  AND payee_name != ''
-                ORDER BY payee_name, date
-            """, (start.isoformat(),)).fetchall()
+            acct_clause, acct_params = _account_where_clause(
+                _parse_account_filter(accounts)
+            )
+            extra = f" AND {acct_clause}" if acct_clause else ""
+            rows = conn.execute(
+                "SELECT date, amount, payee_name, category_name, memo, account_id "
+                "FROM transactions "
+                "WHERE date >= ? "
+                "  AND amount < 0 "
+                "  AND (deleted = 0 OR deleted IS NULL) "
+                "  AND payee_name IS NOT NULL "
+                "  AND payee_name != ''" + extra +
+                " ORDER BY payee_name, date",
+                [start.isoformat(), *acct_params],
+            ).fetchall()
         finally:
             conn.close()
 

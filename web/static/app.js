@@ -151,11 +151,20 @@
   // Transactions ────────────────────────────────────────────────────
   pages.transactions = async () => {
     const $ = (id) => document.getElementById(id);
-    // category may be set via ?category=… on the URL (e.g. clicking
-    // through from the Spending page) — pick that up on load.
-    const initialCat = new URLSearchParams(location.search).get("category") || "";
+    const params = new URLSearchParams(location.search);
+    // category and accounts may be passed via the URL (e.g. clicking
+    // through from the Spending or Accounts page) — pick those up.
+    const initialCat = params.get("category") || "";
+    const initialAccounts = (params.get("accounts") || "")
+      .split(",").map(s => s.trim()).filter(Boolean);
     const state = { q: "", state: "all", sort: "-date",
-                    category: initialCat, page: 1, total: 0 };
+                    category: initialCat, accounts: initialAccounts,
+                    page: 1, total: 0 };
+    const accountPicker = await buildAccountPicker({
+      targetId: "tx-accounts",
+      initial: initialAccounts,
+      onChange: (ids) => { state.accounts = ids; state.page = 1; load(); },
+    });
     let timer = null;
 
     function debounce(fn, ms = 250) {
@@ -221,6 +230,9 @@
           page: String(state.page), page_size: "50",
         });
         if (state.category) params.set("category", state.category);
+        if (state.accounts && state.accounts.length) {
+          params.set("accounts", state.accounts.join(","));
+        }
         const d = await api("GET", `/api/transactions?${params}`);
         state.total = d.total;
         const rows = d.items.map(t => {
@@ -248,7 +260,10 @@
             : `<span class="text-xs text-ink-500 dark:text-slate-500 italic">—</span>`;
           return `<tr>
             <td class="px-4 py-2 whitespace-nowrap text-ink-500 dark:text-slate-400">${escHTML(t.date)}</td>
-            <td class="px-4 py-2">${escHTML(t.payee_name)}</td>
+            <td class="px-4 py-2">
+              <div>${escHTML(t.payee_name)}</div>
+              ${t.account_name ? `<div class="text-xs text-ink-500 dark:text-slate-500">${escHTML(t.account_name)}</div>` : ""}
+            </td>
             <td class="px-4 py-2 text-right tabular-nums ${cls}">${fmtMoney(t.amount_display)}</td>
             <td class="px-4 py-2">${catCell}</td>
             <td class="px-4 py-2 text-ink-500 dark:text-slate-400 truncate max-w-[24ch]">${escHTML(t.memo)}</td>
@@ -454,14 +469,220 @@
   };
 
   // Upload ──────────────────────────────────────────────────────────
+  // Accounts ────────────────────────────────────────────────────────
+  function classificationBadge(cls) {
+    const map = {
+      cash:    "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
+      credit:  "bg-rose-100    text-rose-700    dark:bg-rose-500/15    dark:text-rose-300",
+      tracking:"bg-slate-100   text-slate-700   dark:bg-ink-700        dark:text-slate-300",
+    };
+    return `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full ${map[cls] || map.tracking}">${escHTML(cls || 'tracking')}</span>`;
+  }
+  function statusBadge(a) {
+    if (a.deleted) {
+      return `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full bg-slate-200 text-slate-600 dark:bg-ink-700 dark:text-slate-400">deleted</span>`;
+    }
+    if (a.closed) {
+      return `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">closed</span>`;
+    }
+    return `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">active</span>`;
+  }
+
+  pages.accounts = async () => {
+    const $ = (id) => document.getElementById(id);
+    $("acc-refresh").addEventListener("click", async () => {
+      const btn = $("acc-refresh");
+      btn.disabled = true; btn.textContent = "Syncing…";
+      try {
+        const r = await api("POST", "/api/sync");
+        toast(r.synced ? "ok" : "info",
+              r.synced ? "Synced from YNAB." : "Already up to date.");
+        await load();
+      } catch (e) { toast("error", e.message); }
+      finally { btn.disabled = false; btn.textContent = "⟳ Sync"; }
+    });
+    await load();
+
+    async function load() {
+      $("acc-loading").classList.remove("hidden");
+      $("acc-empty").classList.add("hidden");
+      try {
+        const d = await api("GET", "/api/accounts");
+        const items = d.items || [];
+        $("acc-loading").classList.add("hidden");
+        if (!items.length) {
+          $("acc-empty").classList.remove("hidden");
+          ["cash","credit","tracking","closed"].forEach(s =>
+            $(`acc-${s}-section`).classList.add("hidden"));
+          return;
+        }
+
+        const buckets = { cash: [], credit: [], tracking: [], closed: [] };
+        for (const a of items) {
+          if (a.deleted || a.closed) buckets.closed.push(a);
+          else (buckets[a.classification] || buckets.tracking).push(a);
+        }
+
+        // Summary cards (active accounts only)
+        const activeSum = (cls) =>
+          buckets[cls].reduce((s, a) => s + a.balance, 0);
+        $("acc-cash-total").textContent     = fmtMoney(activeSum("cash"));
+        $("acc-credit-total").textContent   = fmtMoney(activeSum("credit"));
+        $("acc-tracking-total").textContent = fmtMoney(activeSum("tracking"));
+        $("acc-cash-meta").textContent     = `${buckets.cash.length} account(s)`;
+        $("acc-credit-meta").textContent   = `${buckets.credit.length} account(s)`;
+        $("acc-tracking-meta").textContent = `${buckets.tracking.length} account(s)`;
+
+        // Section renderer
+        function renderSection(cls) {
+          const sec = $(`acc-${cls}-section`);
+          const rowsEl = $(`acc-${cls}-rows`);
+          if (!buckets[cls].length) { sec.classList.add("hidden"); return; }
+          sec.classList.remove("hidden");
+          rowsEl.innerHTML = buckets[cls].map(a => {
+            const txLink = `/app/transactions?accounts=${encodeURIComponent(a.id)}`;
+            const lastLine = a.last_activity
+              ? `last txn ${escHTML(a.last_activity)}`
+              : `no transactions yet`;
+            return `<a href="${txLink}" class="block px-5 py-3 hover:bg-slate-50 dark:hover:bg-ink-700/40">
+              <div class="flex items-center justify-between gap-4 flex-wrap">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="font-medium truncate">${escHTML(a.name)}</span>
+                  ${a.is_primary ? `<span class="inline-flex items-center px-1.5 py-0.5 text-xs rounded-full bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-500">primary</span>` : ""}
+                  ${statusBadge(a)}
+                  ${a.type ? `<span class="text-xs text-ink-500 dark:text-slate-500">${escHTML(a.type)}</span>` : ""}
+                </div>
+                <div class="text-sm tabular-nums font-medium ${a.balance < 0 ? "text-rose-600 dark:text-rose-400" : ""}">
+                  ${fmtMoney(a.balance)}
+                </div>
+              </div>
+              <div class="flex items-center justify-between mt-1 text-xs text-ink-500 dark:text-slate-400">
+                <span>${a.tx_count.toLocaleString()} txns · ${lastLine}</span>
+                <span>cleared ${fmtMoney(a.cleared_balance)}${
+                    a.uncleared_balance ? ` · pending ${fmtMoney(a.uncleared_balance)}` : ""}</span>
+              </div>
+            </a>`;
+          }).join("");
+        }
+        ["cash", "credit", "tracking", "closed"].forEach(renderSection);
+      } catch (e) {
+        toast("error", e.message);
+        $("acc-loading").classList.add("hidden");
+      }
+    }
+  };
+
+  // ── Reusable account picker (popover) ──────────────────────────────
+  // Renders into a target <div id="..."> and manages a Set<account_id>
+  // of selected accounts. Empty selection = "all accounts" semantics.
+  // The caller passes an `onChange()` invoked after each toggle so it
+  // can re-fetch its data.
+  async function buildAccountPicker(opts) {
+    const root = document.getElementById(opts.targetId);
+    if (!root) return null;
+    let accounts = [];
+    try {
+      const d = await api("GET", "/api/accounts");
+      accounts = (d.items || []).filter(a => !a.deleted);
+    } catch (e) {
+      console.warn("accounts load failed:", e);
+      return null;
+    }
+    const selected = new Set(opts.initial || []);
+    let open = false;
+
+    function label() {
+      if (selected.size === 0) return "All accounts";
+      if (selected.size === 1) {
+        const a = accounts.find(x => x.id === [...selected][0]);
+        return a ? a.name : "1 account";
+      }
+      return `${selected.size} accounts`;
+    }
+    function render() {
+      root.innerHTML = `
+        <div class="relative">
+          <button type="button" id="${opts.targetId}-btn"
+                  class="text-sm px-3 py-2 rounded-md border border-slate-200 dark:border-ink-600
+                         bg-white dark:bg-ink-800 hover:bg-slate-50 dark:hover:bg-ink-700
+                         flex items-center gap-2 min-w-[14rem] justify-between">
+            <span class="truncate">${escHTML(label())}</span>
+            <svg viewBox="0 0 20 20" class="w-4 h-4 opacity-60" fill="currentColor"><path d="M5 8l5 5 5-5z"/></svg>
+          </button>
+          <div id="${opts.targetId}-pop"
+               class="${open ? "" : "hidden"} absolute right-0 mt-1 w-72 rounded-md
+                      border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                      shadow-soft z-20 overflow-hidden">
+            <div class="px-3 py-2 border-b border-slate-100 dark:border-ink-700 flex items-center justify-between text-xs">
+              <button type="button" data-act="all"
+                      class="text-brand-600 hover:underline">All</button>
+              <span class="text-ink-500 dark:text-slate-500">${selected.size} of ${accounts.length}</span>
+              <button type="button" data-act="none"
+                      class="text-rose-600 hover:underline">None</button>
+            </div>
+            <div class="max-h-72 overflow-auto py-1">
+              ${accounts.map(a => `
+                <label class="flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-slate-50 dark:hover:bg-ink-700 cursor-pointer">
+                  <input type="checkbox" data-id="${escHTML(a.id)}" ${selected.has(a.id) ? "checked" : ""}
+                         class="rounded border-slate-300 dark:border-ink-600 text-brand-500 focus:ring-brand-500">
+                  <span class="flex-1 truncate">${escHTML(a.name)}</span>
+                  <span class="text-xs text-ink-500 dark:text-slate-500">${escHTML(a.classification)}</span>
+                </label>`).join("")}
+            </div>
+          </div>
+        </div>
+      `;
+      const btn = document.getElementById(`${opts.targetId}-btn`);
+      const pop = document.getElementById(`${opts.targetId}-pop`);
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        open = !open;
+        pop.classList.toggle("hidden", !open);
+      });
+      pop.querySelectorAll('input[type=checkbox]').forEach(cb => {
+        cb.addEventListener("change", () => {
+          if (cb.checked) selected.add(cb.dataset.id);
+          else selected.delete(cb.dataset.id);
+          render();
+          if (opts.onChange) opts.onChange([...selected]);
+        });
+      });
+      pop.querySelectorAll('button[data-act]').forEach(b => {
+        b.addEventListener("click", () => {
+          if (b.dataset.act === "all") accounts.forEach(a => selected.add(a.id));
+          else selected.clear();
+          render();
+          if (opts.onChange) opts.onChange([...selected]);
+        });
+      });
+    }
+    document.addEventListener("click", () => {
+      if (!open) return;
+      open = false;
+      const pop = document.getElementById(`${opts.targetId}-pop`);
+      if (pop) pop.classList.add("hidden");
+    });
+    render();
+    return {
+      selected: () => [...selected],
+      setSelected: (ids) => { selected.clear(); ids.forEach(i => selected.add(i)); render(); },
+    };
+  }
+  // Expose so non-page callers (rare) can use it too
+  window.RYNAB_buildAccountPicker = buildAccountPicker;
+
   // Spending ───────────────────────────────────────────────────────
   pages.spending = async () => {
     const $ = (id) => document.getElementById(id);
-    const state = { months: 6 };
+    const state = { months: 6, accounts: [] };
     $("sp-months").value = state.months;
     $("sp-months").addEventListener("change", () => {
       state.months = parseInt($("sp-months").value, 10) || 6;
       load();
+    });
+    await buildAccountPicker({
+      targetId: "sp-accounts",
+      onChange: (ids) => { state.accounts = ids; load(); },
     });
     $("sp-refresh").addEventListener("click", async () => {
       const btn = $("sp-refresh");
@@ -487,7 +708,9 @@
       $("sp-cats").innerHTML = "";
       $("sp-month-bars").innerHTML = "";
       try {
-        const d = await api("GET", `/api/spending?months=${state.months}`);
+        const qp = new URLSearchParams({ months: String(state.months) });
+        if (state.accounts.length) qp.set("accounts", state.accounts.join(","));
+        const d = await api("GET", `/api/spending?${qp}`);
         const months = d.months || [];
         const perMonth = d.per_month_total || [];
         const cats = d.categories || [];
@@ -569,11 +792,15 @@
   // Subscriptions ───────────────────────────────────────────────────
   pages.subscriptions = async () => {
     const $ = (id) => document.getElementById(id);
-    const state = { window: 12 };
+    const state = { window: 12, accounts: [] };
     $("sub-window").value = state.window;
     $("sub-window").addEventListener("change", () => {
       state.window = parseInt($("sub-window").value, 10) || 12;
       load();
+    });
+    await buildAccountPicker({
+      targetId: "sub-accounts",
+      onChange: (ids) => { state.accounts = ids; load(); },
     });
     $("sub-refresh").addEventListener("click", async () => {
       const btn = $("sub-refresh");
@@ -598,9 +825,11 @@
       $("sub-empty").classList.add("hidden");
       $("sub-tbody").innerHTML = "";
       try {
-        const d = await api(
-          "GET", `/api/subscriptions?lookback_months=${state.window}`,
-        );
+        const qp = new URLSearchParams({
+          lookback_months: String(state.window),
+        });
+        if (state.accounts.length) qp.set("accounts", state.accounts.join(","));
+        const d = await api("GET", `/api/subscriptions?${qp}`);
         const items = d.items || [];
 
         // Summary cards

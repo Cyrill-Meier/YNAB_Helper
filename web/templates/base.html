@@ -95,6 +95,7 @@
                     {% endif %}">{{ label }}</a>
         {% endmacro %}
         {{ nav_item('/app/dashboard', 'Dashboard') }}
+        {{ nav_item('/app/accounts', 'Accounts') }}
         {{ nav_item('/app/transactions', 'Transactions') }}
         {{ nav_item('/app/spending', 'Spending') }}
         {{ nav_item('/app/subscriptions', 'Subscriptions') }}
@@ -123,6 +124,7 @@
       <div class="flex items-center gap-1 px-4 py-2 text-sm whitespace-nowrap">
         {% set tab = request.url.path %}
         {{ nav_item('/app/dashboard', 'Dashboard') }}
+        {{ nav_item('/app/accounts', 'Accounts') }}
         {{ nav_item('/app/transactions', 'Transactions') }}
         {{ nav_item('/app/spending', 'Spending') }}
         {{ nav_item('/app/subscriptions', 'Subscriptions') }}

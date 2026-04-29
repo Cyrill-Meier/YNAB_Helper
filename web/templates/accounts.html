@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Accounts — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-end justify-between gap-4 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Accounts</h1>
+      <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+        Every account known to YNAB for this budget. Synced automatically on every page load
+        (throttled). The bot's CSV imports always go to the
+        <span class="inline-flex items-center px-1.5 py-0.5 text-xs rounded-full bg-brand-50 text-brand-700 dark:bg-brand-500/15 dark:text-brand-500">primary</span>
+        account; the others are read-only here.
+      </p>
+    </div>
+    <button id="acc-refresh" type="button"
+            class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                   hover:bg-slate-100 dark:hover:bg-ink-700">⟳ Sync</button>
+  </div>
+
+  {# ── Summary cards ─────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="card">
+      <div class="card-label">💵 Cash</div>
+      <div class="card-value" id="acc-cash-total">—</div>
+      <div class="card-meta" id="acc-cash-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">💳 Credit</div>
+      <div class="card-value" id="acc-credit-total">—</div>
+      <div class="card-meta" id="acc-credit-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">📊 Tracking</div>
+      <div class="card-value" id="acc-tracking-total">—</div>
+      <div class="card-meta" id="acc-tracking-meta">&nbsp;</div>
+    </div>
+  </div>
+
+  {# ── Sections — one per classification ─────────────────────────────── #}
+  <div id="acc-cash-section" class="card p-0 overflow-hidden hidden">
+    <div class="px-5 py-3 border-b border-slate-200 dark:border-ink-700">
+      <h2 class="font-medium">💵 Cash</h2>
+    </div>
+    <div id="acc-cash-rows" class="divide-y divide-slate-100 dark:divide-ink-700"></div>
+  </div>
+
+  <div id="acc-credit-section" class="card p-0 overflow-hidden hidden">
+    <div class="px-5 py-3 border-b border-slate-200 dark:border-ink-700">
+      <h2 class="font-medium">💳 Credit</h2>
+    </div>
+    <div id="acc-credit-rows" class="divide-y divide-slate-100 dark:divide-ink-700"></div>
+  </div>
+
+  <div id="acc-tracking-section" class="card p-0 overflow-hidden hidden">
+    <div class="px-5 py-3 border-b border-slate-200 dark:border-ink-700">
+      <h2 class="font-medium">📊 Tracking</h2>
+    </div>
+    <div id="acc-tracking-rows" class="divide-y divide-slate-100 dark:divide-ink-700"></div>
+  </div>
+
+  <div id="acc-closed-section" class="card p-0 overflow-hidden hidden">
+    <div class="px-5 py-3 border-b border-slate-200 dark:border-ink-700 text-ink-500 dark:text-slate-400">
+      <h2 class="font-medium">Closed / deleted</h2>
+    </div>
+    <div id="acc-closed-rows" class="divide-y divide-slate-100 dark:divide-ink-700"></div>
+  </div>
+
+  <div id="acc-empty" class="hidden card text-center py-12 text-ink-500 dark:text-slate-400">
+    No accounts found yet. Try clicking <span class="font-medium text-ink-900 dark:text-slate-100">⟳ Sync</span>
+    to pull from YNAB.
+  </div>
+  <div id="acc-loading" class="card text-center py-12 text-ink-500 dark:text-slate-400">
+    <span class="spinner inline-block"></span><span class="ml-2">Loading accounts…</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('accounts');</script>
+{% endblock %}

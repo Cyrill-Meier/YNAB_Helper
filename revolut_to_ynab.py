@@ -221,6 +221,47 @@ def init_db(db_path=None):
         )
     """)
 
+    # Accounts table — every YNAB account in the user's budget. Synced
+    # via sync_accounts_from_ynab. The classification column buckets
+    # the YNAB-side `type` + `on_budget` into one of three buckets:
+    # cash / credit / tracking — see `classify_account`.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_id           TEXT PRIMARY KEY,
+            name                 TEXT,
+            type                 TEXT,
+            classification       TEXT,
+            on_budget            INTEGER NOT NULL DEFAULT 1,
+            closed               INTEGER NOT NULL DEFAULT 0,
+            deleted              INTEGER NOT NULL DEFAULT 0,
+            note                 TEXT,
+            balance              INTEGER,
+            cleared_balance      INTEGER,
+            uncleared_balance    INTEGER,
+            transfer_payee_id    TEXT,
+            last_seen_at         TEXT,
+            first_seen_at        TEXT NOT NULL,
+            created_at           TEXT NOT NULL,
+            updated_at           TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_classification "
+        "ON accounts(classification)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_active "
+        "ON accounts(closed, deleted)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_account "
+        "ON transactions(account_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transactions_date "
+        "ON transactions(date)"
+    )
+
     # Migrate: add columns if they don't exist yet (for users with older DB)
     _migrate_db(conn)
 
@@ -429,6 +470,222 @@ def list_accounts(token, budget_id):
         print(f"  Balance: {balance:,.2f}")
         print()
     return accounts
+
+
+# ─── Accounts ──────────────────────────────────────────────────────────────
+
+#: Map YNAB's raw `type` values onto our three-bucket classification.
+#: Anything not in this dict (or any account with `on_budget=False`)
+#: falls into 'tracking'.
+_ACCOUNT_TYPE_TO_CLASSIFICATION = {
+    # Budget — cash side
+    "checking":     "cash",
+    "savings":      "cash",
+    "cash":         "cash",
+    # Budget — credit side
+    "creditCard":   "credit",
+    "lineOfCredit": "credit",
+    # Tracking — assets / liabilities (on_budget=False also forces this)
+    "otherAsset":     "tracking",
+    "otherLiability": "tracking",
+    "mortgage":       "tracking",
+    "autoLoan":       "tracking",
+    "studentLoan":    "tracking",
+    "personalLoan":   "tracking",
+    "medicalDebt":    "tracking",
+    "otherDebt":      "tracking",
+}
+
+
+def classify_account(yt):
+    """Bucket a YNAB account dict into 'cash', 'credit', or 'tracking'."""
+    if not yt.get("on_budget"):
+        return "tracking"
+    return _ACCOUNT_TYPE_TO_CLASSIFICATION.get(yt.get("type") or "", "tracking")
+
+
+def sync_accounts_from_ynab(conn, token, budget_id):
+    """Pull every account from YNAB and reconcile with the local table.
+
+    Returns a dict summarising what changed:
+        {"added": [name…], "renamed": [(old, new)…],
+         "closed": [name…], "reopened": [name…],
+         "deleted": [name…], "unchanged": int}
+
+    The first time this runs against a fresh DB the entire account list
+    is "added" — caller can detect that and decide whether to suppress
+    notifications.
+    """
+    result = ynab_request("GET", f"/budgets/{budget_id}/accounts", token)
+    accounts = result.get("data", {}).get("accounts", [])
+    now = datetime.now().isoformat()
+
+    pre_existing = {
+        r["account_id"]: dict(r)
+        for r in conn.execute(
+            "SELECT account_id, name, classification, closed, deleted "
+            "FROM accounts"
+        ).fetchall()
+    }
+    seen_ids = set()
+    added, renamed, closed, reopened, deleted = [], [], [], [], []
+    unchanged = 0
+
+    for ya in accounts:
+        ya_id = ya.get("id")
+        if not ya_id:
+            continue
+        seen_ids.add(ya_id)
+        cls = classify_account(ya)
+        is_closed = bool(ya.get("closed"))
+        is_deleted = bool(ya.get("deleted"))
+        new_name = ya.get("name") or ""
+
+        prev = pre_existing.get(ya_id)
+        if prev is None:
+            added.append(new_name)
+        else:
+            if (prev["name"] or "") != new_name:
+                renamed.append((prev["name"] or "", new_name))
+            if not prev["closed"] and is_closed:
+                closed.append(new_name)
+            elif prev["closed"] and not is_closed:
+                reopened.append(new_name)
+            if not prev["deleted"] and is_deleted:
+                deleted.append(new_name)
+            if (prev["name"] == new_name and bool(prev["closed"]) == is_closed
+                    and bool(prev["deleted"]) == is_deleted
+                    and (prev["classification"] or "") == cls):
+                unchanged += 1
+
+        conn.execute("""
+            INSERT INTO accounts (
+                account_id, name, type, classification,
+                on_budget, closed, deleted, note,
+                balance, cleared_balance, uncleared_balance,
+                transfer_payee_id, last_seen_at, first_seen_at,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                name = excluded.name,
+                type = excluded.type,
+                classification = excluded.classification,
+                on_budget = excluded.on_budget,
+                closed = excluded.closed,
+                deleted = excluded.deleted,
+                note = excluded.note,
+                balance = excluded.balance,
+                cleared_balance = excluded.cleared_balance,
+                uncleared_balance = excluded.uncleared_balance,
+                transfer_payee_id = excluded.transfer_payee_id,
+                last_seen_at = excluded.last_seen_at,
+                updated_at = excluded.updated_at
+        """, (
+            ya_id, new_name, ya.get("type") or "", cls,
+            int(bool(ya.get("on_budget"))),
+            int(is_closed),
+            int(is_deleted),
+            ya.get("note") or "",
+            ya.get("balance"), ya.get("cleared_balance"),
+            ya.get("uncleared_balance"),
+            ya.get("transfer_payee_id"),
+            now, now, now, now,
+        ))
+
+    # Accounts that were in our local DB but NOT in this response are
+    # implicitly deleted on YNAB's side. YNAB usually returns them with
+    # deleted=true so we already handled that above; this is a fallback.
+    for prev_id, prev in pre_existing.items():
+        if prev_id in seen_ids:
+            continue
+        if not prev["deleted"]:
+            deleted.append(prev["name"] or "")
+            conn.execute(
+                "UPDATE accounts SET deleted = 1, updated_at = ? "
+                "WHERE account_id = ?",
+                (now, prev_id),
+            )
+
+    conn.commit()
+    summary = {
+        "added": added, "renamed": renamed,
+        "closed": closed, "reopened": reopened,
+        "deleted": deleted, "unchanged": unchanged,
+    }
+    if any(summary[k] for k in ("added", "renamed", "closed",
+                                 "reopened", "deleted")):
+        log.info("accounts sync: %s", summary)
+    return summary
+
+
+def sync_budget_transactions(conn, token, budget_id, primary_account_id=None):
+    """Pull transactions from EVERY account in the budget in one call.
+
+    Uses YNAB's budget-wide /transactions endpoint with delta syncing
+    (separate ``server_knowledge`` slot so it doesn't fight the
+    per-account ``sync_from_ynab``). Local rows for non-primary
+    accounts get a synthesized import_id of the form
+    ``acct:<account_id>:<ynab_tx_id>`` so they can never collide with
+    primary-account YNAB:milli:date:occ rows.
+    """
+    knowledge_key = f"budget:{budget_id}"
+    knowledge = db_get_server_knowledge(conn, knowledge_key)
+    path = f"/budgets/{budget_id}/transactions"
+    if knowledge is not None:
+        path += f"?last_knowledge_of_server={knowledge}"
+
+    result = ynab_request("GET", path, token)
+    data = result.get("data", {})
+    txns = data.get("transactions", [])
+    new_knowledge = data.get("server_knowledge")
+
+    created = updated = deleted = 0
+    for yt in txns:
+        ya_id = yt.get("account_id") or ""
+        ynab_iid = yt.get("import_id")
+        if primary_account_id and ya_id == primary_account_id:
+            # Preserve existing import_id format for compatibility with
+            # the CSV-import / dedupe flow.
+            local_iid = ynab_iid or f"ynab_manual:{yt['id']}"
+            source = "revolut" if (ynab_iid or "").startswith("YNAB:") else "ynab"
+        else:
+            local_iid = f"acct:{ya_id}:{yt['id']}"
+            source = "ynab"
+
+        tx = {
+            "import_id":     local_iid,
+            "date":          yt.get("date", ""),
+            "amount":        yt.get("amount", 0),
+            "payee_name":    yt.get("payee_name") or "",
+            "memo":          yt.get("memo") or "",
+            "cleared":       yt.get("cleared", "uncleared"),
+            "approved":      yt.get("approved", False),
+            "deleted":       yt.get("deleted", False),
+            "account_id":    ya_id,
+            "category_name": yt.get("category_name") or "",
+            "_state": "COMPLETED" if yt.get("cleared") in ("cleared", "reconciled") else "PENDING",
+        }
+
+        if tx["deleted"]:
+            deleted += 1
+        elif conn.execute(
+            "SELECT 1 FROM transactions WHERE import_id = ?", (local_iid,)
+        ).fetchone():
+            updated += 1
+        else:
+            created += 1
+        db_upsert(conn, tx, ynab_tx_id=yt["id"], source=source)
+
+    if new_knowledge is not None:
+        db_set_server_knowledge(conn, knowledge_key, new_knowledge)
+    conn.commit()
+    if created or updated or deleted:
+        log.info(
+            "sync_budget_transactions: created=%d updated=%d deleted=%d",
+            created, updated, deleted,
+        )
+    return {"created": created, "updated": updated, "deleted": deleted}
 
 
 # ─── YNAB sync (pull transactions down) ─────────────────────────────────────

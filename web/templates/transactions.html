@@ -26,6 +26,12 @@
       <option value="cleared">Cleared</option>
       <option value="uncleared">Pending</option>
     </select>
+    <select id="tx-category"
+            class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                   py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40 max-w-[14rem]">
+      <option value="">All categories</option>
+      <option value="__none__">— uncategorized —</option>
+    </select>
     <select id="tx-sort"
             class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
                    py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40">
@@ -46,6 +52,7 @@
             <th class="text-left px-4 py-2 font-medium">Date</th>
             <th class="text-left px-4 py-2 font-medium">Payee</th>
             <th class="text-right px-4 py-2 font-medium">Amount</th>
+            <th class="text-left px-4 py-2 font-medium">Category</th>
             <th class="text-left px-4 py-2 font-medium">Memo</th>
             <th class="text-left px-4 py-2 font-medium">State</th>
           </tr>

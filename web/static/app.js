@@ -151,7 +151,11 @@
   // Transactions ────────────────────────────────────────────────────
   pages.transactions = async () => {
     const $ = (id) => document.getElementById(id);
-    const state = { q: "", state: "all", sort: "-date", page: 1, total: 0 };
+    // category may be set via ?category=… on the URL (e.g. clicking
+    // through from the Spending page) — pick that up on load.
+    const initialCat = new URLSearchParams(location.search).get("category") || "";
+    const state = { q: "", state: "all", sort: "-date",
+                    category: initialCat, page: 1, total: 0 };
     let timer = null;
 
     function debounce(fn, ms = 250) {
@@ -172,6 +176,10 @@
     $("tx-sort").addEventListener("change", () => {
       state.sort = $("tx-sort").value; load();
     });
+    $("tx-category").addEventListener("change", () => {
+      state.category = $("tx-category").value;
+      state.page = 1; load();
+    });
     $("tx-prev").addEventListener("click", () => {
       if (state.page > 1) { state.page -= 1; load(); }
     });
@@ -179,6 +187,27 @@
       const last = Math.ceil(state.total / 50);
       if (state.page < last) { state.page += 1; load(); }
     });
+
+    // Populate the category dropdown from /api/categories
+    try {
+      const cats = await api("GET", "/api/categories");
+      const sel = $("tx-category");
+      for (const c of cats.items) {
+        const opt = document.createElement("option");
+        opt.value = c.name;
+        opt.textContent = `${c.name} (${c.count})`;
+        sel.appendChild(opt);
+      }
+      if (cats.uncategorized) {
+        // Update existing __none__ row label
+        const none = sel.querySelector('option[value="__none__"]');
+        if (none) none.textContent = `— uncategorized — (${cats.uncategorized})`;
+      }
+      if (initialCat) sel.value = initialCat;
+    } catch (e) {
+      // Non-fatal — keep working without the dropdown
+      console.warn("categories load failed:", e);
+    }
 
     await load();
 
@@ -191,6 +220,7 @@
           q: state.q, state: state.state, sort: state.sort,
           page: String(state.page), page_size: "50",
         });
+        if (state.category) params.set("category", state.category);
         const d = await api("GET", `/api/transactions?${params}`);
         state.total = d.total;
         const rows = d.items.map(t => {
@@ -201,10 +231,15 @@
                           bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300">cleared</span>`
             : `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
                           bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">pending</span>`;
+          const catCell = t.category_name
+            ? `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
+                            bg-slate-100 text-slate-700 dark:bg-ink-700 dark:text-slate-300">${escHTML(t.category_name)}</span>`
+            : `<span class="text-xs text-ink-500 dark:text-slate-500 italic">—</span>`;
           return `<tr>
             <td class="px-4 py-2 whitespace-nowrap text-ink-500 dark:text-slate-400">${escHTML(t.date)}</td>
             <td class="px-4 py-2">${escHTML(t.payee_name)}</td>
             <td class="px-4 py-2 text-right tabular-nums ${cls}">${fmtMoney(t.amount_display)}</td>
+            <td class="px-4 py-2">${catCell}</td>
             <td class="px-4 py-2 text-ink-500 dark:text-slate-400 truncate max-w-[24ch]">${escHTML(t.memo)}</td>
             <td class="px-4 py-2">${stateBadge}</td>
           </tr>`;
@@ -408,6 +443,234 @@
   };
 
   // Upload ──────────────────────────────────────────────────────────
+  // Spending ───────────────────────────────────────────────────────
+  pages.spending = async () => {
+    const $ = (id) => document.getElementById(id);
+    const state = { months: 6 };
+    $("sp-months").value = state.months;
+    $("sp-months").addEventListener("change", () => {
+      state.months = parseInt($("sp-months").value, 10) || 6;
+      load();
+    });
+    $("sp-refresh").addEventListener("click", async () => {
+      const btn = $("sp-refresh");
+      btn.disabled = true;
+      btn.textContent = "Syncing…";
+      try {
+        const r = await api("POST", "/api/sync");
+        toast(r.synced ? "ok" : "info",
+              r.synced ? "Synced from YNAB." : "Already up to date.");
+        await load();
+      } catch (e) {
+        toast("error", e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "⟳ Sync";
+      }
+    });
+    await load();
+
+    async function load() {
+      $("sp-loading").classList.remove("hidden");
+      $("sp-empty").classList.add("hidden");
+      $("sp-cats").innerHTML = "";
+      $("sp-month-bars").innerHTML = "";
+      try {
+        const d = await api("GET", `/api/spending?months=${state.months}`);
+        const months = d.months || [];
+        const perMonth = d.per_month_total || [];
+        const cats = d.categories || [];
+
+        // Summary cards
+        const thisIdx = months.length - 1;
+        const prevIdx = months.length - 2;
+        const thisTotal = thisIdx >= 0 ? perMonth[thisIdx] : 0;
+        const prevTotal = prevIdx >= 0 ? perMonth[prevIdx] : 0;
+        const avg = months.length
+          ? perMonth.reduce((a, b) => a + b, 0) / months.length : 0;
+        $("sp-this-month").textContent = fmtMoney(thisTotal);
+        if (prevTotal > 0) {
+          const delta = thisTotal - prevTotal;
+          const pct = (delta / prevTotal) * 100;
+          const cls = delta > 0 ? "text-rose-600 dark:text-rose-400"
+                                : "text-emerald-600 dark:text-emerald-400";
+          $("sp-this-month-meta").innerHTML =
+            `<span class="${cls}">${delta >= 0 ? "+" : ""}${fmtMoney(delta)} (${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%)</span> vs prev`;
+        } else {
+          $("sp-this-month-meta").textContent = "no prior month";
+        }
+        $("sp-prev-month").textContent = fmtMoney(prevTotal);
+        $("sp-avg").textContent = fmtMoney(avg);
+        $("sp-window-meta").textContent = months.length
+          ? `${months[0]} → ${months[months.length - 1]}`
+          : "";
+        $("sp-window-label").textContent = months.length
+          ? `${months.length} months`
+          : "";
+
+        // Per-month bars (stacked total)
+        const peakMonth = perMonth.length ? Math.max(...perMonth) : 0;
+        $("sp-month-bars").innerHTML = months.map((m, i) => {
+          const v = perMonth[i] || 0;
+          const w = peakMonth > 0 ? (v / peakMonth) * 100 : 0;
+          return `<div class="flex items-center gap-3">
+            <div class="w-20 text-xs text-ink-500 dark:text-slate-400 tabular-nums">${escHTML(m)}</div>
+            <div class="flex-1 h-5 rounded bg-slate-100 dark:bg-ink-700 overflow-hidden">
+              <div class="h-full bg-brand-500/80" style="width: ${w.toFixed(2)}%"></div>
+            </div>
+            <div class="w-28 text-right text-sm tabular-nums">${fmtMoney(v)}</div>
+          </div>`;
+        }).join("");
+
+        // Per-category breakdown
+        if (!cats.length) {
+          $("sp-empty").classList.remove("hidden");
+        } else {
+          const peak = Math.max(...cats.map(c => Math.max(...c.by_month)));
+          $("sp-cats").innerHTML = cats.map(c => {
+            const isUncat = c.category === "(uncategorized)";
+            const link = isUncat
+              ? `/app/transactions?category=__none__`
+              : `/app/transactions?category=${encodeURIComponent(c.category)}`;
+            const bars = c.by_month.map((v, i) => {
+              const w = peak > 0 ? (v / peak) * 100 : 0;
+              return `<div class="flex-1 flex flex-col justify-end" title="${escHTML(months[i])}: ${fmtMoney(v)}">
+                <div class="bg-brand-500/70 hover:bg-brand-500 transition-colors rounded-sm" style="height: ${w.toFixed(1)}%"></div>
+              </div>`;
+            }).join("");
+            return `<a href="${link}" class="block px-5 py-3 hover:bg-slate-50 dark:hover:bg-ink-700/40">
+              <div class="flex items-center justify-between gap-4">
+                <div class="font-medium ${isUncat ? 'italic text-ink-500 dark:text-slate-400' : ''}">${escHTML(c.category)}</div>
+                <div class="text-sm tabular-nums">${fmtMoney(c.total)}</div>
+              </div>
+              <div class="mt-2 flex items-end gap-1 h-10">${bars}</div>
+            </a>`;
+          }).join("");
+        }
+      } catch (e) {
+        toast("error", e.message);
+      } finally {
+        $("sp-loading").classList.add("hidden");
+      }
+    }
+  };
+
+  // Subscriptions ───────────────────────────────────────────────────
+  pages.subscriptions = async () => {
+    const $ = (id) => document.getElementById(id);
+    const state = { window: 12 };
+    $("sub-window").value = state.window;
+    $("sub-window").addEventListener("change", () => {
+      state.window = parseInt($("sub-window").value, 10) || 12;
+      load();
+    });
+    $("sub-refresh").addEventListener("click", async () => {
+      const btn = $("sub-refresh");
+      btn.disabled = true;
+      btn.textContent = "Syncing…";
+      try {
+        const r = await api("POST", "/api/sync");
+        toast(r.synced ? "ok" : "info",
+              r.synced ? "Synced from YNAB." : "Already up to date.");
+        await load();
+      } catch (e) {
+        toast("error", e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "⟳ Sync";
+      }
+    });
+    await load();
+
+    async function load() {
+      $("sub-loading").classList.remove("hidden");
+      $("sub-empty").classList.add("hidden");
+      $("sub-tbody").innerHTML = "";
+      try {
+        const d = await api(
+          "GET", `/api/subscriptions?lookback_months=${state.window}`,
+        );
+        const items = d.items || [];
+
+        // Summary cards
+        $("sub-count").textContent = items.length.toLocaleString();
+        $("sub-count-meta").textContent =
+          items.length ? `over the last ${state.window} months` : "";
+        const monthlyMultipliers = {
+          weekly: 4.33, biweekly: 2.17, monthly: 1, yearly: 1/12,
+        };
+        const monthlyRunRate = items.reduce(
+          (sum, x) => sum + x.amount_latest * (monthlyMultipliers[x.cadence] || 0),
+          0,
+        );
+        $("sub-monthly").textContent = fmtMoney(monthlyRunRate);
+        const changes = items.filter(x => x.price_changed).length;
+        $("sub-changes").textContent = changes.toLocaleString();
+
+        if (!items.length) {
+          $("sub-empty").classList.remove("hidden");
+          return;
+        }
+
+        // Spark history — fixed-size cell, area on the right
+        const peakHist = Math.max(...items.flatMap(x => x.amount_history));
+        $("sub-tbody").innerHTML = items.map(x => {
+          const cadenceColors = {
+            weekly:   "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-500/15 dark:text-fuchsia-300",
+            biweekly: "bg-violet-100  text-violet-700  dark:bg-violet-500/15  dark:text-violet-300",
+            monthly:  "bg-brand-50    text-brand-700   dark:bg-brand-500/15   dark:text-brand-500",
+            yearly:   "bg-amber-100   text-amber-700   dark:bg-amber-500/15   dark:text-amber-300",
+          };
+          const cadenceCls = cadenceColors[x.cadence] || "bg-slate-100 text-slate-700";
+          const cats = (x.categories || []).filter(c => c && c !== "(uncategorized)");
+          const catCell = cats.length
+            ? cats.map(c => `<span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full
+                  bg-slate-100 text-slate-700 dark:bg-ink-700 dark:text-slate-300 mr-1">${escHTML(c)}</span>`).join("")
+            : `<span class="text-xs text-ink-500 italic">—</span>`;
+          // 6 latest amounts as tiny bars
+          const last6 = x.amount_history.slice(-6);
+          const sparkBars = last6.map(v => {
+            const h = peakHist > 0 ? (v / peakHist) * 100 : 0;
+            return `<div class="w-1.5 bg-brand-500/70 rounded-sm" style="height: ${h.toFixed(1)}%" title="${fmtMoney(v)}"></div>`;
+          }).join("");
+          const priceFlag = x.price_changed
+            ? `<span class="ml-2 inline-flex items-center px-1.5 py-0.5 text-xs rounded-full
+                          bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300"
+                    title="Latest amount differs from earlier charges">±</span>`
+            : "";
+          return `<tr>
+            <td class="px-4 py-2">
+              ${escHTML(x.payee_name)}
+              ${priceFlag}
+            </td>
+            <td class="px-4 py-2">
+              <span class="inline-flex items-center px-2 py-0.5 text-xs rounded-full ${cadenceCls}">
+                ${x.cadence} (~${x.median_days}d)
+              </span>
+            </td>
+            <td class="px-4 py-2">${catCell}</td>
+            <td class="px-4 py-2 text-right tabular-nums">${fmtMoney(x.amount_latest)}</td>
+            <td class="px-4 py-2 text-right text-xs text-ink-500 dark:text-slate-400 tabular-nums">
+              ${x.amount_min === x.amount_max
+                ? "—"
+                : `${fmtMoney(x.amount_min)} – ${fmtMoney(x.amount_max)}`}
+            </td>
+            <td class="px-4 py-2">
+              <div class="flex items-end gap-0.5 h-6">${sparkBars}</div>
+            </td>
+            <td class="px-4 py-2 text-xs text-ink-500 dark:text-slate-400 whitespace-nowrap">
+              ${escHTML(x.last)} (${x.occurrences}×)
+            </td>
+          </tr>`;
+        }).join("");
+      } catch (e) {
+        toast("error", e.message);
+      } finally {
+        $("sub-loading").classList.add("hidden");
+      }
+    }
+  };
+
   pages.upload = async () => {
     const $ = (id) => document.getElementById(id);
     const drop = $("up-drop");

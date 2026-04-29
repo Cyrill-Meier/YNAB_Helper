@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Subscriptions — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-end justify-between gap-4 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Subscriptions</h1>
+      <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+        Recurring payments detected in your transaction history. Cadence is inferred from the median
+        interval between charges. <span class="text-rose-600 dark:text-rose-400 font-medium">Price changes</span> are flagged.
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <select id="sub-window"
+              class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                     py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+        <option value="6">Last 6 months</option>
+        <option value="12" selected>Last 12 months</option>
+        <option value="24">Last 24 months</option>
+      </select>
+      <button id="sub-refresh" type="button"
+              class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                     hover:bg-slate-100 dark:hover:bg-ink-700">⟳ Sync</button>
+    </div>
+  </div>
+
+  {# ── Summary cards ─────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="card">
+      <div class="card-label">Detected</div>
+      <div class="card-value" id="sub-count">—</div>
+      <div class="card-meta" id="sub-count-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Monthly run-rate</div>
+      <div class="card-value" id="sub-monthly">—</div>
+      <div class="card-meta">monthly + biweekly + weekly normalised to /month</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Price changes</div>
+      <div class="card-value" id="sub-changes">—</div>
+      <div class="card-meta">subscriptions whose amount has shifted</div>
+    </div>
+  </div>
+
+  {# ── Table ─────────────────────────────────────────────────────────── #}
+  <div class="card p-0 overflow-hidden">
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 dark:bg-ink-700/50 text-ink-500 dark:text-slate-400">
+          <tr>
+            <th class="text-left px-4 py-2 font-medium">Payee</th>
+            <th class="text-left px-4 py-2 font-medium">Cadence</th>
+            <th class="text-left px-4 py-2 font-medium">Category</th>
+            <th class="text-right px-4 py-2 font-medium">Latest</th>
+            <th class="text-right px-4 py-2 font-medium">Range</th>
+            <th class="text-left px-4 py-2 font-medium">History</th>
+            <th class="text-left px-4 py-2 font-medium">Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="sub-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+    <div id="sub-empty" class="hidden text-center py-12 text-ink-500 dark:text-slate-400">
+      No recurring payments detected yet. Try widening the window or come back after a few more months of data.
+    </div>
+    <div id="sub-loading" class="text-center py-12 text-ink-500 dark:text-slate-400">
+      <span class="spinner inline-block"></span><span class="ml-2">Scanning…</span>
+    </div>
+  </div>
+
+  <p class="text-xs text-ink-500 dark:text-slate-400">
+    Heuristic: a payee is flagged as recurring if it has at least 3 charges within the window
+    and the median gap between charges sits in one of the standard cadences (weekly, biweekly,
+    monthly, yearly). Charges within ±0.05 of each other are treated as the same amount.
+  </p>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('subscriptions');</script>
+{% endblock %}

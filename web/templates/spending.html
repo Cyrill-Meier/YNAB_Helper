@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Spending — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex items-end justify-between gap-4 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold tracking-tight">Spending</h1>
+      <p class="text-sm text-ink-500 dark:text-slate-400 mt-1">
+        Per-category spending pulled from YNAB. Positive amounts (deposits, refunds) are excluded.
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <select id="sp-months"
+              class="rounded-md border border-slate-200 dark:border-ink-600 bg-white dark:bg-ink-800
+                     py-2 px-3 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40">
+        <option value="3">Last 3 months</option>
+        <option value="6" selected>Last 6 months</option>
+        <option value="12">Last 12 months</option>
+      </select>
+      <button id="sp-refresh" type="button"
+              title="Force a fresh sync from YNAB"
+              class="text-sm px-3 py-1.5 rounded-md border border-slate-200 dark:border-ink-600
+                     hover:bg-slate-100 dark:hover:bg-ink-700">⟳ Sync</button>
+    </div>
+  </div>
+
+  {# ── Summary cards ─────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <div class="card">
+      <div class="card-label">This month</div>
+      <div class="card-value" id="sp-this-month">—</div>
+      <div class="card-meta" id="sp-this-month-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Previous month</div>
+      <div class="card-value" id="sp-prev-month">—</div>
+      <div class="card-meta">&nbsp;</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Avg / month (window)</div>
+      <div class="card-value" id="sp-avg">—</div>
+      <div class="card-meta" id="sp-window-meta">&nbsp;</div>
+    </div>
+  </div>
+
+  {# ── Per-month total bars ──────────────────────────────────────────── #}
+  <div class="card">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="font-medium">Total spend per month</h2>
+      <span class="text-xs text-ink-500 dark:text-slate-400" id="sp-window-label"></span>
+    </div>
+    <div id="sp-month-bars" class="space-y-2"></div>
+  </div>
+
+  {# ── Per-category breakdown ────────────────────────────────────────── #}
+  <div class="card p-0 overflow-hidden">
+    <div class="px-5 py-3 border-b border-slate-200 dark:border-ink-700 flex items-center justify-between">
+      <h2 class="font-medium">Categories — month-over-month</h2>
+      <span class="text-xs text-ink-500 dark:text-slate-400">click a row to filter Transactions</span>
+    </div>
+    <div id="sp-cats" class="divide-y divide-slate-100 dark:divide-ink-700"></div>
+    <div id="sp-empty" class="hidden text-center py-12 text-ink-500 dark:text-slate-400">
+      No spending data yet. Categorize some transactions in YNAB and come back.
+    </div>
+    <div id="sp-loading" class="text-center py-12 text-ink-500 dark:text-slate-400">
+      <span class="spinner inline-block"></span><span class="ml-2">Loading…</span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script>RYNAB.boot('spending');</script>
+{% endblock %}

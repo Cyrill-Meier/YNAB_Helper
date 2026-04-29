@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}Revolut → YNAB{% endblock %}</title>
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/static/favicon.svg?v={{ cache_bust }}" type="image/svg+xml">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
@@ -43,7 +43,7 @@
       }
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v={{ cache_bust }}">
   <style type="text/tailwindcss">
     /* Cards & primitives */
     .card        { @apply bg-white dark:bg-ink-800 border border-slate-200 dark:border-ink-700 rounded-2xl p-5 shadow-soft; }
@@ -164,7 +164,7 @@
    `<script>RYNAB.boot(…)</script>` blocks below this tag, and inline
    scripts run synchronously during parsing while deferred scripts run
    after parsing finishes — so deferring app.js races the bootstraps. #}
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v={{ cache_bust }}"></script>
 {% block extra_scripts %}{% endblock %}
 </body>
 </html>

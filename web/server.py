@@ -288,6 +288,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             return RedirectResponse(url="/app", status_code=302)
         return templates.TemplateResponse("login.html", {
             "request": request,
+            "cache_bust": _cache_bust_token(),
             "message": "Open Telegram and send /login to your bot to get a "
                        "one-time URL.",
         })
@@ -303,7 +304,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             log.warning("web: auth rate-limit hit for %s", ip)
             return templates.TemplateResponse(
                 "login.html",
-                {"request": request,
+                {"request": request, "cache_bust": _cache_bust_token(),
                  "message": "Too many attempts. Wait a minute and try again."},
                 status_code=429,
             )
@@ -325,7 +326,7 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             log.info("web: bad/expired login token from %s", ip)
             return templates.TemplateResponse(
                 "login.html",
-                {"request": request,
+                {"request": request, "cache_bust": _cache_bust_token(),
                  "message": "That login URL has expired or already been "
                             "used. Open Telegram and run /login again."},
                 status_code=400,
@@ -386,6 +387,10 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             "user": user,
             "csrf_token": csrf,
             "version": _bot_version_line(),
+            # Used as ?v=… on /static/* URLs to bust browser caches on
+            # every deploy. Combines version + commit SHA so even a
+            # rebuild without a version bump invalidates clients.
+            "cache_bust": _cache_bust_token(),
             "now_ts": int(time.time()),
             **ctx,
         }
@@ -1146,6 +1151,22 @@ def _bot_version_line():
         return bot.format_version_line()
     except Exception:
         return "v? (?, ?)"
+
+
+def _cache_bust_token():
+    """Short opaque token that changes on every deploy.
+
+    Format: ``<version>-<sha>``. Used as ``?v=…`` on every reference to
+    a /static/ asset so browsers don't serve stale CSS/JS after a
+    deploy. Falls back to a constant if the bot module can't be
+    imported (which would only happen during very early boot).
+    """
+    try:
+        import revolut_ynab_bot as bot
+        sha = (bot.get_version_info() or {}).get("sha", "dev")
+        return f"{bot.__version__}-{sha}"
+    except Exception:
+        return "dev"
 
 
 def _latest_csv(data_dir, telegram_id):

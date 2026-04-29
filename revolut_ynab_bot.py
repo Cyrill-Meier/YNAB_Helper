@@ -61,7 +61,7 @@ import revolut_to_ynab as ynab
 # BUILD_SHA and BUILD_DATE are injected at Docker build time from GitHub Actions
 # (see Dockerfile ARGs). When running locally from source, they stay "dev".
 
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 
 
 def get_version_info():
@@ -2469,6 +2469,35 @@ class RevolutYNABBot:
                 len(user_cmds), len(admin_cmds), self.admin_id,
             )
 
+    def _migrate_user_tx_dbs(self):
+        """Open every user's transactions DB once so `_migrate_db` runs.
+
+        ``_migrate_db`` (in ``revolut_to_ynab``) holds idempotent
+        ALTER TABLE migrations and one-shot data backfills. It only
+        executes inside ``init_db`` — which the bot otherwise calls
+        on CSV import. That meant a deploy with a new migration only
+        applied the next time each user uploaded a CSV, sometimes
+        days later. Doing the open + close pass at startup makes
+        deploys deterministic.
+        """
+        try:
+            tx_dbs = sorted(self.data_dir.glob("transactions_*.db"))
+        except OSError as e:
+            ynab.log.warning("bot: could not enumerate user tx DBs: %s", e)
+            return
+        for path in tx_dbs:
+            try:
+                conn = ynab.init_db(str(path))
+                conn.close()
+            except Exception as e:
+                ynab.log.warning(
+                    "bot: migration pass failed for %s: %s", path.name, e,
+                )
+        ynab.log.info(
+            "bot: ran startup migration pass over %d user tx DB(s)",
+            len(tx_dbs),
+        )
+
     def run(self):
         """Start the bot with long-polling."""
         me = tg_request(self.token, "getMe")
@@ -2478,6 +2507,12 @@ class RevolutYNABBot:
         # Register / refresh slash-command autocomplete with Telegram.
         # Cheap idempotent call — safe to run on every restart.
         self._register_bot_commands()
+        # Run any pending DB migrations on every user's transactions DB.
+        # Without this, idempotent backfills inside `_migrate_db` only
+        # fire on the next CSV import — which can be days away. Open
+        # each DB once at startup so migrations land deterministically
+        # right after a deploy.
+        self._migrate_user_tx_dbs()
         bot_name = me["result"].get("username", "?")
         version_line = format_version_line()
         print(f"🤖 Bot @{bot_name} started ({version_line}) admin={self.admin_id}")

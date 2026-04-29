@@ -242,6 +242,34 @@ def _migrate_db(conn):
         if col not in existing:
             conn.execute(f"ALTER TABLE transactions ADD COLUMN {col} {col_type}")
 
+    # One-time backfill: strip stale "(pending)" markers from cleared rows
+    # in the local DB. Pre-1.2.7 db_upsert used COALESCE on `memo`, so
+    # when a transaction transitioned PENDING → COMPLETED (and the parser
+    # produced memo=NULL), the original "(pending)" memo was preserved in
+    # the local DB. YNAB itself was patched correctly via PUT, but the
+    # web UI reads memos from the local DB so users saw the stale string.
+    #
+    # This pass runs every startup but does no work on a clean DB
+    # (LIKE filter narrows to the affected rows; cleaned rows no longer
+    # match, so the next run is a no-op).
+    stale = conn.execute(
+        "SELECT import_id, memo FROM transactions "
+        "WHERE cleared = 'cleared' AND memo LIKE '%(pending)%'"
+    ).fetchall()
+    if stale:
+        now = datetime.now().isoformat()
+        for iid, memo in stale:
+            cleaned = _strip_pending_marker(memo) or None
+            conn.execute(
+                "UPDATE transactions SET memo = ?, updated_at = ? "
+                "WHERE import_id = ?",
+                (cleaned, now, iid),
+            )
+        log.info(
+            "init_db: backfilled %d stale '(pending)' memos on cleared rows",
+            len(stale),
+        )
+
 
 def db_get_server_knowledge(conn, account_id):
     """Get the last server_knowledge value for delta syncing."""
@@ -284,7 +312,13 @@ def db_upsert(conn, tx, ynab_tx_id=None, source="revolut"):
         ON CONFLICT(import_id) DO UPDATE SET
             amount = excluded.amount,
             payee_name = COALESCE(excluded.payee_name, transactions.payee_name),
-            memo = COALESCE(excluded.memo, transactions.memo),
+            -- NOT COALESCE: the parser explicitly sets memo to NULL when
+            -- a row clears (PENDING → COMPLETED produces an empty memo,
+            -- which the parser stores as None). COALESCE here preserved
+            -- the stale "(pending)" memo from the original PENDING import,
+            -- so the web UI showed Memo="(pending)" while State="cleared"
+            -- on every row that had ever been pending.
+            memo = excluded.memo,
             cleared = excluded.cleared,
             state = excluded.state,
             ynab_tx_id = COALESCE(excluded.ynab_tx_id, transactions.ynab_tx_id),

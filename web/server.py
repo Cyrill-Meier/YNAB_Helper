@@ -625,13 +625,18 @@ def make_app(config: WebConfig, bot_db_path: Path, log: logging.Logger):
             where.append("(t.payee_name LIKE ? OR t.memo LIKE ?)")
             params.extend([like, like])
         # YNAB's `cleared` column is a three-value enum:
-        # cleared, reconciled, uncleared. Reconciled means
-        # "cleared and locked by a reconcile pass" — it's MORE
-        # cleared than just cleared. So:
-        #   state=cleared   → matches cleared OR reconciled
-        #   state=uncleared → matches uncleared OR NULL only
+        # cleared, reconciled, uncleared. The UI exposes all three as
+        # distinct filter options; each one matches exactly its bucket.
+        # Reconciled means "cleared and locked by a reconcile pass" —
+        # it's MORE cleared than just cleared, but users still want to
+        # be able to slice it on its own.
+        #   state=cleared    → only cleared (NOT reconciled)
+        #   state=reconciled → only reconciled
+        #   state=uncleared  → uncleared OR NULL
         if state == "cleared":
-            where.append("t.cleared IN ('cleared', 'reconciled')")
+            where.append("t.cleared = 'cleared'")
+        elif state == "reconciled":
+            where.append("t.cleared = 'reconciled'")
         elif state == "uncleared":
             where.append("(t.cleared = 'uncleared' OR t.cleared IS NULL)")
         if category:

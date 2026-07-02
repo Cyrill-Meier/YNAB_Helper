@@ -1451,6 +1451,7 @@ class RevolutYNABBot:
             tg_send(self.token, chat_id, "Setup incomplete. Run /setup first.", None)
             return
 
+        conn = None
         try:
             conn = ynab.init_db(cfg["db_path"])
             buf = io.StringIO()
@@ -1464,12 +1465,21 @@ class RevolutYNABBot:
             finally:
                 sys.stdout = old_stdout
             output = buf.getvalue()
-            conn.close()
         except Exception as e:
             ynab.log.error("bot: import failed for user %s: %s",
                            sender_id, traceback.format_exc())
             tg_send(self.token, chat_id, f"Import failed: {e}", None)
             return
+        finally:
+            # A leaked connection keeps any uncommitted write transaction
+            # open, which holds the SQLite write lock and fails every
+            # future import with "database is locked" until restart.
+            if conn is not None:
+                try:
+                    conn.rollback()
+                    conn.close()
+                except sqlite3.Error:
+                    pass
 
         summary = self._format_import_summary(output)
         tg_send(self.token, chat_id, summary, None)

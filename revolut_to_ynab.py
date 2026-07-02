@@ -1228,6 +1228,11 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 tx.get("payee_name", ""), tx["cleared"],
                 tx["import_id"], ynab_tx_id or "-",
             )
+        # Commit before duplicate reconciliation: YNAB already accepted
+        # these rows, so the local id-mapping must survive even if the
+        # reconciliation below fails. An uncommitted transaction here
+        # would also hold the write lock across its network calls.
+        conn.commit()
 
         # ── Duplicate reconciliation ──
         # YNAB's import_id dedup skips the POST when an import_id already exists,
@@ -1292,6 +1297,9 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
 
                 # Record locally either way so future imports have the ynab_tx_id
                 db_upsert(conn, tx, ynab_tx_id=ynab_tx_id)
+                # Commit per row — the PATCHes above mean this loop can
+                # hold the write lock across many network round-trips.
+                conn.commit()
 
             if dup_patched:
                 print(f"    ↻ Patched:   {dup_patched} drifted (pending→cleared / memo / amount)")
@@ -1334,6 +1342,12 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 updated_count += 1
 
             db_upsert(conn, tx, ynab_tx_id)
+            # Per-row commit: the YNAB-side write above already happened,
+            # so record it durably now. Committing only after the loop
+            # meant a mid-loop API error (e.g. PATCH on a transaction
+            # deleted in YNAB → 404) left an open write transaction that
+            # locked the DB for every subsequent import.
+            conn.commit()
             log.info(
                 "tx updated   date=%s amount=%+.2f payee=%s state=%s import_id=%s ynab_id=%s",
                 tx["date"], tx["amount"] / 1000,
@@ -1341,7 +1355,6 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 tx["import_id"], ynab_tx_id or "-",
             )
 
-        conn.commit()
         print(f"    ✓ Updated: {updated_count}")
 
 

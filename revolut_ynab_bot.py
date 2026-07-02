@@ -1506,6 +1506,8 @@ class RevolutYNABBot:
                 parts.append(f"  Created: {line.split(':')[-1].strip()}")
             elif "Duplicates:" in line:
                 parts.append(f"  Dupes:   {line.split(':')[-1].strip()}")
+            elif "Removed:" in line:
+                parts.append(f"  Removed: {line.split(':')[-1].strip()} (reverted)")
         return "\n".join(parts)
 
     # ── /reconcile ───────────────────────────────────────────────────────

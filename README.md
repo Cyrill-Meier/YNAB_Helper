@@ -526,6 +526,8 @@ Each transaction gets an `import_id` derived from its date, amount, and payee. Y
 
 **Pending → cleared drift.** When a row is first imported while still pending, its memo gets a `(pending)` tag and `cleared=uncleared`. On a later CSV where that row has cleared, the importer normally sees the state change in the local DB and issues a `PATCH` to strip the marker and flip `cleared`. If the local DB was wiped (fresh VM, deleted volume, etc.), that record is missing — the importer re-POSTs, YNAB returns it as a duplicate, and without intervention the original stale row would stay. The importer now fetches duplicates and patches any whose `cleared` / `memo` / `amount` has drifted. To clean up historic drift that predates this fix, run `/cleanup_pending` (bot) or `--cleanup-pending-memos` (CLI).
 
+**Pending → reverted.** When Revolut reverts a payment (failed or cancelled card authorization), the CSV keeps the row with state `REVERTED`. If that row was previously imported while pending, the importer deletes its YNAB transaction and marks the local record deleted; if it was never imported, it is skipped entirely — reverted payments never reach YNAB. Rows already deleted in YNAB by hand are tolerated (the 404 just updates local state).
+
 ### Auto-update flow
 
 1. You push to `main`.

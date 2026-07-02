@@ -335,7 +335,7 @@ def db_get_existing(conn, import_ids):
         return {}
     placeholders = ",".join("?" for _ in import_ids)
     rows = conn.execute(
-        f"SELECT import_id, amount, cleared, state, ynab_tx_id FROM transactions WHERE import_id IN ({placeholders})",
+        f"SELECT import_id, amount, cleared, state, ynab_tx_id, deleted FROM transactions WHERE import_id IN ({placeholders})",
         import_ids,
     ).fetchall()
     return {row["import_id"]: dict(row) for row in rows}
@@ -918,35 +918,57 @@ def parse_revolut_csv(filepath):
 def diff_transactions(conn, transactions):
     """
     Compare parsed transactions against the local DB.
-    Returns (to_create, to_update) where:
+    Returns (to_create, to_update, to_delete, skipped) where:
       - to_create: transactions not in the DB (genuinely new)
       - to_update: transactions whose state changed (e.g. pending → completed,
                    or amount changed after settlement)
+      - to_delete: previously imported transactions Revolut now reports as
+                   REVERTED — their YNAB copy should be removed
     """
     import_ids = [tx["import_id"] for tx in transactions]
     existing = db_get_existing(conn, import_ids)
 
     to_create = []
     to_update = []
+    to_delete = []
     skipped = 0
 
     for tx in transactions:
         iid = tx["import_id"]
-        if iid not in existing:
-            to_create.append(tx)
-        else:
-            old = existing[iid]
-            # Check if anything meaningful changed
-            amount_changed = old["amount"] != tx["amount"]
-            state_changed = old["cleared"] != tx["cleared"]
+        reverted = tx.get("_state") == "REVERTED"
 
-            if amount_changed or state_changed:
-                tx["_ynab_tx_id"] = old.get("ynab_tx_id")
-                to_update.append(tx)
+        if iid not in existing:
+            if reverted:
+                # A failed/cancelled authorization we never imported —
+                # it must not reach YNAB at all.
+                skipped += 1
+            else:
+                to_create.append(tx)
+            continue
+
+        old = existing[iid]
+        if reverted:
+            # Imported earlier (usually while PENDING), since reverted by
+            # Revolut: delete the YNAB copy. Rows already unlinked or
+            # already marked deleted need no further action.
+            if old.get("ynab_tx_id") and not old.get("deleted"):
+                tx["_ynab_tx_id"] = old["ynab_tx_id"]
+                to_delete.append(tx)
             else:
                 skipped += 1
+            continue
 
-    return to_create, to_update, skipped
+        # Check if anything meaningful changed
+        amount_changed = old["amount"] != tx["amount"]
+        state_changed = old["cleared"] != tx["cleared"]
+
+        if amount_changed or state_changed:
+            tx["_ynab_tx_id"] = old.get("ynab_tx_id")
+            to_update.append(tx)
+        else:
+            skipped += 1
+
+    return to_create, to_update, to_delete, skipped
 
 
 def _fetch_ynab_txns_by_import_id(token, budget_id, account_id, import_ids, since_date=None):
@@ -1163,19 +1185,21 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
     """
     Diff transactions against the local DB, then create/update only what's needed.
     """
-    to_create, to_update, skipped = diff_transactions(conn, transactions)
+    to_create, to_update, to_delete, skipped = diff_transactions(conn, transactions)
 
     log.info(
-        "import diff: new=%d updated=%d skipped=%d (account=%s)",
-        len(to_create), len(to_update), skipped, account_id,
+        "import diff: new=%d updated=%d reverted=%d skipped=%d (account=%s)",
+        len(to_create), len(to_update), len(to_delete), skipped, account_id,
     )
 
     print(f"\n  📋 Summary:")
     print(f"     New transactions:     {len(to_create)}")
     print(f"     Updated (state/amt):  {len(to_update)}")
+    if to_delete:
+        print(f"     Reverted (to remove): {len(to_delete)}")
     print(f"     Already imported:     {skipped}")
 
-    if not to_create and not to_update:
+    if not to_create and not to_update and not to_delete:
         print("  ✓ Nothing to do — everything is already up to date.")
         return
 
@@ -1191,6 +1215,11 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
             for tx in to_update:
                 amt = tx["amount"] / 1000
                 print(f"    ↻ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}  → {tx['cleared']}")
+        if to_delete:
+            print(f"\n  ── Would remove {len(to_delete)} reverted transaction(s) from YNAB: ──\n")
+            for tx in to_delete:
+                amt = tx["amount"] / 1000
+                print(f"    ✗ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}")
         return
 
     # ── Create new transactions ──
@@ -1356,6 +1385,38 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
             )
 
         print(f"    ✓ Updated: {updated_count}")
+
+    # ── Remove reverted transactions ──
+    if to_delete:
+        print(f"\n  → Removing {len(to_delete)} reverted transaction(s) from YNAB...")
+        removed = 0
+        for tx in to_delete:
+            ynab_tx_id = tx["_ynab_tx_id"]
+            try:
+                ynab_request(
+                    "DELETE",
+                    f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
+                    token,
+                )
+                removed += 1
+            except RuntimeError as e:
+                # Already gone in YNAB (e.g. deleted by hand) — just
+                # record that locally so we stop retrying.
+                if "YNAB API 404" not in str(e):
+                    raise
+            conn.execute(
+                "UPDATE transactions SET deleted = 1, state = 'REVERTED', "
+                "updated_at = ? WHERE import_id = ?",
+                (datetime.now().isoformat(), tx["import_id"]),
+            )
+            conn.commit()
+            log.info(
+                "tx removed   date=%s amount=%+.2f payee=%s import_id=%s ynab_id=%s (reverted)",
+                tx["date"], tx["amount"] / 1000,
+                tx.get("payee_name", ""), tx["import_id"], ynab_tx_id,
+            )
+
+        print(f"    ✓ Removed: {removed}")
 
 
 # ─── Auto-detect the latest Revolut export ─────────────────────────────────

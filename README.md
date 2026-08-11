@@ -528,6 +528,8 @@ Each transaction gets an `import_id` derived from its date, amount, and payee. Y
 
 **Pending → reverted.** When Revolut reverts a payment (failed or cancelled card authorization), the CSV keeps the row with state `REVERTED`. If that row was previously imported while pending, the importer deletes its YNAB transaction and marks the local record deleted; if it was never imported, it is skipped entirely — reverted payments never reach YNAB. Rows already deleted in YNAB by hand are tolerated (the 404 just updates local state).
 
+**Date-shifted rows.** Revolut occasionally re-renders a row's Started Date between exports (timezone change around midnight), which changes the amount+date-based `import_id` and used to create a YNAB duplicate. The importer now recognizes this: a "new" row that started within 3h of midnight, whose exact amount+payee exists locally ±1 day linked to YNAB, and whose old date has vanished from the CSV, is treated as the same transaction — the YNAB row is re-dated via PATCH and the local record re-keyed instead of creating a copy.
+
 ### Auto-update flow
 
 1. You push to `main`.

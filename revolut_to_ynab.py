@@ -42,7 +42,7 @@ import sqlite3
 import sys
 import time
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import ssl
 from urllib.request import Request, urlopen
@@ -901,6 +901,9 @@ def parse_revolut_csv(filepath):
                 "approved": True,
                 "import_id": import_id,
                 "_state": state,  # keep original state for DB tracking
+                # Start time of day — used to detect rows whose date shifted
+                # between exports (timezone re-rendering near midnight).
+                "_started_time": dt.strftime("%H:%M:%S"),
             })
 
     if skipped_products:
@@ -915,6 +918,50 @@ def parse_revolut_csv(filepath):
 
 # ─── Diff & import ───────────────────────────────────────────────────────────
 
+def _find_date_shifted_original(conn, tx, csv_import_ids, consumed):
+    """Find a local row that is this CSV row under a shifted date.
+
+    Revolut occasionally re-renders a row's Started Date between exports
+    (timezone change near midnight), which changes our amount+date-based
+    import_id and would create a YNAB duplicate. A row qualifies as the
+    same transaction when ALL of:
+      - the CSV row started within 3h of midnight (only those can shift),
+      - a local Revolut-sourced row exists exactly ±1 day away with the
+        same amount AND same payee, still linked to a YNAB transaction,
+      - that local row's import_id is absent from the current CSV
+        (its old date no longer exists in the export).
+    Returns the local row dict or None.
+    """
+    started = tx.get("_started_time") or ""
+    try:
+        hour = int(started[:2])
+    except ValueError:
+        return None
+    if 3 <= hour < 21:
+        return None
+
+    try:
+        day = datetime.strptime(tx["date"], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+    for delta in (-1, 1):
+        neighbor = (day + timedelta(days=delta)).strftime("%Y-%m-%d")
+        row = conn.execute(
+            "SELECT import_id, amount, cleared, ynab_tx_id FROM transactions "
+            "WHERE amount = ? AND payee_name = ? AND date = ? "
+            "AND source = 'revolut' AND deleted = 0 AND ynab_tx_id IS NOT NULL",
+            (tx["amount"], tx["payee_name"], neighbor),
+        ).fetchone()
+        if (
+            row
+            and row["import_id"] not in csv_import_ids
+            and row["import_id"] not in consumed
+        ):
+            return dict(row)
+    return None
+
+
 def diff_transactions(conn, transactions):
     """
     Compare parsed transactions against the local DB.
@@ -927,6 +974,8 @@ def diff_transactions(conn, transactions):
     """
     import_ids = [tx["import_id"] for tx in transactions]
     existing = db_get_existing(conn, import_ids)
+    csv_import_ids = set(import_ids)
+    shift_consumed = set()
 
     to_create = []
     to_update = []
@@ -942,6 +991,18 @@ def diff_transactions(conn, transactions):
                 # A failed/cancelled authorization we never imported —
                 # it must not reach YNAB at all.
                 skipped += 1
+                continue
+            shifted = _find_date_shifted_original(
+                conn, tx, csv_import_ids, shift_consumed,
+            )
+            if shifted:
+                # Same transaction, re-dated by Revolut between exports:
+                # update the existing YNAB row and re-key the local record
+                # instead of creating a duplicate.
+                shift_consumed.add(shifted["import_id"])
+                tx["_ynab_tx_id"] = shifted["ynab_tx_id"]
+                tx["_rekey_from"] = shifted["import_id"]
+                to_update.append(tx)
             else:
                 to_create.append(tx)
             continue
@@ -1214,7 +1275,8 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
             print(f"\n  ── Would update {len(to_update)} transaction(s): ──\n")
             for tx in to_update:
                 amt = tx["amount"] / 1000
-                print(f"    ↻ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}  → {tx['cleared']}")
+                note = f"  (re-dated from {tx['_rekey_from'].split(':')[2]})" if tx.get("_rekey_from") else ""
+                print(f"    ↻ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}  → {tx['cleared']}{note}")
         if to_delete:
             print(f"\n  ── Would remove {len(to_delete)} reverted transaction(s) from YNAB: ──\n")
             for tx in to_delete:
@@ -1362,6 +1424,10 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                         "memo": tx.get("memo"),
                     }
                 }
+                if tx.get("_rekey_from"):
+                    # Date-shifted duplicate: move the YNAB row to the
+                    # re-dated CSV date instead of creating a copy.
+                    update_body["transaction"]["date"] = tx["date"]
                 result = ynab_request(
                     "PATCH",
                     f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
@@ -1370,6 +1436,17 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 )
                 updated_count += 1
 
+            if tx.get("_rekey_from"):
+                # Replace the old-dated local record; db_upsert below
+                # re-inserts the same transaction under its new import_id.
+                conn.execute(
+                    "DELETE FROM transactions WHERE import_id = ?",
+                    (tx["_rekey_from"],),
+                )
+                log.info(
+                    "tx re-dated  %s -> %s (ynab_id=%s kept, no duplicate created)",
+                    tx["_rekey_from"], tx["import_id"], ynab_tx_id,
+                )
             db_upsert(conn, tx, ynab_tx_id)
             # Per-row commit: the YNAB-side write above already happened,
             # so record it durably now. Committing only after the loop

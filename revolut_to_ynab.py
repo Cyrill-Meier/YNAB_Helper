@@ -1025,6 +1025,9 @@ def diff_transactions(conn, transactions):
 
         if amount_changed or state_changed:
             tx["_ynab_tx_id"] = old.get("ynab_tx_id")
+            if amount_changed:
+                # Carried along so the import can report old -> new
+                tx["_old_amount"] = old["amount"]
             to_update.append(tx)
         else:
             skipped += 1
@@ -1374,6 +1377,11 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                             token, update_body,
                         )
                         dup_patched += 1
+                        if existing.get("amount", 0) != tx["amount"]:
+                            print(
+                                f"    Δ {tx['date']}  {tx['payee_name']} — amount "
+                                f"{existing.get('amount', 0)/1000:+.2f} → {tx['amount']/1000:+.2f}"
+                            )
                         log.info(
                             "tx drift-fix date=%s amount=%+.2f payee=%s "
                             "cleared=%s→%s memo=%r→%r import_id=%s ynab_id=%s",
@@ -1447,6 +1455,19 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                     "tx re-dated  %s -> %s (ynab_id=%s kept, no duplicate created)",
                     tx["_rekey_from"], tx["import_id"], ynab_tx_id,
                 )
+            changes = []
+            if tx.get("_old_amount") is not None and tx["_old_amount"] != tx["amount"]:
+                changes.append(
+                    f"amount {tx['_old_amount']/1000:+.2f} → {tx['amount']/1000:+.2f}"
+                )
+            if tx.get("_rekey_from"):
+                old_date = tx["_rekey_from"].split(":")[2]
+                if old_date != tx["date"]:
+                    changes.append(f"date {old_date} → {tx['date']}")
+            if changes:
+                # "Δ" lines are picked up by the bot and surfaced in the
+                # Telegram import summary.
+                print(f"    Δ {tx['date']}  {tx['payee_name']} — {', '.join(changes)}")
             db_upsert(conn, tx, ynab_tx_id)
             # Per-row commit: the YNAB-side write above already happened,
             # so record it durably now. Committing only after the loop

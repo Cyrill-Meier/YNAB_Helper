@@ -1489,6 +1489,7 @@ class RevolutYNABBot:
         """Turn the script's stdout into a clean Telegram message."""
         lines = stdout_output.strip().splitlines()
         parts = ["✅ Import complete\n"]
+        changed = []
         for line in lines:
             line = line.strip()
             if not line:
@@ -1508,6 +1509,14 @@ class RevolutYNABBot:
                 parts.append(f"  Dupes:   {line.split(':')[-1].strip()}")
             elif "Removed:" in line:
                 parts.append(f"  Removed: {line.split(':')[-1].strip()} (reverted)")
+            elif line.startswith("Δ "):
+                changed.append(line[2:])
+        if changed:
+            parts.append("\n⚠ Amount/date changed:")
+            shown = changed[:8]
+            parts.extend(f"  • {c}" for c in shown)
+            if len(changed) > len(shown):
+                parts.append(f"  … and {len(changed) - len(shown)} more")
         return "\n".join(parts)
 
     # ── /reconcile ───────────────────────────────────────────────────────

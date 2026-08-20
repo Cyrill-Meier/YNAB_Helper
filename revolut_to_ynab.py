@@ -1014,6 +1014,7 @@ def diff_transactions(conn, transactions):
             # already marked deleted need no further action.
             if old.get("ynab_tx_id") and not old.get("deleted"):
                 tx["_ynab_tx_id"] = old["ynab_tx_id"]
+                tx["_delete_reason"] = "reverted"
                 to_delete.append(tx)
             else:
                 skipped += 1
@@ -1031,6 +1032,38 @@ def diff_transactions(conn, transactions):
             to_update.append(tx)
         else:
             skipped += 1
+
+    # ── Orphaned pendings ──
+    # A pending we imported earlier can vanish from the export even though
+    # its date is still inside the export's window: Revolut settled it
+    # under DIFFERENT rows (restaurant bill + tip split into two, FX
+    # re-quote changing the amount, one auth splitting into several
+    # settlements). The amount+date import_id no longer matches anything,
+    # so the YNAB copy would linger uncleared forever. Queue it for
+    # removal — the settled replacement rows arrive as new transactions
+    # in the same import.
+    if transactions:
+        window_lo = min(t["date"] for t in transactions)
+        window_hi = max(t["date"] for t in transactions)
+        orphans = conn.execute(
+            "SELECT import_id, date, amount, payee_name, ynab_tx_id "
+            "FROM transactions "
+            "WHERE cleared = 'uncleared' AND source = 'revolut' "
+            "AND deleted = 0 AND ynab_tx_id IS NOT NULL "
+            "AND date BETWEEN ? AND ?",
+            (window_lo, window_hi),
+        ).fetchall()
+        for row in orphans:
+            if row["import_id"] in csv_import_ids or row["import_id"] in shift_consumed:
+                continue
+            to_delete.append({
+                "date": row["date"],
+                "amount": row["amount"],
+                "payee_name": row["payee_name"] or "",
+                "import_id": row["import_id"],
+                "_ynab_tx_id": row["ynab_tx_id"],
+                "_delete_reason": "superseded",
+            })
 
     return to_create, to_update, to_delete, skipped
 
@@ -1252,7 +1285,7 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
     to_create, to_update, to_delete, skipped = diff_transactions(conn, transactions)
 
     log.info(
-        "import diff: new=%d updated=%d reverted=%d skipped=%d (account=%s)",
+        "import diff: new=%d updated=%d remove=%d skipped=%d (account=%s)",
         len(to_create), len(to_update), len(to_delete), skipped, account_id,
     )
 
@@ -1260,7 +1293,7 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
     print(f"     New transactions:     {len(to_create)}")
     print(f"     Updated (state/amt):  {len(to_update)}")
     if to_delete:
-        print(f"     Reverted (to remove): {len(to_delete)}")
+        print(f"     Stale (to remove):    {len(to_delete)}")
     print(f"     Already imported:     {skipped}")
 
     if not to_create and not to_update and not to_delete:
@@ -1281,10 +1314,11 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 note = f"  (re-dated from {tx['_rekey_from'].split(':')[2]})" if tx.get("_rekey_from") else ""
                 print(f"    ↻ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}  → {tx['cleared']}{note}")
         if to_delete:
-            print(f"\n  ── Would remove {len(to_delete)} reverted transaction(s) from YNAB: ──\n")
+            print(f"\n  ── Would remove {len(to_delete)} stale transaction(s) from YNAB: ──\n")
             for tx in to_delete:
                 amt = tx["amount"] / 1000
-                print(f"    ✗ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}")
+                reason = tx.get("_delete_reason", "reverted")
+                print(f"    ✗ {tx['date']}  {amt:>10.2f}  {tx['payee_name']}  ({reason})")
         return
 
     # ── Create new transactions ──
@@ -1484,12 +1518,13 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
 
         print(f"    ✓ Updated: {updated_count}")
 
-    # ── Remove reverted transactions ──
+    # ── Remove reverted / superseded transactions ──
     if to_delete:
-        print(f"\n  → Removing {len(to_delete)} reverted transaction(s) from YNAB...")
+        print(f"\n  → Removing {len(to_delete)} stale transaction(s) from YNAB...")
         removed = 0
         for tx in to_delete:
             ynab_tx_id = tx["_ynab_tx_id"]
+            reason = tx.get("_delete_reason", "reverted")
             try:
                 ynab_request(
                     "DELETE",
@@ -1503,15 +1538,21 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 if "YNAB API 404" not in str(e):
                     raise
             conn.execute(
-                "UPDATE transactions SET deleted = 1, state = 'REVERTED', "
+                "UPDATE transactions SET deleted = 1, state = ?, "
                 "updated_at = ? WHERE import_id = ?",
-                (datetime.now().isoformat(), tx["import_id"]),
+                (reason.upper(), datetime.now().isoformat(), tx["import_id"]),
             )
             conn.commit()
+            label = ("pending superseded by settled rows"
+                     if reason == "superseded" else "reverted")
+            # "✗" lines are picked up by the bot and surfaced in the
+            # Telegram import summary.
+            print(f"    ✗ {tx['date']}  {tx['amount']/1000:+.2f}  "
+                  f"{tx.get('payee_name', '')} — {label}")
             log.info(
-                "tx removed   date=%s amount=%+.2f payee=%s import_id=%s ynab_id=%s (reverted)",
+                "tx removed   date=%s amount=%+.2f payee=%s import_id=%s ynab_id=%s (%s)",
                 tx["date"], tx["amount"] / 1000,
-                tx.get("payee_name", ""), tx["import_id"], ynab_tx_id,
+                tx.get("payee_name", ""), tx["import_id"], ynab_tx_id, reason,
             )
 
         print(f"    ✓ Removed: {removed}")

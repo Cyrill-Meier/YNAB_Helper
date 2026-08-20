@@ -530,6 +530,8 @@ Each transaction gets an `import_id` derived from its date, amount, and payee. Y
 
 **Date-shifted rows.** Revolut occasionally re-renders a row's Started Date between exports (timezone change around midnight), which changes the amount+date-based `import_id` and used to create a YNAB duplicate. The importer now recognizes this: a "new" row that started within 3h of midnight, whose exact amount+payee exists locally ±1 day linked to YNAB, and whose old date has vanished from the CSV, is treated as the same transaction — the YNAB row is re-dated via PATCH and the local record re-keyed instead of creating a copy.
 
+**Superseded pendings.** A pending authorization often settles under *different* rows than it was authorized as: a restaurant bill and tip split into two transactions, an FX re-quote changing the amount, one hotel hold splitting into several settlements. The pending's `import_id` then vanishes from the export while the settled rows arrive as new transactions — previously the pending's YNAB copy lingered uncleared forever. Now, a previously-imported pending whose `import_id` has disappeared from the CSV although its date is inside the CSV's window is deleted from YNAB (and listed in the Telegram summary under "Removed"). Pendings older than the CSV window and pendings still present in the export are never touched.
+
 ### Auto-update flow
 
 1. You push to `main`.

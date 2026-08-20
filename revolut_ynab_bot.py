@@ -1490,6 +1490,7 @@ class RevolutYNABBot:
         lines = stdout_output.strip().splitlines()
         parts = ["✅ Import complete\n"]
         changed = []
+        removed = []
         for line in lines:
             line = line.strip()
             if not line:
@@ -1508,15 +1509,23 @@ class RevolutYNABBot:
             elif "Duplicates:" in line:
                 parts.append(f"  Dupes:   {line.split(':')[-1].strip()}")
             elif "Removed:" in line:
-                parts.append(f"  Removed: {line.split(':')[-1].strip()} (reverted)")
+                parts.append(f"  Removed: {line.split(':')[-1].strip()}")
             elif line.startswith("Δ "):
                 changed.append(line[2:])
+            elif line.startswith("✗ ") and "API error" not in line:
+                removed.append(line[2:])
         if changed:
             parts.append("\n⚠ Amount/date changed:")
             shown = changed[:8]
             parts.extend(f"  • {c}" for c in shown)
             if len(changed) > len(shown):
                 parts.append(f"  … and {len(changed) - len(shown)} more")
+        if removed:
+            parts.append("\n🗑 Removed from YNAB:")
+            shown = removed[:8]
+            parts.extend(f"  • {r}" for r in shown)
+            if len(removed) > len(shown):
+                parts.append(f"  … and {len(removed) - len(shown)} more")
         return "\n".join(parts)
 
     # ── /reconcile ───────────────────────────────────────────────────────

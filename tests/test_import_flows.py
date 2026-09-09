@@ -40,7 +40,7 @@ def mk(date, amount, payee, state="COMPLETED", t="12:00:00", occ=1):
         "memo": None,
         "cleared": "cleared" if state == "COMPLETED" else "uncleared",
         "approved": True, "import_id": f"YNAB:{amount}:{date}:{occ}",
-        "_state": state, "_started_time": t,
+        "_state": state, "_started_time": t, "_started_at": f"{date} {t}",
     }
 
 
@@ -104,6 +104,62 @@ def test_date_shift(tmpdir):
     print("ok: date-shifted row re-keyed via PATCH, guards intact")
 
 
+def test_timezone_shift(tmpdir):
+    """Export made in Las Vegas (UTC-7), re-exported from Zürich (UTC+2):
+    every timestamp moves +9h, evening rows land on the next day."""
+    conn = fresh_db(tmpdir, "tzshift.db")
+    ynab.db_upsert(conn, mk("2026-08-22", -20000, "Lunch", t="12:15:10"), ynab_tx_id="y-lunch")
+    ynab.db_upsert(conn, mk("2026-08-22", -30000, "Dinner", t="19:30:05"), ynab_tx_id="y-dinner")
+    ynab.db_upsert(conn, mk("2026-08-22", -180, "Toll", t="22:10:00"), ynab_tx_id="y-toll")
+    conn.commit()
+    out = run_import(conn, [
+        mk("2026-08-22", -20000, "Lunch", t="21:15:10"),          # same day, reveals +9h
+        mk("2026-08-23", -30000, "Dinner", t="04:30:05"),         # crossed midnight, 04:30 is
+                                                                  # outside the old 3h gate
+        mk("2026-08-23", -180, "Toll", t="06:10:00", occ=1),      # genuinely new toll (+8h)
+        mk("2026-08-23", -180, "Toll", t="07:10:00", occ=2),      # the old toll, shifted +9h
+    ])
+    posts = [b["transactions"] for m, _, b in calls if m == "POST"]
+    assert len(posts) == 1 and len(posts[0]) == 1, posts
+    assert posts[0][0]["import_id"] == "YNAB:-180:2026-08-23:1", posts[0]
+    patches = {c[1].rsplit("/", 1)[1]: c[2]["transaction"] for c in calls if c[0] == "PATCH"}
+    assert set(patches) == {"y-dinner", "y-toll"}, patches
+    assert patches["y-dinner"]["date"] == "2026-08-23"
+    assert "date 2026-08-22 → 2026-08-23" in out
+    ids = sorted(r[0] for r in conn.execute(
+        "SELECT import_id FROM transactions WHERE deleted = 0"))
+    assert ids == [
+        "YNAB:-180:2026-08-23:1", "YNAB:-180:2026-08-23:2",
+        "YNAB:-20000:2026-08-22:1", "YNAB:-30000:2026-08-23:1",
+    ], ids
+    # Re-importing the same export converges
+    run_import(conn, [
+        mk("2026-08-22", -20000, "Lunch", t="21:15:10"),
+        mk("2026-08-23", -30000, "Dinner", t="04:30:05"),
+        mk("2026-08-23", -180, "Toll", t="06:10:00", occ=1),
+        mk("2026-08-23", -180, "Toll", t="07:10:00", occ=2),
+    ])
+    assert calls == [], calls
+    # Guard: a same-payee/amount neighbour whose time difference isn't a
+    # timezone offset (here 3h17m) is a different transaction — create.
+    ynab.db_upsert(conn, mk("2026-08-25", -4500, "Cafe", t="23:10:00"), ynab_tx_id="y-cafe")
+    conn.commit()
+    run_import(conn, [mk("2026-08-26", -4500, "Cafe", t="02:27:00")])
+    assert [c[0] for c in calls] == ["POST"], calls
+    # Legacy rows without started_at still use the near-midnight heuristic
+    ynab.db_upsert(conn, mk("2026-08-27", -7000, "Bar", t="23:40:00"), ynab_tx_id="y-bar")
+    ynab.db_upsert(conn, mk("2026-08-27", -8000, "Shop", t="14:00:00"), ynab_tx_id="y-shop")
+    conn.execute("UPDATE transactions SET started_at = NULL WHERE payee_name IN ('Bar', 'Shop')")
+    conn.commit()
+    run_import(conn, [
+        mk("2026-08-28", -7000, "Bar", t="00:40:00"),
+        mk("2026-08-28", -8000, "Shop", t="15:00:00"),
+    ])
+    assert sorted(c[0] for c in calls) == ["PATCH", "POST"], calls
+    conn.close()
+    print("ok: 9h export offset learned from matched rows, evening rows re-keyed, guards intact")
+
+
 def test_superseded_pending(tmpdir):
     conn = fresh_db(tmpdir, "superseded.db")
     # combined dinner+tip auth, later settled as two separate rows
@@ -159,6 +215,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         test_reverted(tmpdir)
         test_date_shift(tmpdir)
+        test_timezone_shift(tmpdir)
         test_superseded_pending(tmpdir)
         test_change_reporting(tmpdir)
     print("ALL PASSED")

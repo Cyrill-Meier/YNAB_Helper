@@ -278,6 +278,12 @@ def _migrate_db(conn):
         "approved":      "INTEGER",
         "deleted":       "INTEGER DEFAULT 0",
         "source":        "TEXT DEFAULT 'revolut'",
+        # Full "Started Date" as rendered by the export that last wrote
+        # the row. Exports render this column in the phone's local
+        # timezone at export time, so the same transaction can carry a
+        # different timestamp (and date) in two exports — see
+        # _find_date_shifted_original.
+        "started_at":    "TEXT",
     }
     for col, col_type in migrations.items():
         if col not in existing:
@@ -335,7 +341,8 @@ def db_get_existing(conn, import_ids):
         return {}
     placeholders = ",".join("?" for _ in import_ids)
     rows = conn.execute(
-        f"SELECT import_id, amount, cleared, state, ynab_tx_id, deleted FROM transactions WHERE import_id IN ({placeholders})",
+        f"SELECT import_id, amount, cleared, state, ynab_tx_id, deleted, started_at "
+        f"FROM transactions WHERE import_id IN ({placeholders})",
         import_ids,
     ).fetchall()
     return {row["import_id"]: dict(row) for row in rows}
@@ -347,9 +354,10 @@ def db_upsert(conn, tx, ynab_tx_id=None, source="revolut"):
     conn.execute("""
         INSERT INTO transactions (
             import_id, date, amount, payee_name, memo, cleared, state,
-            ynab_tx_id, account_id, category_name, approved, deleted, source, imported_at
+            ynab_tx_id, account_id, category_name, approved, deleted, source,
+            started_at, imported_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(import_id) DO UPDATE SET
             amount = excluded.amount,
             payee_name = COALESCE(excluded.payee_name, transactions.payee_name),
@@ -368,6 +376,7 @@ def db_upsert(conn, tx, ynab_tx_id=None, source="revolut"):
             approved = COALESCE(excluded.approved, transactions.approved),
             deleted = excluded.deleted,
             source = CASE WHEN transactions.source = 'revolut' THEN 'revolut' ELSE excluded.source END,
+            started_at = COALESCE(excluded.started_at, transactions.started_at),
             updated_at = ?
     """, (
         tx["import_id"], tx["date"], tx["amount"],
@@ -379,6 +388,7 @@ def db_upsert(conn, tx, ynab_tx_id=None, source="revolut"):
         1 if tx.get("approved") else 0,
         1 if tx.get("deleted") else 0,
         source,
+        tx.get("_started_at"),
         now, now,
     ))
 
@@ -901,9 +911,11 @@ def parse_revolut_csv(filepath):
                 "approved": True,
                 "import_id": import_id,
                 "_state": state,  # keep original state for DB tracking
-                # Start time of day — used to detect rows whose date shifted
-                # between exports (timezone re-rendering near midnight).
+                # Started timestamp as rendered by this export — used to
+                # detect rows whose date shifted between exports because
+                # the phone was in a different timezone when exporting.
                 "_started_time": dt.strftime("%H:%M:%S"),
+                "_started_at": dt.strftime("%Y-%m-%d %H:%M:%S"),
             })
 
     if skipped_products:
@@ -918,18 +930,75 @@ def parse_revolut_csv(filepath):
 
 # ─── Diff & import ───────────────────────────────────────────────────────────
 
-def _find_date_shifted_original(conn, tx, csv_import_ids, consumed):
+#: Largest timezone offset between two exports of the same statement we
+#: accept as a re-rendering of the same transaction (UTC-12 … UTC+14).
+_MAX_EXPORT_OFFSET = timedelta(hours=14)
+
+
+def _parse_started_at(value):
+    try:
+        return datetime.strptime(value or "", "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _is_timezone_offset(delta):
+    """True when `delta` looks like a timezone re-rendering of one instant.
+
+    Real offsets are whole multiples of 15 minutes (most zones are whole
+    hours, a few :30 / :45) and never exceed ±14h. Two *different*
+    transactions with the same payee and amount on adjacent days would
+    have to coincide to the second to pass this.
+    """
+    if not delta or abs(delta) > _MAX_EXPORT_OFFSET:
+        return False
+    return int(delta.total_seconds()) % 900 == 0
+
+
+def _observed_export_offsets(existing, transactions):
+    """Timezone offsets between this export and the local DB, learned from
+    rows that match by import_id (same date in both renderings).
+
+    The phone renders "Started Date" in its local timezone at export time.
+    An export made in Las Vegas and one made back in Zürich differ by 9h
+    on *every* row; rows that didn't cross midnight still match by
+    import_id and reveal that offset, which we then require for the rows
+    that did cross midnight. Returns a set of timedelta (never 0).
+    """
+    offsets = set()
+    for tx in transactions:
+        old = existing.get(tx["import_id"])
+        if not old:
+            continue
+        new_dt = _parse_started_at(tx.get("_started_at"))
+        old_dt = _parse_started_at(old.get("started_at"))
+        if new_dt and old_dt and new_dt != old_dt:
+            delta = new_dt - old_dt
+            if _is_timezone_offset(delta):
+                offsets.add(delta)
+    return offsets
+
+
+def _find_date_shifted_original(conn, tx, csv_import_ids, consumed, offsets=frozenset()):
     """Find a local row that is this CSV row under a shifted date.
 
-    Revolut occasionally re-renders a row's Started Date between exports
-    (timezone change near midnight), which changes our amount+date-based
-    import_id and would create a YNAB duplicate. A row qualifies as the
-    same transaction when ALL of:
-      - the CSV row started within 3h of midnight (only those can shift),
-      - a local Revolut-sourced row exists exactly ±1 day away with the
-        same amount AND same payee, still linked to a YNAB transaction,
-      - that local row's import_id is absent from the current CSV
-        (its old date no longer exists in the export).
+    Revolut renders "Started Date" in the phone's local timezone at
+    export time, so a transaction exported from Las Vegas and again from
+    Zürich carries timestamps 9h apart — and a different calendar date
+    when the shift crosses midnight. That changes our amount+date-based
+    import_id and would create a YNAB duplicate.
+
+    A local row qualifies as the same transaction when ALL of:
+      - it is a Revolut-sourced row exactly ±1 day away with the same
+        amount AND same payee, still linked to a YNAB transaction,
+      - its import_id is absent from the current CSV (its old date no
+        longer exists in the export),
+      - the timestamps agree on the shift. When the local row stores
+        `started_at`, the difference must be a timezone-shaped offset
+        (see _is_timezone_offset) and, if this export revealed offsets
+        via rows matched by import_id, one of those exactly. Rows
+        written before `started_at` existed fall back to the old
+        heuristic: the CSV row started within 3h of midnight.
     Returns the local row dict or None.
     """
     started = tx.get("_started_time") or ""
@@ -937,8 +1006,8 @@ def _find_date_shifted_original(conn, tx, csv_import_ids, consumed):
         hour = int(started[:2])
     except ValueError:
         return None
-    if 3 <= hour < 21:
-        return None
+    near_midnight = hour < 3 or hour >= 21
+    new_dt = _parse_started_at(tx.get("_started_at"))
 
     try:
         day = datetime.strptime(tx["date"], "%Y-%m-%d")
@@ -947,17 +1016,25 @@ def _find_date_shifted_original(conn, tx, csv_import_ids, consumed):
 
     for delta in (-1, 1):
         neighbor = (day + timedelta(days=delta)).strftime("%Y-%m-%d")
-        row = conn.execute(
-            "SELECT import_id, amount, cleared, ynab_tx_id FROM transactions "
+        rows = conn.execute(
+            "SELECT import_id, amount, cleared, ynab_tx_id, started_at "
+            "FROM transactions "
             "WHERE amount = ? AND payee_name = ? AND date = ? "
             "AND source = 'revolut' AND deleted = 0 AND ynab_tx_id IS NOT NULL",
             (tx["amount"], tx["payee_name"], neighbor),
-        ).fetchone()
-        if (
-            row
-            and row["import_id"] not in csv_import_ids
-            and row["import_id"] not in consumed
-        ):
+        ).fetchall()
+        for row in rows:
+            if row["import_id"] in csv_import_ids or row["import_id"] in consumed:
+                continue
+            old_dt = _parse_started_at(row["started_at"])
+            if old_dt and new_dt:
+                shift = new_dt - old_dt
+                if not _is_timezone_offset(shift):
+                    continue
+                if offsets and shift not in offsets:
+                    continue
+            elif not near_midnight:
+                continue
             return dict(row)
     return None
 
@@ -976,6 +1053,12 @@ def diff_transactions(conn, transactions):
     existing = db_get_existing(conn, import_ids)
     csv_import_ids = set(import_ids)
     shift_consumed = set()
+    export_offsets = _observed_export_offsets(existing, transactions)
+    if export_offsets:
+        log.info(
+            "import: export timestamps offset from local DB by %s",
+            ", ".join(f"{d.total_seconds()/3600:+g}h" for d in sorted(export_offsets)),
+        )
 
     to_create = []
     to_update = []
@@ -993,7 +1076,7 @@ def diff_transactions(conn, transactions):
                 skipped += 1
                 continue
             shifted = _find_date_shifted_original(
-                conn, tx, csv_import_ids, shift_consumed,
+                conn, tx, csv_import_ids, shift_consumed, export_offsets,
             )
             if shifted:
                 # Same transaction, re-dated by Revolut between exports:
@@ -1282,6 +1365,18 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
     """
     Diff transactions against the local DB, then create/update only what's needed.
     """
+    for tx in transactions:
+        tx.setdefault("account_id", account_id)
+    # Rows imported before account_id was recorded on CSV rows: claim them
+    # for this account so per-account views in the web UI see them. No-op
+    # once backfilled.
+    conn.execute(
+        "UPDATE transactions SET account_id = ? "
+        "WHERE source = 'revolut' AND (account_id IS NULL OR account_id = '')",
+        (account_id,),
+    )
+    conn.commit()
+
     to_create, to_update, to_delete, skipped = diff_transactions(conn, transactions)
 
     log.info(

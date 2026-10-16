@@ -1,0 +1,6 @@
+# Runtime dependencies. Compile with:
+#   uv pip compile --generate-hashes --python-version 3.12 --universal requirements.in -o requirements.txt
+fastapi
+uvicorn
+jinja2
+pycryptodome

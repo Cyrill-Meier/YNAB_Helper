@@ -1,0 +1,32 @@
+[project]
+name = "ynab-helper"
+version = "2.0.0"
+description = "Revolut → YNAB importer with a Telegram bot, web dashboard, crypto and IBKR sync"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Private" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["tests/legacy", ".cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+  "E501",    # formatter handles line length; long strings are fine
+  "RUF001",  # ambiguous unicode in strings (we use emoji / arrows in messages)
+  "RUF002",
+  "RUF003",
+  "SIM105",  # contextlib.suppress is not always clearer
+  "B008",    # FastAPI Depends() in defaults
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ynab_helper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+markers = ["slow: slower tests (crypto vectors, convergence sweeps)"]

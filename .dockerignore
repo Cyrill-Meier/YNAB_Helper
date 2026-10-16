@@ -1,14 +1,22 @@
-.git
-.gitignore
-.env
-*.env
-!.env.example
-bot_data/
-__pycache__/
-*.pyc
-*.db
-*.log
-*.csv
-.DS_Store
-.vscode/
-.idea/
+# Allowlist: the build context contains only what the image needs. Anything
+# new in the repository (tests, docs, local .env files, bot_data, CSV
+# statements, databases) stays out unless it is added here on purpose.
+*
+!requirements.txt
+!ynab_helper/**
+!revolut_to_ynab.py
+!revolut_ynab_bot.py
+
+# Re-exclude build and editor debris, and anything that could hold secrets or
+# financial data, even if it ends up inside the package directory by accident.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.DS_Store
+**/.env
+**/*.env
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/*.csv
+**/*.log

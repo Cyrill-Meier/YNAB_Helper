@@ -1,0 +1,87 @@
+# Weekly dependency updates, one grouped pull request per ecosystem. Every
+# update has to pass CI (tests, pip-audit, image self-check) before it can be
+# merged, and merging to main deploys it.
+#
+# The cooldown delays version updates until a release is a few days old, so
+# a compromised or broken release is usually yanked before it is proposed.
+# Security updates are not delayed.
+version: 2
+updates:
+  # Python dependencies. requirements.txt / requirements-dev.txt are lock
+  # files compiled from the *.in files by `uv pip compile --generate-hashes
+  # --universal --python-version 3.12` (see their headers). The `uv`
+  # ecosystem re-runs that command, so transitive pins and hashes stay
+  # consistent; the `pip` ecosystem only recognises pip-compile headers and
+  # would edit single pins in place.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zurich
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        applies-to: version-updates
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # Base image digest in the Dockerfile. The Python minor version is changed
+  # deliberately (the lock files are compiled for 3.12), so only digest
+  # refreshes of python:3.12-slim-bookworm are proposed.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zurich
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    groups:
+      docker:
+        applies-to: version-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Caddy / Watchtower tags in the reference docker-compose.yml.
+  - package-ecosystem: docker-compose
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zurich
+    cooldown:
+      default-days: 7
+    groups:
+      compose:
+        applies-to: version-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  # Action SHAs in .github/workflows (the version comments are updated too).
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Zurich
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"

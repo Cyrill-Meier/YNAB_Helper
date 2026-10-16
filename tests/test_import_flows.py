@@ -13,22 +13,64 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import revolut_to_ynab as ynab
 import revolut_ynab_bot as bot
 
-calls = []
+calls = []        # mutating requests only: (method, path, body)
+gets = []         # GET paths
+ynab_state = {}   # stateful fake YNAB: ynab_tx_id -> transaction dict
+
+
+class YnabNotFound(RuntimeError):
+    pass
 
 
 def fake_ynab_request(method, path, token, body=None):
+    if method == "GET":
+        gets.append(path)
+        if path.startswith("/budgets/b/accounts/a/transactions") or path.startswith(
+            "/budgets/b/transactions"
+        ):
+            return {"data": {"transactions": [dict(t) for t in ynab_state.values()],
+                             "server_knowledge": 1}}
+        return {"data": {}}
     calls.append((method, path, body))
     if method == "POST":
         txs = body["transactions"]
+        created, dups = [], []
+        existing_iids = {t.get("import_id") for t in ynab_state.values()}
+        for t in txs:
+            if t["import_id"] in existing_iids:
+                dups.append(t["import_id"])
+                continue
+            tid = f"created-{t['import_id']}"
+            ynab_state[tid] = {**t, "id": tid, "deleted": False}
+            created.append(ynab_state[tid])
         return {"data": {
-            "transaction_ids": ["x"] * len(txs),
-            "transactions": [
-                {"import_id": t["import_id"], "id": f"created-{t['import_id']}"}
-                for t in txs
-            ],
-            "duplicate_import_ids": [],
+            "transaction_ids": [t["id"] for t in created],
+            "transactions": [dict(t) for t in created],
+            "duplicate_import_ids": dups,
         }}
-    return {"data": {}}
+    tx_id = path.rsplit("/", 1)[1]
+    cur = ynab_state.get(tx_id)
+    if cur is None or cur.get("deleted"):
+        raise RuntimeError(f"YNAB API 404: transaction {tx_id} not found")
+    if method == "PATCH":
+        cur.update(body["transaction"])
+        return {"data": {"transaction": dict(cur)}}
+    if method == "DELETE":
+        cur["deleted"] = True
+        return {"data": {"transaction": dict(cur)}}
+    raise AssertionError(f"unexpected {method} {path}")
+
+
+def seed(conn, tx, ynab_tx_id, **ynab_overrides):
+    """Record tx locally (linked to ynab_tx_id) and as it would sit in YNAB."""
+    ynab.db_upsert(conn, tx, ynab_tx_id=ynab_tx_id)
+    conn.commit()
+    ynab_state[ynab_tx_id] = {
+        "id": ynab_tx_id, "account_id": "a", "date": tx["date"], "amount": tx["amount"],
+        "payee_name": tx["payee_name"], "import_id": tx["import_id"],
+        "cleared": tx["cleared"], "memo": "(pending)" if tx["_state"] == "PENDING" else None,
+        "deleted": False, **ynab_overrides,
+    }
 
 
 ynab.ynab_request = fake_ynab_request
@@ -45,7 +87,8 @@ def mk(date, amount, payee, state="COMPLETED", t="12:00:00", occ=1):
 
 
 def fresh_db(tmpdir, name):
-    return ynab.init_db(os.path.join(tmpdir, name))
+    ynab_state.clear()
+    return ynab.init_db(os.path.join(str(tmpdir), name))
 
 
 def run_import(conn, txs):
@@ -63,7 +106,7 @@ def run_import(conn, txs):
 def test_reverted(tmpdir):
     conn = fresh_db(tmpdir, "reverted.db")
     # previously imported pending, now reported REVERTED -> delete in YNAB
-    ynab.db_upsert(conn, mk("2026-08-09", -5000, "Shop", "PENDING"), ynab_tx_id="y1")
+    seed(conn, mk("2026-08-09", -5000, "Shop", "PENDING"), "y1")
     conn.commit()
     run_import(conn, [
         mk("2026-08-09", -5000, "Shop", "REVERTED"),
@@ -85,7 +128,7 @@ def test_reverted(tmpdir):
 
 def test_date_shift(tmpdir):
     conn = fresh_db(tmpdir, "dateshift.db")
-    ynab.db_upsert(conn, mk("2026-08-04", 2000000, "Top-up", t="02:32:04"), ynab_tx_id="y-dep")
+    seed(conn, mk("2026-08-04", 2000000, "Top-up", t="02:32:04"), "y-dep")
     conn.commit()
     out = run_import(conn, [mk("2026-08-03", 2000000, "Top-up", t="22:32:04")])
     assert not [c for c in calls if c[0] == "POST"]
@@ -96,7 +139,7 @@ def test_date_shift(tmpdir):
     rows = conn.execute("SELECT import_id FROM transactions WHERE amount=2000000").fetchall()
     assert [r[0] for r in rows] == ["YNAB:2000000:2026-08-03:1"]
     # guards: midday twin and unlinked rows still create
-    ynab.db_upsert(conn, mk("2026-08-06", -2500, "Cafe Noon"), ynab_tx_id="y-noon")
+    seed(conn, mk("2026-08-06", -2500, "Cafe Noon"), "y-noon")
     conn.commit()
     run_import(conn, [mk("2026-08-07", -2500, "Cafe Noon")])
     assert [c[0] for c in calls] == ["POST"]
@@ -108,9 +151,9 @@ def test_timezone_shift(tmpdir):
     """Export made in Las Vegas (UTC-7), re-exported from Zürich (UTC+2):
     every timestamp moves +9h, evening rows land on the next day."""
     conn = fresh_db(tmpdir, "tzshift.db")
-    ynab.db_upsert(conn, mk("2026-08-22", -20000, "Lunch", t="12:15:10"), ynab_tx_id="y-lunch")
-    ynab.db_upsert(conn, mk("2026-08-22", -30000, "Dinner", t="19:30:05"), ynab_tx_id="y-dinner")
-    ynab.db_upsert(conn, mk("2026-08-22", -180, "Toll", t="22:10:00"), ynab_tx_id="y-toll")
+    seed(conn, mk("2026-08-22", -20000, "Lunch", t="12:15:10"), "y-lunch")
+    seed(conn, mk("2026-08-22", -30000, "Dinner", t="19:30:05"), "y-dinner")
+    seed(conn, mk("2026-08-22", -180, "Toll", t="22:10:00"), "y-toll")
     conn.commit()
     out = run_import(conn, [
         mk("2026-08-22", -20000, "Lunch", t="21:15:10"),          # same day, reveals +9h
@@ -142,13 +185,13 @@ def test_timezone_shift(tmpdir):
     assert calls == [], calls
     # Guard: a same-payee/amount neighbour whose time difference isn't a
     # timezone offset (here 3h17m) is a different transaction — create.
-    ynab.db_upsert(conn, mk("2026-08-25", -4500, "Cafe", t="23:10:00"), ynab_tx_id="y-cafe")
+    seed(conn, mk("2026-08-25", -4500, "Cafe", t="23:10:00"), "y-cafe")
     conn.commit()
     run_import(conn, [mk("2026-08-26", -4500, "Cafe", t="02:27:00")])
     assert [c[0] for c in calls] == ["POST"], calls
     # Legacy rows without started_at still use the near-midnight heuristic
-    ynab.db_upsert(conn, mk("2026-08-27", -7000, "Bar", t="23:40:00"), ynab_tx_id="y-bar")
-    ynab.db_upsert(conn, mk("2026-08-27", -8000, "Shop", t="14:00:00"), ynab_tx_id="y-shop")
+    seed(conn, mk("2026-08-27", -7000, "Bar", t="23:40:00"), "y-bar")
+    seed(conn, mk("2026-08-27", -8000, "Shop", t="14:00:00"), "y-shop")
     conn.execute("UPDATE transactions SET started_at = NULL WHERE payee_name IN ('Bar', 'Shop')")
     conn.commit()
     run_import(conn, [
@@ -163,10 +206,10 @@ def test_timezone_shift(tmpdir):
 def test_superseded_pending(tmpdir):
     conn = fresh_db(tmpdir, "superseded.db")
     # combined dinner+tip auth, later settled as two separate rows
-    ynab.db_upsert(conn, mk("2026-08-18", -57480, "Tanta", "PENDING"), ynab_tx_id="y-tanta")
+    seed(conn, mk("2026-08-18", -57480, "Tanta", "PENDING"), "y-tanta")
     # old pending outside CSV window and pending still present in CSV: untouched
-    ynab.db_upsert(conn, mk("2026-07-01", -99000, "Old Hold", "PENDING"), ynab_tx_id="y-old")
-    ynab.db_upsert(conn, mk("2026-08-19", -11000, "Hotel Hold", "PENDING"), ynab_tx_id="y-hotel")
+    seed(conn, mk("2026-07-01", -99000, "Old Hold", "PENDING"), "y-old")
+    seed(conn, mk("2026-08-19", -11000, "Hotel Hold", "PENDING"), "y-hotel")
     conn.commit()
     csv_txs = [
         mk("2026-08-18", -51060, "Tanta", t="10:59:18"),
@@ -195,11 +238,10 @@ def test_superseded_pending(tmpdir):
 
 def test_change_reporting(tmpdir):
     conn = fresh_db(tmpdir, "changes.db")
-    seed = mk("2026-08-09", -45000, "EV Charge", "PENDING")
-    seed["import_id"] = "YNAB:X:fixed:1"
-    ynab.db_upsert(conn, seed, ynab_tx_id="y-ev")
-    ynab.db_upsert(conn, mk("2026-08-10", -9990, "Cafe", "PENDING"), ynab_tx_id="y-cafe")
-    conn.commit()
+    ev = mk("2026-08-09", -45000, "EV Charge", "PENDING")
+    ev["import_id"] = "YNAB:X:fixed:1"
+    seed(conn, ev, "y-ev")
+    seed(conn, mk("2026-08-10", -9990, "Cafe", "PENDING"), "y-cafe")
     changed = mk("2026-08-09", -41200, "EV Charge")
     changed["import_id"] = "YNAB:X:fixed:1"
     out = run_import(conn, [changed, mk("2026-08-10", -9990, "Cafe")])
@@ -211,6 +253,125 @@ def test_change_reporting(tmpdir):
     print("ok: amount changes reported, plain clearing silent")
 
 
+def test_reconciled_never_downgraded(tmpdir):
+    """The web UI's sync stores 'reconciled' locally; a later CSV import must
+    not PATCH those rows back to 'cleared' or wipe the memo the user wrote."""
+    conn = fresh_db(tmpdir, "reconciled.db")
+    tx = mk("2026-09-01", -42000, "Dinner")
+    seed(conn, tx, "y-dinner", cleared="reconciled", memo="dinner w/ Anna")
+    # what sync_budget_transactions leaves behind locally
+    conn.execute("UPDATE transactions SET cleared='reconciled', memo='dinner w/ Anna'")
+    conn.commit()
+    run_import(conn, [mk("2026-09-01", -42000, "Dinner")])
+    assert calls == [], calls
+    assert ynab_state["y-dinner"]["cleared"] == "reconciled"
+    assert ynab_state["y-dinner"]["memo"] == "dinner w/ Anna"
+    # An older export that still shows the row as PENDING never downgrades it
+    run_import(conn, [mk("2026-09-01", -42000, "Dinner", "PENDING")])
+    assert calls == [], calls
+    conn.close()
+    print("ok: reconciled rows never downgraded, memos kept")
+
+
+def test_clearing_keeps_user_memo(tmpdir):
+    conn = fresh_db(tmpdir, "memo.db")
+    seed(conn, mk("2026-09-02", -51060, "Tanta", "PENDING"), "y-tanta",
+         memo="(pending) | split with Bob")
+    seed(conn, mk("2026-09-02", -1200, "Kiosk", "PENDING"), "y-kiosk",
+         memo="newspaper")
+    run_import(conn, [mk("2026-09-02", -51060, "Tanta"), mk("2026-09-02", -1200, "Kiosk")])
+    bodies = {c[1].rsplit("/", 1)[1]: c[2]["transaction"] for c in calls if c[0] == "PATCH"}
+    assert bodies["y-tanta"] == {"cleared": "cleared", "memo": "split with Bob"}, bodies
+    assert bodies["y-kiosk"] == {"cleared": "cleared"}, bodies   # memo untouched
+    assert ynab_state["y-kiosk"]["memo"] == "newspaper"
+    # A user who already cleared it by hand gets no PATCH at all
+    seed(conn, mk("2026-09-03", -800, "Cafe", "PENDING"), "y-cafe", cleared="cleared",
+         memo="coffee")
+    run_import(conn, [mk("2026-09-03", -800, "Cafe")])
+    assert calls == [], calls
+    conn.close()
+    print("ok: clearing a pending keeps the user's memo")
+
+
+def test_rekey_then_sync_keeps_live_transaction(tmpdir):
+    """Re-key (timezone shift) + the web UI's sync must not leave a ghost row
+    that the superseded sweep then deletes from YNAB."""
+    conn = fresh_db(tmpdir, "ghost.db")
+    seed(conn, mk("2026-08-09", -880000, "Hotel Bellagio", "PENDING", t="23:30:00"), "y1")
+    run_import(conn, [mk("2026-08-10", -880000, "Hotel Bellagio", "PENDING", t="08:30:00")])
+    assert [c[0] for c in calls] == ["PATCH"], calls   # re-dated, no duplicate
+    # YNAB keeps the original import_id; the web UI's syncs run (both of them)
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        ynab.sync_budget_transactions(conn, "t", "b", primary_account_id="a")
+        ynab.sync_from_ynab(conn, "t", "b", "a")
+    finally:
+        sys.stdout = old
+    live = conn.execute(
+        "SELECT import_id FROM transactions WHERE ynab_tx_id='y1' AND deleted=0"
+    ).fetchall()
+    assert [r[0] for r in live] == ["YNAB:-880000:2026-08-10:1"], live
+    # Even a DB that already contains a ghost row never deletes the live one
+    ghost = mk("2026-08-09", -880000, "Hotel Bellagio", "PENDING", t="23:30:00")
+    ynab.db_upsert(conn, ghost, ynab_tx_id="y1")
+    conn.commit()
+    run_import(conn, [mk("2026-08-10", -880000, "Hotel Bellagio", "PENDING", t="08:30:00")])
+    assert not [c for c in calls if c[0] == "DELETE"], calls
+    assert not ynab_state["y1"]["deleted"]
+    conn.close()
+    print("ok: re-key + sync never deletes the live transaction")
+
+
+def test_deleted_in_ynab_does_not_wedge(tmpdir):
+    conn = fresh_db(tmpdir, "wedge.db")
+    seed(conn, mk("2026-09-05", -1500, "Coffee", "PENDING"), "y-gone")
+    seed(conn, mk("2026-09-05", -9000, "Shop", "PENDING"), "y-shop")
+    del ynab_state["y-gone"]   # the user deleted it in YNAB
+    out = run_import(conn, [
+        mk("2026-09-05", -1500, "Coffee"),             # now completed
+        mk("2026-09-05", -9000, "Shop", "REVERTED"),   # must still be removed
+    ])
+    assert [c for c in calls if c[0] == "PATCH"] == [], calls
+    assert [p for m, p, _ in calls if m == "DELETE"] == ["/budgets/b/transactions/y-shop"]
+    assert "no longer in YNAB" in out
+    conn.close()
+    print("ok: a transaction deleted in YNAB no longer aborts the import")
+
+
+def test_superseded_but_cleared_in_ynab_is_kept(tmpdir):
+    conn = fresh_db(tmpdir, "keep.db")
+    seed(conn, mk("2026-09-06", -57480, "Tanta", "PENDING"), "y-tanta", cleared="cleared")
+    out = run_import(conn, [mk("2026-09-06", -51060, "Tanta", t="10:00:00")])
+    assert not [c for c in calls if c[0] == "DELETE"], calls
+    assert "cleared in YNAB: left alone" in out
+    conn.close()
+    print("ok: pendings the user cleared in YNAB are never deleted as superseded")
+
+
+def test_cleanup_pending_never_unreconciles(tmpdir):
+    ynab_state.clear()
+    calls.clear()
+    ynab_state.update({
+        "r": {"id": "r", "account_id": "a", "date": "2026-09-01", "amount": -1000,
+              "import_id": "YNAB:-1000:2026-09-01:1", "cleared": "reconciled",
+              "memo": "(pending) | taxi", "deleted": False},
+        "u": {"id": "u", "account_id": "a", "date": "2026-09-02", "amount": -2000,
+              "import_id": "YNAB:-2000:2026-09-02:1", "cleared": "uncleared",
+              "memo": "(pending)", "deleted": False},
+    })
+    buf, old = io.StringIO(), sys.stdout
+    sys.stdout = buf
+    try:
+        ynab.cleanup_pending_memos("t", "b", "a")
+    finally:
+        sys.stdout = old
+    bodies = {c[1].rsplit("/", 1)[1]: c[2]["transaction"] for c in calls if c[0] == "PATCH"}
+    assert bodies == {"r": {"memo": "taxi"}}, bodies   # never touches cleared / still-pending
+    assert ynab_state["r"]["cleared"] == "reconciled"
+    print("ok: /cleanup_pending never un-reconciles or strips real pendings")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         test_reverted(tmpdir)
@@ -218,6 +379,12 @@ def main():
         test_timezone_shift(tmpdir)
         test_superseded_pending(tmpdir)
         test_change_reporting(tmpdir)
+        test_reconciled_never_downgraded(tmpdir)
+        test_clearing_keeps_user_memo(tmpdir)
+        test_rekey_then_sync_keeps_live_transaction(tmpdir)
+        test_deleted_in_ynab_does_not_wedge(tmpdir)
+        test_superseded_but_cleared_in_ynab_is_kept(tmpdir)
+        test_cleanup_pending_never_unreconciles(tmpdir)
     print("ALL PASSED")
 
 

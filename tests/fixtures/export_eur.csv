@@ -1,0 +1,6 @@
+﻿Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Topup,Current,2026-07-01 08:00:00,2026-07-01 08:01:00,Exchanged from CHF,300.00,0.00,EUR,COMPLETED,300.00
+Card Payment,Current,2026-07-02 12:00:00,2026-07-03 04:00:00,Boulangerie Example,-4.20,0.00,EUR,COMPLETED,295.80
+Card Payment,Current,2026-07-03 19:30:00,2026-07-04 04:00:00,"Trattoria, Example
+Roma",-38.50,0.00,EUR,COMPLETED,257.30
+Card Payment,Current,2026-07-04 09:00:00,,Museo Example,-15.00,0.00,EUR,PENDING,

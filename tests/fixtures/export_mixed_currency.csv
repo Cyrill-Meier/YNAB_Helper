@@ -1,0 +1,4 @@
+Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Topup,Current,2026-10-01 08:00:00,2026-10-01 08:01:00,Top-Up by *4242,100.00,0.00,CHF,COMPLETED,110.00
+Card Payment,Current,2026-10-02 12:00:00,2026-10-03 04:00:00,Boulangerie Example,-4.20,0.00,EUR,COMPLETED,45.80
+Card Payment,Current,2026-10-02 13:00:00,2026-10-03 04:00:01,Coop Pronto,-7.10,0.00,CHF,COMPLETED,102.90

@@ -1,0 +1,6 @@
+Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Card Payment,Current,2026-10-05 08:05:00,2026-10-05 08:06:00,Starbucks Bern,-4.50,0.00,CHF,COMPLETED,195.50
+Card Payment,Current,2026-10-05 08:10:00,,SBB CFF FFS,-3.60,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-05 12:30:00,,Starbucks Bern,-4.50,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-05 16:45:00,2026-10-05 16:46:00,Starbucks Bern,-4.50,0.00,CHF,COMPLETED,191.00
+Card Payment,Current,2026-10-05 17:40:00,2026-10-05 17:41:00,SBB CFF FFS,-3.60,0.00,CHF,COMPLETED,187.40

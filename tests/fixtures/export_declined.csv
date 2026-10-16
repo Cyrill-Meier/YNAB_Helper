@@ -1,0 +1,8 @@
+Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Topup,Current,2026-10-01 08:00:00,2026-10-01 08:01:00,Top-Up by *4242,300.00,0.00,CHF,COMPLETED,400.00
+Card Payment,Current,2026-10-02 10:00:00,,Amazon EU,-250.00,0.00,CHF,DECLINED,
+Card Payment,Current,2026-10-02 10:05:00,2026-10-03 04:00:00,Amazon EU,-250.00,0.00,CHF,COMPLETED,150.00
+Card Payment,Current,2026-10-03 11:00:00,,Galaxus,-80.00,0.00,CHF,FAILED,
+Card Payment,Current,2026-10-03 11:02:00,,Galaxus,-80.00,0.00,CHF,PENDING,
+Transfer,Current,2026-10-04 09:00:00,,To Anna Example,-20.00,0.00,CHF,REVERTED,
+Transfer,Current,2026-10-04 09:05:00,2026-10-04 09:05:01,To Anna Example,-20.00,0.00,CHF,COMPLETED,130.00

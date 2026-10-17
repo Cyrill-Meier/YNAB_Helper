@@ -187,11 +187,6 @@ class Request:
     def text(self) -> str:
         return (self.incoming.text or "").strip()
 
-    def refresh_user(self) -> User | None:
-        """Re-read the sender's row (after a write)."""
-        self.user = self.bot.users.get(self.user_id)
-        return self.user
-
     # ── replies (never raise) ──
 
     def reply(self, text: str, markup: Mapping[str, Any] | None = None) -> dict[str, Any] | None:

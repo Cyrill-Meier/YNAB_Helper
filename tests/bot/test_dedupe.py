@@ -313,3 +313,32 @@ def test_F20_buttons_on_a_message_that_is_not_the_picker_expire(
     other = tg.last(USER).message_id
     press(bot, tg, USER, f"dx:{nonce}:all", message_id=other)  # forged onto another message
     assert tg.answers[-1]["text"].startswith("This list has expired")
+
+
+@pytest.mark.usefixtures("imported")
+def test_bot_R10_dedupe_nothing_found(bot: Bot, tg: FakeTelegram, ynab: FakeYnab):
+    """The most common outcome of /dedupe (a clean statement), and an older picker's
+    buttons expiring once a scan finds nothing."""
+    strays = add_strays(ynab, 1)
+    say(bot, tg, USER, "/dedupe")
+    old = picker(tg)
+    ynab.user_delete_transaction(strays[0])
+    say(bot, tg, USER, "/dedupe")
+    texts = tg.texts(USER)
+    assert texts[-2].startswith("🔎 Looking for stray imports")
+    lines = texts[-1].splitlines()
+    assert lines[0] == "📅 2026-10-01 → 2026-10-13 · statement.csv"
+    match = re.fullmatch(
+        r"📋 Statement rows: (\d+) · YNAB transactions in that period: (\d+)", lines[1]
+    )
+    assert match is not None
+    in_window = [
+        t
+        for t in ynab.transactions(BUDGET, account_id=ACCT)
+        if "2026-10-01" <= t["date"] <= "2026-10-13"
+    ]
+    assert int(match.group(1)) > 10 and int(match.group(2)) == len(in_window)
+    assert lines[2:] == ["", "✓ No stray imports found."]
+    assert tg.last(USER).reply_markup is None
+    press(bot, tg, USER, f"dx:{nonce_of(old)}:t:0", message_id=old.message_id)
+    assert tg.answers[-1]["text"] == "This list has expired — run /dedupe again."

@@ -288,29 +288,7 @@ class TelegramClient:
     def __repr__(self) -> str:
         return f"TelegramClient(api_base={self._base!r}, token=<redacted>)"
 
-    @property
-    def api_base(self) -> str:
-        return self._base
-
     # ── generic call ──
-
-    def call(
-        self,
-        method: str,
-        params: Mapping[str, Any] | None = None,
-        *,
-        timeout: float | None = None,
-        total_timeout: float | None = None,
-        wait_on_rate_limit: bool = True,
-    ) -> Any:
-        """Call ``method`` with a JSON body and return its ``result`` (see the module doc)."""
-        return self._call(
-            method,
-            json_body=dict(params or {}),
-            timeout=timeout,
-            total_timeout=total_timeout,
-            wait_on_rate_limit=wait_on_rate_limit,
-        )
 
     def _call(
         self,

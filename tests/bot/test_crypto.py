@@ -221,3 +221,104 @@ def test_no_tracking_account(bot: Bot, tg: FakeTelegram, users: UsersRepo, ynab)
     say(bot, tg, USER, "/crypto_setup")
     assert "No open tracking accounts" in tg.texts(USER)[-1]
     assert users.get(USER).state == "ready"
+
+
+# ── wallet messages never stay in the chat (R04) ─────────────────────────────
+
+# Public test vectors, not real secrets: BIP32 test vector 1's master private key and the
+# Bitcoin wiki's example WIF.
+XPRV = (
+    "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNN"
+    "U3TGtRBeJgk33yuGBxrMPHi"
+)
+WIF = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ"
+
+
+def send_text(bot: Bot, tg: FakeTelegram, text: str) -> int:
+    """Deliver a text message from USER; returns its message id."""
+    tg.message(USER, text)
+    updates = tg.take_updates()
+    for update in updates:
+        bot.handle_update(update)
+    return updates[-1]["message"]["message_id"]
+
+
+def at_btc_step(bot: Bot, tg: FakeTelegram, users: UsersRepo) -> str:
+    nonce = start_setup(bot, tg)
+    press(bot, tg, USER, f"cs:{nonce}:a:0")
+    assert users.get(USER).state == "awaiting_crypto_btc"
+    return nonce
+
+
+def test_bot_R04_wallet_messages_are_deleted(bot: Bot, tg: FakeTelegram, users: UsersRepo):
+    ready_user(users)
+    at_btc_step(bot, tg, users)
+    typo = send_text(bot, tg, XPUB[:-1] + ("9" if XPUB[-1] != "9" else "8"))
+    assert (USER, typo) in tg.deleted  # refused, but deleted all the same
+    xpub = send_text(bot, tg, XPUB)
+    assert (USER, xpub) in tg.deleted
+    assert users.get(USER).state == "awaiting_crypto_eth"
+    assert "delete it yourself" not in tg.texts(USER)[-1]
+    eth = send_text(bot, tg, ETH_ADDRESS)
+    assert (USER, eth) in tg.deleted
+    user = users.get(USER)
+    assert user.state == "ready" and (user.btc_xpub, user.eth_address) == (XPUB, ETH_ADDRESS)
+    assert tg.deleted == [(USER, typo), (USER, xpub), (USER, eth)]
+
+
+def test_bot_R04_control_words_stay(bot: Bot, tg: FakeTelegram, users: UsersRepo):
+    ready_user(users)
+    at_btc_step(bot, tg, users)
+    send_text(bot, tg, "skip")
+    assert users.get(USER).state == "awaiting_crypto_eth"
+    send_text(bot, tg, "Skip")
+    assert users.get(USER).state == "ready"
+    assert tg.calls_of("deleteMessage") == []
+
+
+@pytest.mark.parametrize("secret", [XPRV, WIF], ids=["xprv", "wif"])
+def test_bot_R04_private_key_is_deleted_and_flagged(
+    bot: Bot, tg: FakeTelegram, users: UsersRepo, secret: str
+):
+    ready_user(users)
+    at_btc_step(bot, tg, users)
+    message_id = send_text(bot, tg, secret)
+    assert tg.deleted == [(USER, message_id)]
+    reply = tg.texts(USER)[-1]
+    assert "PRIVATE key" in reply and "I deleted your message from this chat" in reply
+    assert users.get(USER).state == "awaiting_crypto_btc"
+    assert users.get(USER).temp_data is not None and secret not in str(users.get(USER).temp_data)
+    assert secret not in tg.all_text()
+
+
+def test_bot_R04_undeletable_private_key_warns_urgently(
+    bot: Bot, tg: FakeTelegram, users: UsersRepo
+):
+    ready_user(users)
+    at_btc_step(bot, tg, users)
+    tg.fail_next("deleteMessage", 400, "Bad Request: message can't be deleted")
+    send_text(bot, tg, XPRV)
+    reply = tg.texts(USER)[-1]
+    assert "PRIVATE key" in reply
+    assert "delete it from this chat yourself, now" in reply
+    assert "move the funds to a new wallet" in reply
+    assert tg.deleted == []
+
+
+def test_bot_R04_undeletable_xpub_or_address_asks_the_user(
+    bot: Bot, tg: FakeTelegram, users: UsersRepo
+):
+    ready_user(users)
+    at_btc_step(bot, tg, users)
+    tg.fail_next("deleteMessage", 400, "Bad Request: message can't be deleted")
+    send_text(bot, tg, XPUB)
+    prompt = tg.texts(USER)[-1]
+    assert prompt.startswith("✅ BTC:") and "please delete it yourself" in prompt
+    tg.fail_next("deleteMessage", 400, "Bad Request: message can't be deleted")
+    send_text(bot, tg, "0x1234")
+    assert "please delete it yourself" in tg.texts(USER)[-1]
+    tg.fail_next("deleteMessage", 400, "Bad Request: message can't be deleted")
+    send_text(bot, tg, ETH_ADDRESS)
+    done = tg.texts(USER)[-1]
+    assert "Crypto setup complete" in done and "please delete it yourself" in done
+    assert users.get(USER).state == "ready"

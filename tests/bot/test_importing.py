@@ -155,3 +155,135 @@ def test_auth_error_points_to_setup(bot: Bot, tg: FakeTelegram, ynab: FakeYnab):
     ynab.fail_next("GET", r"/budgets/[^/]+/settings", 401)
     send_csv(bot, tg, BASIC)
     assert "/setup" in tg.texts(USER)[-1]
+
+
+# ── a web page view's background sync is waited out, not answered busy (R14) ──
+
+
+@pytest.mark.usefixtures("user")
+def test_bot_R14_csv_waits_for_the_web_background_sync(
+    bot: Bot, tg: FakeTelegram, ynab: FakeYnab, users: UsersRepo, data_dir: Path
+):
+    """The failure scenario: a dashboard load starts a background sync (YNAB answers it
+    slowly) and the statement arrives meanwhile — it is imported once the sync is done."""
+    import threading
+
+    from ynab_helper import services
+    from ynab_helper.services import UserContext
+    from ynab_helper.web.background import BackgroundSyncer
+
+    ctx = UserContext.from_user_row(users.get(USER), data_dir)
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(*args):
+        entered.set()
+        release.wait(5)
+        return ynab.transport(*args)
+
+    def background_sync(c: UserContext) -> None:
+        client = ynab.client(token=c.ynab_token, max_retries=0, transport=slow)
+        services.sync(c, force=False, client=client)
+
+    syncer = BackgroundSyncer(background_sync)
+    assert syncer.trigger(ctx)  # what every GET /api/... does
+    assert entered.wait(5)
+    assert LOCKS.current(str(USER)) == "sync"
+    timer = threading.Timer(0.2, release.set)
+    timer.start()
+    try:
+        send_csv(bot, tg, BASIC)
+    finally:
+        release.set()
+        timer.cancel()
+        assert syncer.wait_idle(ctx.key, 5)
+    texts = tg.texts(USER)
+    assert render.BUSY_TEXT not in texts
+    assert texts[0].startswith("📥 Importing") and texts[1].startswith("✅ Import complete")
+    assert len(ynab.transactions(BUDGET, account_id=ACCT)) > 10
+
+
+@pytest.mark.usefixtures("user")
+def test_bot_R14_background_sync_outlasting_the_wait_is_busy(bot: Bot, tg: FakeTelegram):
+    bot.background_wait = 0.1
+    with LOCKS.operation(str(USER), "sync"):
+        send_csv(bot, tg, BASIC)
+    assert tg.texts(USER) == ["📥 Importing account-statement.csv…", render.BUSY_TEXT]
+    assert tg.calls_of("getFile") == []
+
+
+@pytest.mark.usefixtures("user")
+def test_bot_R14_sync_taking_the_lock_mid_job_is_retried(
+    bot: Bot, tg: FakeTelegram, ynab: FakeYnab, monkeypatch: pytest.MonkeyPatch
+):
+    """The sync may start between the wait and the service call (during the download):
+    the job waits for it and runs once more."""
+    from ynab_helper import services
+    from ynab_helper.errors import Busy
+
+    real = services.import_csv
+    calls: list[str] = []
+
+    def first_meets_a_sync(*args, **kwargs):
+        calls.append("import")
+        if len(calls) == 1:
+            raise Busy("sync")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(services, "import_csv", first_meets_a_sync)
+    send_csv(bot, tg, BASIC)
+    texts = tg.texts(USER)
+    assert calls == ["import", "import"]
+    assert render.BUSY_TEXT not in texts
+    assert texts[1].startswith("✅ Import complete")
+    assert len(tg.calls_of("getFile")) == 2  # the retry downloads the statement again
+
+
+@pytest.mark.usefixtures("user")
+@pytest.mark.parametrize(("holder", "attempts"), [("sync", 2), ("import", 1), ("web upload", 1)])
+def test_bot_R14_only_background_refreshes_are_retried(
+    bot: Bot, tg: FakeTelegram, monkeypatch: pytest.MonkeyPatch, holder: str, attempts: int
+):
+    from ynab_helper import services
+    from ynab_helper.errors import Busy
+
+    calls: list[str] = []
+
+    def always_busy(*args, **kwargs):
+        calls.append("import")
+        raise Busy(holder)
+
+    monkeypatch.setattr(services, "import_csv", always_busy)
+    send_csv(bot, tg, BASIC)
+    assert len(calls) == attempts
+    assert tg.texts(USER)[-1] == render.BUSY_TEXT
+
+
+def test_bot_R14_the_wait_happens_on_the_worker(
+    tg: FakeTelegram, users: UsersRepo, client, data_dir: Path
+):
+    """While a job waits for a background sync, the poll thread keeps answering."""
+    from tests.bot.conftest import ADMIN
+    from ynab_helper.bot.workers import WorkerPool
+
+    ready_user(users)
+    workers = WorkerPool(1)
+    bot = Bot(telegram=client, users=users, admin_id=ADMIN, data_dir=data_dir, workers=workers)
+    token = LOCKS.acquire(str(USER), "sync")
+    released = False
+    try:
+        tg.document(USER, "statement.csv", BASIC)
+        tg.message(USER, "/help")
+        deliver(bot, tg)  # returns although the import job is still waiting
+        assert "Revolut → YNAB Bot" in tg.texts(USER)[-1]
+        assert workers.busy(str(USER)) == "import"
+        assert bot.is_busy(USER) == "import"
+        LOCKS.release(token)
+        released = True
+        assert workers.wait_idle(5)
+    finally:
+        if not released:
+            LOCKS.release(token)
+        workers.shutdown(1)
+    texts = tg.texts(USER)
+    assert any(t.startswith("✅ Import complete") for t in texts)
+    assert render.BUSY_TEXT not in texts

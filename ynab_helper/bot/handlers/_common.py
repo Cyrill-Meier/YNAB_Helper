@@ -67,15 +67,9 @@ def expire_button(req: Request, text: str) -> None:
 
 
 def busy(req: Request) -> bool:
-    """True (and the user is told) if the user already has an operation running."""
-    from ynab_helper.bot import render
-    from ynab_helper.locks import LOCKS
-
-    key = str(req.user_id)
-    if LOCKS.current(key) or req.bot.workers.busy(key):
-        if req.incoming.kind == "callback":
-            req.answer(render.BUSY_TEXT, alert=True)
-        else:
-            req.reply(render.BUSY_TEXT)
-        return True
-    return False
+    """True (and the user is told) if the user already has an operation running — the
+    same check :meth:`Bot.start_job <ynab_helper.bot.app.Bot.start_job>` makes."""
+    if req.bot.is_busy(req.user_id) is None:
+        return False
+    req.bot.reply_busy(req)
+    return True

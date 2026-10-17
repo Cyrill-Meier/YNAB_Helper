@@ -7,6 +7,12 @@ address (EIP-55 aware check). Each step offers *Keep current* (when set), *Skip*
 *Cancel* buttons; typing ``keep``/``skip``/``cancel`` or sending ``/cancel`` works too.
 Nothing is saved until the last step, and then in one write.
 
+Whatever the user types in the BTC and ETH steps may be a wallet key — an xpub reveals the
+whole wallet history, and users paste private keys (xprv, WIF) there by mistake — so the
+message is deleted as soon as it arrives, before it is validated, like the YNAB token in
+the onboarding (F57, R04). If Telegram refuses the delete, the reply asks the user to
+delete it themselves, urgently when it held a private key.
+
 The flow never traps the user (F55): commands and documents get "finish or /cancel" from
 the gate instead of being swallowed, and a crypto setup left alone for
 :data:`CRYPTO_FLOW_TTL` seconds simply ends (the next message is handled normally).
@@ -50,6 +56,18 @@ _BTC_PROMPT: Final = (
     "• a single address: tracks just that address"
 )
 _ETH_PROMPT: Final = "Now send your <b>ETH address</b> (0x…)."
+
+#: Steps whose typed text may be a wallet key: it is deleted on arrival (R04).
+_WALLET_STATES: Final = frozenset({S.AWAITING_CRYPTO_BTC, S.AWAITING_CRYPTO_ETH})
+#: Typed words that steer the flow (they are not wallet data and stay in the chat).
+_CONTROL_WORDS: Final = frozenset({"cancel", "/cancel", "keep", "skip"})
+_NOT_DELETED: Final = "⚠ I could not delete your message — please delete it yourself."
+_PRIVATE_NOT_DELETED: Final = (
+    "⚠ I could not delete your message — delete it from this chat yourself, now. Anyone "
+    "who sees a private key can spend the funds it controls; if someone may have seen it, "
+    "move the funds to a new wallet."
+)
+_PRIVATE_DELETED: Final = "🗑 I deleted your message from this chat."
 
 
 # ── /crypto, /crypto_status ──────────────────────────────────────────────────
@@ -189,11 +207,16 @@ def expire_stale_flow(bot: Any, user: User) -> User:
 def on_text(req: Request) -> None:
     user = req.user
     assert user is not None
+    word = req.text.lower()
+    removed = True
+    if user.state in _WALLET_STATES and word not in _CONTROL_WORDS:
+        removed = _delete_incoming(req)
     flow = flow_of(user)
     if flow is None or flow.get("kind") != FLOW_KIND:
         cancel(req)
+        if not removed:
+            req.reply(_NOT_DELETED)
         return
-    word = req.text.lower()
     if word in ("cancel", "/cancel"):
         cancel(req)
         return
@@ -212,12 +235,32 @@ def on_text(req: Request) -> None:
         if word in ("skip", "keep"):
             _set_btc(req, flow, word)
         else:
-            _set_btc(req, flow, "value", req.text)
+            _set_btc(req, flow, "value", req.text, removed=removed)
     elif user.state == S.AWAITING_CRYPTO_ETH:
         if word in ("skip", "keep"):
             _set_eth(req, flow, word)
         else:
-            _set_eth(req, flow, "value", req.text)
+            _set_eth(req, flow, "value", req.text, removed=removed)
+
+
+def _delete_incoming(req: Request) -> bool:
+    """Delete the user's message (it may hold a wallet key); False if it is still there."""
+    if req.message_id is None:
+        return True
+    return req.bot.delete_message(req.chat_id, req.message_id)
+
+
+def _removal_note(removed: bool, *, private_key: bool = False) -> str:
+    """What to tell the user about their deleted (or undeletable) message, as a suffix."""
+    if private_key:
+        return "\n" + (_PRIVATE_DELETED if removed else _PRIVATE_NOT_DELETED)
+    return "" if removed else "\n" + _NOT_DELETED
+
+
+def _is_private_key(exc: btc.InvalidBitcoinInput) -> bool:
+    """True if the validator refused the input because it is a private key (xprv & co.,
+    private data in an extended key, WIF): its message then carries that warning."""
+    return "PRIVATE key" in str(exc)
 
 
 def _step_keyboard(nonce: str, *, has_current: bool, skip_label: str) -> dict[str, Any]:
@@ -256,10 +299,19 @@ def _choose_account(req: Request, flow: dict[str, Any], index: int) -> None:
     req.reply(text, _step_keyboard(nonce, has_current=current, skip_label="Skip BTC"))
 
 
-def _set_btc(req: Request, flow: dict[str, Any], action: str, value: str | None = None) -> None:
+def _set_btc(
+    req: Request,
+    flow: dict[str, Any],
+    action: str,
+    value: str | None = None,
+    *,
+    removed: bool = True,
+) -> None:
+    """``removed``: whether the message that carried ``value`` was deleted."""
     user = req.user
     assert user is not None
     nonce = str(flow["flow"])
+    note = ""
     if action == "keep":
         btc_value = user.btc_xpub
         if not btc_value:
@@ -272,9 +324,11 @@ def _set_btc(req: Request, flow: dict[str, Any], action: str, value: str | None 
         try:
             kind, parsed = btc.validate_btc_input(text)
         except btc.InvalidBitcoinInput as exc:
-            req.reply(f"❌ {h(exc)}\nSend another one, or type skip / cancel.")
+            note = _removal_note(removed, private_key=_is_private_key(exc))
+            req.reply(f"❌ {h(exc)}{note}\nSend another one, or type skip / cancel.")
             return
         btc_value = text if kind == "xpub" else str(parsed)
+        note = _removal_note(removed)
     updated = req.bot.users.update_if(
         req.user_id,
         states={S.AWAITING_CRYPTO_BTC},
@@ -291,16 +345,25 @@ def _set_btc(req: Request, flow: dict[str, Any], action: str, value: str | None 
         req.remove_keyboard()
     saved = f"✅ BTC: {code(mask(btc_value))}" if btc_value else "⏭ No BTC."
     current = bool(updated.eth_address)
-    text = f"{saved}\n\n{_ETH_PROMPT}"
+    text = f"{saved}{note}\n\n{_ETH_PROMPT}"
     if current:
         text += f"\n\nCurrent: {code(mask(updated.eth_address))}"
     req.reply(text, _step_keyboard(nonce, has_current=current, skip_label="Skip ETH"))
 
 
-def _set_eth(req: Request, flow: dict[str, Any], action: str, value: str | None = None) -> None:
+def _set_eth(
+    req: Request,
+    flow: dict[str, Any],
+    action: str,
+    value: str | None = None,
+    *,
+    removed: bool = True,
+) -> None:
+    """``removed``: whether the message that carried ``value`` was deleted."""
     user = req.user
     assert user is not None
     nonce = str(flow["flow"])
+    note = ""
     if action == "keep":
         eth_value = user.eth_address
         if not eth_value:
@@ -310,10 +373,11 @@ def _set_eth(req: Request, flow: dict[str, Any], action: str, value: str | None 
         eth_value = None
     else:
         text = (value or "").strip()
+        note = _removal_note(removed)
         if not eth.is_valid_eth_address(text):
             req.reply(
                 "❌ That doesn't look like an Ethereum address (0x followed by 40 hex "
-                "characters; check the capitalisation if you typed it).\n"
+                f"characters; check the capitalisation if you typed it).{note}\n"
                 "Send another one, or type skip / cancel."
             )
             return
@@ -362,7 +426,7 @@ def _set_eth(req: Request, flow: dict[str, Any], action: str, value: str | None 
         ]
     else:
         lines += ["", "Run /crypto anytime to sync your portfolio value to YNAB."]
-    req.reply("\n".join(lines))
+    req.reply("\n".join(lines) + note)
 
 
 def cb_crypto_setup(req: Request) -> None:

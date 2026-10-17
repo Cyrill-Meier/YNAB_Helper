@@ -8,9 +8,13 @@ error; it never reaches the poll loop.
 
 **Slow work** (YNAB, blockchains, downloads) runs on :class:`~ynab_helper.bot.workers.WorkerPool`
 via :meth:`Bot.start_job`: the user gets an immediate "working…" reply, a second job of the
-same user — or one while the web UI holds the user's service lock — gets
-"⏳ Another operation is still running." (F16, F43). Errors are reported with their
-``user_message``.
+same user — or one while the web UI holds the user's service lock for an operation — gets
+"⏳ Another operation is still running." (F16, F43). A mirror refresh nobody asked the bot
+for (:data:`BACKGROUND_OPS`: the sync every web page view triggers) is not such an
+operation: the job waits for it on its worker, up to :data:`BACKGROUND_WAIT` seconds as
+the web's own actions do, instead of dropping a statement the user just sent (R14).
+:meth:`Bot.is_busy` is the one definition of "busy" for the jobs and the handlers' checks.
+Errors are reported with their ``user_message``.
 
 **Polling** (F26, F40, F69):
 
@@ -41,7 +45,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import sys
 import threading
 import time
@@ -69,9 +72,10 @@ from ynab_helper.errors import (
 from ynab_helper.locks import LOCKS
 from ynab_helper.maintenance.dedupe import DEDUPE_SCANS
 from ynab_helper.services import UserContext
+from ynab_helper.services.status import OP_STATUS, OP_SYNC
 from ynab_helper.storage.users import User
 
-__all__ = ["HARD_EXIT_AFTER", "Bot", "FlowMemory", "WebAccess"]
+__all__ = ["BACKGROUND_OPS", "BACKGROUND_WAIT", "HARD_EXIT_AFTER", "Bot", "FlowMemory", "WebAccess"]
 
 log = logging.getLogger(__name__)
 
@@ -96,6 +100,12 @@ WEB_STOP_TIMEOUT: Final = 2.0
 NOTICE_BUDGET: Final = 1.0
 #: The process ends this many seconds after a stop signal, whatever still runs.
 HARD_EXIT_AFTER: Final = 7.5
+#: Lock holders that only refresh the user's mirror and end within YNAB's timeouts (the
+#: web's background sync, a status read): a job waits for them instead of answering busy.
+BACKGROUND_OPS: Final = frozenset({OP_SYNC, OP_STATUS})
+#: How long a job waits for such a refresh (the web's actions wait as long: IDLE_WAIT).
+BACKGROUND_WAIT: Final = 10.0
+_BACKGROUND_POLL: Final = 0.05
 
 _GENERIC_ERROR: Final = "❌ Something went wrong — the error was logged. Please try again."
 _EXPECTED_ERRORS: Final = (CsvError, ConfigError, StaleStateError)
@@ -234,6 +244,7 @@ class Bot:
         hard_exit: Callable[[int], None] = os._exit,
         clock: Callable[[], float] = time.monotonic,
         ip_lookup: Callable[[], str] | None = None,
+        background_wait: float = BACKGROUND_WAIT,
     ) -> None:
         self.tg = telegram
         self.users = users
@@ -245,6 +256,7 @@ class Bot:
         self.log_file = log_file
         self.memory = FlowMemory()
         self.ip_lookup = ip_lookup
+        self.background_wait = float(background_wait)
         self.bot_username: str | None = None
         self.clock = clock
         self.gate = AuthGate(users, admin_id=admin_id, normalize=self._normalize_user, clock=clock)
@@ -374,6 +386,52 @@ class Bot:
 
     # ── jobs ──
 
+    def is_busy(self, telegram_id: int) -> str | None:
+        """The operation a new one of this user must not overlap, or None: a bot job queued
+        or running for them, or the service lock held by anything but a
+        :data:`BACKGROUND_OPS` refresh (jobs wait those out, see :meth:`start_job`)."""
+        key = str(telegram_id)
+        job = self.workers.busy(key)
+        if job:
+            return job
+        holder = LOCKS.current(key)
+        return None if holder is None or holder in BACKGROUND_OPS else holder
+
+    @staticmethod
+    def reply_busy(req: Request) -> None:
+        """Tell the sender another operation runs (an alert for a button press)."""
+        if req.incoming.kind == "callback":
+            req.answer(render.BUSY_TEXT, alert=True)
+        else:
+            req.reply(render.BUSY_TEXT)
+
+    def _await_background(self, key: str) -> bool:
+        """Wait (on a worker) until no :data:`BACKGROUND_OPS` refresh holds ``key``'s lock;
+        False if one still does after :attr:`background_wait` seconds or at shutdown.
+        Real time, not :attr:`clock` (a test double there must not stall a worker)."""
+        deadline = time.monotonic() + self.background_wait
+        while LOCKS.current(key) in BACKGROUND_OPS:
+            if self._stop_flag or time.monotonic() >= deadline:
+                return False
+            time.sleep(_BACKGROUND_POLL)
+        return True
+
+    def _run_patiently(self, key: str, job: Callable[[], None]) -> None:
+        """Run ``job`` once no background refresh holds the user's lock; if one took the lock
+        while the job ran (its service raised Busy naming it), wait for it and run the job
+        once more. Safe because a job's Busy comes from its service's lock acquisition,
+        which precedes anything the service writes and anything the job reports."""
+        for attempt in (0, 1):
+            if not self._await_background(key):
+                raise Busy(LOCKS.current(key) or OP_SYNC)
+            try:
+                job()
+                return
+            except Busy as exc:
+                if attempt or exc.operation not in BACKGROUND_OPS:
+                    raise
+                log.info("job of user %s met a background %s; running it again", key, exc.operation)
+
     def start_job(
         self,
         req: Request,
@@ -386,12 +444,12 @@ class Bot:
 
         ``working`` (HTML) is sent before the job starts; for a button press it becomes the
         callback answer, which Telegram shows as plain text, so its markup is stripped.
-        Returns False if the user already has an operation running.
+        Returns False if the user already has an operation running (:meth:`is_busy`). A
+        background refresh holding the user's lock is waited out on the worker (R14).
         """
         key = str(req.user_id)
-        running = LOCKS.current(key) or self.workers.busy(key)
-        if running:
-            self._reply_busy(req)
+        if self.is_busy(req.user_id):
+            self.reply_busy(req)
             return False
         if working:
             if req.incoming.kind == "callback":
@@ -401,7 +459,7 @@ class Bot:
 
         def run() -> None:
             try:
-                job()
+                self._run_patiently(key, job)
             except Busy:
                 req.reply(render.BUSY_TEXT)
             except YnabAuthError as exc:
@@ -418,16 +476,9 @@ class Bot:
                 req.reply(_GENERIC_ERROR)
 
         if not self.workers.submit(key, op, run):
-            self._reply_busy(req)
+            self.reply_busy(req)
             return False
         return True
-
-    @staticmethod
-    def _reply_busy(req: Request) -> None:
-        if req.incoming.kind == "callback":
-            req.answer(render.BUSY_TEXT, alert=True)
-        else:
-            req.reply(render.BUSY_TEXT)
 
     # ── dispatch ──
 
@@ -510,15 +561,6 @@ class Bot:
     def request_stop(self) -> None:
         """Ask the loop to stop (safe from signal handlers: only sets a flag)."""
         self._stop_flag = True
-
-    def install_signal_handlers(self) -> None:
-        """SIGTERM/SIGINT → :meth:`request_stop` (main thread only)."""
-
-        def handler(signum: int, _frame: object) -> None:
-            self._stop_flag = True
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            signal.signal(sig, handler)
 
     def _interruptible_wait(self, seconds: float) -> bool:
         """Sleep up to ``seconds`` in short ticks; False as soon as a stop is requested."""

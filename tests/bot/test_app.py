@@ -624,3 +624,61 @@ def test_a_ready_row_without_a_complete_setup_goes_back_to_the_token_step(
     texts = tg.texts(USER)
     assert "setup is incomplete" in texts[0]
     assert texts[-1] == "Please send your YNAB Personal Access Token first (or /cancel)."
+
+
+# ── one definition of "busy" (R22) ───────────────────────────────────────────
+
+
+def test_bot_R22_is_busy_definition(bot: Bot, users: UsersRepo, monkeypatch):
+    from ynab_helper.locks import LOCKS
+
+    ready_user(users)
+    assert bot.is_busy(USER) is None
+    with LOCKS.operation(str(USER), "web upload"):
+        assert bot.is_busy(USER) == "web upload"
+    for refresh in sorted(app_module.BACKGROUND_OPS):  # waited out by the jobs (R14)
+        with LOCKS.operation(str(USER), refresh):
+            assert bot.is_busy(USER) is None
+    monkeypatch.setattr(bot.workers, "busy", lambda key: "import" if key == str(USER) else None)
+    assert bot.is_busy(USER) == "import"
+    assert bot.is_busy(USER + 1) is None
+
+
+def test_bot_R22_handlers_and_jobs_share_one_busy_check(
+    bot: Bot, tg: FakeTelegram, users: UsersRepo, monkeypatch
+):
+    """Handlers' ``busy()`` and ``start_job`` both ask :meth:`Bot.is_busy` and answer
+    through :meth:`Bot.reply_busy`, so a change to either applies to every path."""
+    ready_user(users)
+    monkeypatch.setattr(Bot, "is_busy", lambda self, telegram_id: "something")
+    tg.message(USER, "/setup")  # handlers/_common.busy
+    tg.message(USER, "/status")  # Bot.start_job
+    deliver(bot, tg)
+    assert tg.texts(USER) == ["⏳ Another operation is still running."] * 2
+    assert users.get(USER).state == "ready"
+    tg.callback(USER, "st:setup")  # a button press gets the alert
+    deliver(bot, tg)
+    assert tg.answers[-1]["text"] == "⏳ Another operation is still running."
+    assert tg.answers[-1]["show_alert"] is True
+    monkeypatch.setattr(Bot, "is_busy", lambda self, telegram_id: None)
+    tg.message(USER, "/setup")
+    deliver(bot, tg)
+    assert users.get(USER).state == "awaiting_token"
+
+
+# ── dead API removed (R21) ───────────────────────────────────────────────────
+
+
+def test_bot_R21_signal_path_is_main_and_dead_api_is_gone(bot: Bot):
+    """SIGTERM/SIGINT reach the bot only through ``bot.main._StopRequest`` →
+    :meth:`Bot.request_stop`; the unused duplicates are gone."""
+    from ynab_helper.bot.context import Request
+    from ynab_helper.bot.main import _StopRequest
+
+    stop = _StopRequest()
+    stop.bot = bot
+    stop(signal.SIGTERM, None)
+    assert stop.requested and bot.stopping
+    assert not hasattr(Bot, "install_signal_handlers")
+    assert not hasattr(Request, "refresh_user")
+    assert not hasattr(TelegramClient, "call") and not hasattr(TelegramClient, "api_base")

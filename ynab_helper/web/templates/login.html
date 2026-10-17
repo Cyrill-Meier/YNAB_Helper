@@ -1,5 +1,6 @@
 {#- The login page (GET /, sign-in errors). Context: the common keys plus ``message`` and,
-    on errors, ``error: True``; ``expired`` when a session ran out (F24). -#}
+    on errors, ``error: True``; ``expired`` when a session ran out (F24); ``setup_paused``
+    when the browser's session is kept while the user runs /setup in Telegram (R05). -#}
 {% extends "_public.html" %}
 {% block title %}Sign in — Revolut → YNAB{% endblock %}
 {% block heading %}
@@ -8,6 +9,10 @@
 {% endblock %}
 {% block card %}
 <div class="card p-6">
+  {% if setup_paused %}
+  <p class="alert alert-warn" role="status">{{ message }}</p>
+  <p class="mt-6"><a href="/" class="btn-primary">Reload</a></p>
+  {% else %}
   {% if expired %}
   <p class="alert alert-warn mb-5" role="status">Your session has expired. Please sign in again.</p>
   {% endif %}
@@ -31,6 +36,7 @@
     {% else %}
     <p class="mt-6 text-xs text-ink-500 dark:text-slate-400">{{ message }}</p>
     {% endif %}
+  {% endif %}
   {% endif %}
 </div>
 {% endblock %}

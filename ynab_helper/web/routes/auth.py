@@ -2,7 +2,9 @@
 
 * ``GET /`` — the login page, unless the session cookie belongs to a **valid** session
   (then 303 to the dashboard). A stale cookie is cleared and the page says the session
-  expired (F24: v1 redirected any cookie into a raw 401).
+  expired (F24: v1 redirected any cookie into a raw 401). A *paused* session (the user
+  runs the main ``/setup`` in Telegram, R05) keeps its cookie, and the page says to finish
+  or ``/cancel`` the setup and come back.
 * ``GET /auth?t=<token>`` — never consumes the token (F88: link unfurlers and prefetchers
   issue GETs). It renders a tiny page whose form POSTs the token back; ``/static/js/auth.js``
   submits it automatically and a visible "Continue" button is the fallback. When the
@@ -36,14 +38,17 @@ from starlette.requests import Request
 from starlette.responses import RedirectResponse, Response
 
 from ynab_helper import sessions
-from ynab_helper.sessions import SESSION_COOKIE, LoginResult
+from ynab_helper.sessions import SESSION_COOKIE, LoginResult, SessionPaused
 from ynab_helper.storage.db import connect
 from ynab_helper.web.config import WebConfig
 from ynab_helper.web.deps import (
     CSRF_FORM_FIELD,
     CSRF_HEADER,
+    SETUP_IN_PROGRESS_MESSAGE,
     ApiError,
+    AuthedUser,
     WebState,
+    check_session,
     clear_session_cookie,
     client_ip,
     get_state,
@@ -89,8 +94,19 @@ def login_page(request: Request, expired: str | None = None) -> Response:
     """The login page, or the dashboard when the cookie belongs to a valid session."""
     state = get_state(request)
     token = request.cookies.get(SESSION_COOKIE)
-    if token and resolve_session(state, token) is not None:
+    found = check_session(state, token)
+    if isinstance(found, AuthedUser):
         return RedirectResponse(DASHBOARD, status_code=303)
+    if isinstance(found, SessionPaused):
+        # Kept session, kept cookie (R05): once the setup is over this page leads back.
+        return render(
+            state,
+            request,
+            "login.html",
+            page="login",
+            setup_paused=True,
+            message=SETUP_IN_PROGRESS_MESSAGE,
+        )
     response = render(
         state,
         request,
@@ -187,12 +203,15 @@ def _stale_form_logout(state: WebState, token: str) -> Response:
     The session stays (the request may be forged), and the browser lands on a freshly
     rendered page whose logout form carries the current token, with a notice. A cookie
     that no longer belongs to a valid session is simply cleared: there is nothing left
-    to protect.
+    to protect. A paused session (R05) is kept as well; ``/`` explains the pause.
     """
-    if resolve_session(state, token) is None:
+    found = check_session(state, token)
+    if found is None:
         response = RedirectResponse("/", status_code=303)
         clear_session_cookie(response, state.config)
         return response
+    if isinstance(found, SessionPaused):
+        return RedirectResponse("/", status_code=303)
     return RedirectResponse(f"{DASHBOARD}?notice=logout_stale", status_code=303)
 
 

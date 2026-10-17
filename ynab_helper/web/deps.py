@@ -13,8 +13,12 @@
   (``Sec-Fetch-Site`` other than ``same-origin``/``none``): the SameSite=Lax cookie rides
   along on cross-site navigations and on every request from a sibling subdomain, and the
   page's own ``fetch`` calls are always same-origin.
-  A session only counts while its user is ``ready`` (F18; enforced by
-  :func:`ynab_helper.sessions.lookup_session`).
+  A session only counts while :func:`ynab_helper.sessions.session_access` allows its
+  user (``ready``, or in the crypto setup, with token, budget and account set; F18, R05).
+  While the main ``/setup`` runs the session is *paused*: requests are refused
+  (``LoginRequired(paused=True)`` → HTML 303 to ``/``, JSON 401 ``setup_in_progress``)
+  but the session row and the cookie are kept, so ``/cancel`` in Telegram is enough to
+  continue.
 * Bodies are read **only by handlers, after** the auth/CSRF dependency ran
   (:func:`read_json`, :func:`read_body`), with a byte cap — never by FastAPI before
   authentication (F21). There is no multipart parsing at all (F22).
@@ -54,7 +58,14 @@ from ynab_helper.errors import (
 )
 from ynab_helper.maintenance.dedupe import DedupeSelectionError
 from ynab_helper.services.context import UserContext
-from ynab_helper.sessions import SESSION_COOKIE, SessionInfo, TokenHasher
+from ynab_helper.sessions import (
+    SESSION_COOKIE,
+    SessionAccess,
+    SessionInfo,
+    SessionPaused,
+    TokenHasher,
+    session_access,
+)
 from ynab_helper.storage.db import StorageError, connect, open_tx_db
 from ynab_helper.storage.users import User, UserStore
 from ynab_helper.web.background import BackgroundSyncer, DetachedRunner
@@ -76,6 +87,7 @@ __all__ = [
     "api_error_for",
     "api_user",
     "api_user_csrf",
+    "check_session",
     "clear_session_cookie",
     "client_ip",
     "get_state",
@@ -113,6 +125,10 @@ NAV: Final[tuple[tuple[str, str, str], ...]] = tuple(
 
 SESSION_EXPIRED_MESSAGE: Final = (
     "Your session has expired. Send /login to the bot in Telegram for a new sign-in link."
+)
+SETUP_IN_PROGRESS_MESSAGE: Final = (
+    "Your YNAB setup is in progress in Telegram. Finish it there, or send /cancel to keep "
+    "your current settings, then reload this page."
 )
 #: Notices an app page can show, selected by ``?notice=<key>`` (never free text).
 NOTICES: Final[dict[str, str]] = {
@@ -204,12 +220,17 @@ class ApiError(Exception):
 
 
 class LoginRequired(Exception):
-    """No valid session. HTML routes redirect to the login page, JSON routes answer 401."""
+    """No usable session. HTML routes redirect to the login page, JSON routes answer 401.
 
-    def __init__(self, *, api: bool, had_cookie: bool) -> None:
-        super().__init__("login required")
+    ``paused``: the session is fine but its user is in the main ``/setup`` (R05); the
+    response says so and the cookie is kept.
+    """
+
+    def __init__(self, *, api: bool, had_cookie: bool, paused: bool = False) -> None:
+        super().__init__("setup in progress" if paused else "login required")
         self.api = api
         self.had_cookie = had_cookie
+        self.paused = paused
 
 
 def api_error_for(exc: YnabHelperError) -> ApiError:
@@ -299,12 +320,14 @@ class AuthedUser:
         )
 
 
-def resolve_session(state: WebState, token: str | None) -> AuthedUser | None:
-    """Look up (and slide) the session of ``token``; None unless its user is ready."""
+def check_session(state: WebState, token: str | None) -> AuthedUser | SessionPaused | None:
+    """Look up (and slide) the session of ``token``: the signed-in user, a paused session
+    (its user is in the main ``/setup``; nothing deleted, R05) or None (no usable session;
+    a revoked one is deleted, F18)."""
     if not token:
         return None
     with closing(connect(state.users_db_path)) as conn:
-        info = sessions.lookup_session(
+        found = sessions.check_session(
             conn,
             state.hasher,
             token,
@@ -312,12 +335,23 @@ def resolve_session(state: WebState, token: str | None) -> AuthedUser | None:
             absolute_ttl=state.config.session_absolute_ttl,
             now=state.clock(),
         )
-        if info is None:
-            return None
-        user = UserStore(conn).get(info.telegram_id)
-    if user is None or not user.is_ready:
+        if not isinstance(found, SessionInfo):
+            return found
+        user = UserStore(conn).get(found.telegram_id)
+    # The row may have changed since the lookup's transaction: decide on what was read.
+    access = session_access(user)
+    if user is None or access is SessionAccess.REVOKED:
         return None
-    return AuthedUser(user=user, session=info, session_token=token)
+    if access is SessionAccess.PAUSED:
+        return SessionPaused(telegram_id=user.telegram_id, state=user.state)
+    return AuthedUser(user=user, session=found, session_token=token)
+
+
+def resolve_session(state: WebState, token: str | None) -> AuthedUser | None:
+    """The signed-in user of ``token`` (session slid), or None — also for a paused session,
+    whose row is kept (see :func:`check_session`)."""
+    found = check_session(state, token)
+    return found if isinstance(found, AuthedUser) else None
 
 
 def _require_same_site_fetch(request: Request) -> None:
@@ -331,10 +365,12 @@ def _authenticate(request: Request, *, api: bool) -> AuthedUser:
     if api:
         _require_same_site_fetch(request)
     token = request.cookies.get(SESSION_COOKIE)
-    authed = resolve_session(get_state(request), token)
-    if authed is None:
+    found = check_session(get_state(request), token)
+    if isinstance(found, SessionPaused):
+        raise LoginRequired(api=api, had_cookie=True, paused=True)
+    if found is None:
         raise LoginRequired(api=api, had_cookie=bool(token))
-    return authed
+    return found
 
 
 def page_user(request: Request) -> AuthedUser:

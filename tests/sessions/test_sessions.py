@@ -15,7 +15,9 @@ from ynab_helper import sessions
 from ynab_helper.sessions import (
     SESSION_COOKIE,
     LoginResult,
+    SessionAccess,
     SessionInfo,
+    SessionPaused,
     TokenHasher,
     attach_tg_message,
     consume_login_token,
@@ -25,8 +27,10 @@ from ynab_helper.sessions import (
     new_token,
     purge_expired,
     revoke_all,
+    session_access,
 )
 from ynab_helper.storage import SessionStore, UserStore, connect, open_users_db
+from ynab_helper.storage.users import User
 
 from .helpers import (
     ABSOLUTE_TTL,
@@ -454,30 +458,49 @@ def test_v1_sha256_rows_never_validate(
     assert purge_expired(conn, T0 + 4000) == 2
 
 
-# ── F18: only ready users may sign in or keep a session ───────────────────────
+# ── F18/R05: who may sign in or keep a session ────────────────────────────────
 
-_NOT_READY = [
-    {"state": "pending"},
-    {"state": "denied", "ynab_token": "t", "budget_id": "b", "account_id": "a"},
-    {"state": "awaiting_token"},
-    {"state": "awaiting_budget", "ynab_token": "t"},
-    {"state": "awaiting_account", "ynab_token": "t", "budget_id": "b"},
-    {"state": "awaiting_crypto_eth", "ynab_token": "t", "budget_id": "b", "account_id": "a"},
-    {"state": "ready", "ynab_token": None, "budget_id": "b", "account_id": "a"},
-    {"state": "ready", "ynab_token": "t", "budget_id": "", "account_id": "a"},
-    {"state": "ready", "ynab_token": "t", "budget_id": "b", "account_id": None},
+
+def _row(
+    state: str, token: str | None = "t", budget: str | None = "b", account: str | None = "a"
+) -> dict[str, object]:
+    """A users row with every configuration column given explicitly."""
+    return {"state": state, "ynab_token": token, "budget_id": budget, "account_id": account}
+
+
+def _ids(fields: dict[str, object]) -> str:
+    return "-".join(f"{k}={v}" for k, v in fields.items())
+
+
+#: Login tokens rejected, sessions deleted (F18).
+_REVOKED = [
+    _row("pending", None, None, None),
+    _row("pending"),
+    _row("denied"),
+    # v1's /setup cleared the configuration before asking for a new token.
+    _row("awaiting_token", None, None, None),
+    _row("awaiting_budget", "t", None, None),
+    _row("awaiting_account", "t", "b", None),
+    _row("awaiting_crypto_eth", None),
+    _row("ready", None),
+    _row("ready", budget=""),
+    _row("ready", account=None),
+]
+#: The main /setup with the previous configuration still in the row (R05).
+_PAUSED = [_row(s) for s in ("awaiting_token", "awaiting_budget", "awaiting_account")]
+#: The crypto setup starts from ready and never touches token, budget or account (R05).
+_CRYPTO = [
+    _row(s) for s in ("awaiting_crypto_account", "awaiting_crypto_btc", "awaiting_crypto_eth")
 ]
 
 
-@pytest.mark.parametrize(
-    "fields", _NOT_READY, ids=lambda f: "-".join(f"{k}={v}" for k, v in f.items())
-)
-def test_F18_login_token_of_a_user_who_is_not_ready_is_rejected(
-    conn: sqlite3.Connection, hasher: TokenHasher, fields: dict[str, object]
-) -> None:
-    UserStore(conn).upsert(OTHER_ID, **fields)
-    token = issue_login_token(conn, hasher, OTHER_ID, ttl_seconds=LOGIN_TTL, now=T0)
-    result = consume_login_token(
+def _set_state_raw(conn: sqlite3.Connection, telegram_id: int, state: str) -> None:
+    """A state UserStore refuses to write (a v1 leftover such as ``approved``)."""
+    conn.execute("UPDATE users SET state = ? WHERE telegram_id = ?", (state, telegram_id))
+
+
+def _consume(conn: sqlite3.Connection, hasher: TokenHasher, token: str) -> LoginResult | None:
+    return consume_login_token(
         conn,
         hasher,
         token,
@@ -487,31 +510,43 @@ def test_F18_login_token_of_a_user_who_is_not_ready_is_rejected(
         user_agent="ua",
         now=T0 + 1,
     )
-    assert result is None
+
+
+def _check(conn: sqlite3.Connection, hasher: TokenHasher, token: str, now: float):
+    return sessions.check_session(
+        conn, hasher, token, sliding_ttl=SESSION_TTL, absolute_ttl=ABSOLUTE_TTL, now=now
+    )
+
+
+@pytest.mark.parametrize("fields", _REVOKED + _PAUSED, ids=_ids)
+def test_F18_login_token_of_a_user_who_is_not_ready_is_rejected(
+    conn: sqlite3.Connection, hasher: TokenHasher, fields: dict[str, object]
+) -> None:
+    UserStore(conn).upsert(OTHER_ID, **fields)
+    token = issue_login_token(conn, hasher, OTHER_ID, ttl_seconds=LOGIN_TTL, now=T0)
+    assert _consume(conn, hasher, token) is None
     assert _rows(conn) == []  # no session, and the login token is burnt
+
+
+def test_F18_login_token_of_a_user_in_an_unknown_state_is_rejected(
+    conn: sqlite3.Connection, hasher: TokenHasher
+) -> None:
+    UserStore(conn).upsert(OTHER_ID, **_row("ready"))
+    _set_state_raw(conn, OTHER_ID, "approved")
+    token = issue_login_token(conn, hasher, OTHER_ID, ttl_seconds=LOGIN_TTL, now=T0)
+    assert _consume(conn, hasher, token) is None
+    assert _rows(conn) == []
 
 
 def test_F18_login_token_of_an_unknown_user_is_rejected(
     conn: sqlite3.Connection, hasher: TokenHasher
 ) -> None:
     token = issue_login_token(conn, hasher, 999, ttl_seconds=LOGIN_TTL, now=T0)
-    result = consume_login_token(
-        conn,
-        hasher,
-        token,
-        session_ttl=SESSION_TTL,
-        absolute_ttl=ABSOLUTE_TTL,
-        ip="ip",
-        user_agent="ua",
-        now=T0 + 1,
-    )
-    assert result is None
+    assert _consume(conn, hasher, token) is None
     assert _rows(conn) == []
 
 
-@pytest.mark.parametrize(
-    "fields", _NOT_READY, ids=lambda f: "-".join(f"{k}={v}" for k, v in f.items())
-)
+@pytest.mark.parametrize("fields", _REVOKED, ids=_ids)
 def test_F18_session_of_a_user_who_is_no_longer_ready_is_deleted(
     conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int, fields: dict[str, object]
 ) -> None:
@@ -526,6 +561,15 @@ def test_F18_session_of_a_user_who_is_no_longer_ready_is_deleted(
     assert _lookup(conn, hasher, session.session_token, T0 + 180) is None
 
 
+def test_F18_session_of_a_user_in_an_unknown_state_is_deleted(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
+) -> None:
+    session = _login(conn, hasher)
+    _set_state_raw(conn, ready_user, "approved")
+    assert _check(conn, hasher, session.session_token, T0 + 60) is None
+    assert _rows(conn) == []
+
+
 def test_F18_session_of_a_deleted_user_is_deleted(
     conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
 ) -> None:
@@ -533,6 +577,141 @@ def test_F18_session_of_a_deleted_user_is_deleted(
     conn.execute("DELETE FROM users WHERE telegram_id = ?", (ready_user,))
     assert _lookup(conn, hasher, session.session_token, T0 + 60) is None
     assert _rows(conn) == []
+
+
+def _user(**fields: object) -> User:
+    values: dict[str, object] = {
+        "telegram_id": OTHER_ID,
+        "chat_id": OTHER_ID,
+        "username": None,
+        "first_name": None,
+        "ynab_token": None,
+        "budget_id": None,
+        "budget_name": None,
+        "account_id": None,
+        "account_name": None,
+        "crypto_account_id": None,
+        "crypto_account_name": None,
+        "btc_xpub": None,
+        "eth_address": None,
+        "state": "pending",
+        "temp_data": None,
+        "created_at": "2026-10-17 00:00:00",
+        "updated_at": "2026-10-17 00:00:00",
+        "auto_approve": True,
+    }
+    values.update(fields)
+    return User(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        (_row("ready"), SessionAccess.ALLOWED),
+        *[(f, SessionAccess.ALLOWED) for f in _CRYPTO],
+        *[(f, SessionAccess.PAUSED) for f in _PAUSED],
+        *[(f, SessionAccess.REVOKED) for f in _REVOKED],
+        (_row("approved"), SessionAccess.REVOKED),
+        (_row("something-new"), SessionAccess.REVOKED),
+    ],
+    ids=lambda v: _ids(v) if isinstance(v, dict) else v.name,
+)
+def test_web_R05_session_access_classifies_every_row(
+    fields: dict[str, object], expected: SessionAccess
+) -> None:
+    assert session_access(_user(**fields)) is expected
+
+
+def test_web_R05_session_access_of_no_user_is_revoked() -> None:
+    assert session_access(None) is SessionAccess.REVOKED
+
+
+def test_web_R05_session_access_covers_every_storable_state() -> None:
+    """A state added to the users table must be classified on purpose: the bot's state
+    groups (which the classification uses) must cover every storable state."""
+    from ynab_helper.bot import states as S
+    from ynab_helper.storage.users import USER_STATES
+
+    grouped = S.READY_STATES | S.SETUP_STATES | S.CRYPTO_STATES | S.BLOCKED_STATES
+    assert grouped == USER_STATES
+
+
+@pytest.mark.parametrize("fields", _CRYPTO, ids=_ids)
+def test_web_R05_crypto_setup_keeps_and_slides_the_session(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int, fields: dict[str, object]
+) -> None:
+    """v2 before R05: a web request during /crypto_setup deleted the session for good."""
+    session = _login(conn, hasher)
+    UserStore(conn).upsert(ready_user, state=fields["state"])  # what /crypto_setup does
+    info = _lookup(conn, hasher, session.session_token, T0 + 600)
+    assert info is not None and info.telegram_id == ready_user
+    assert info.expires_at == T0 + 600 + SESSION_TTL  # slid like any other request
+    UserStore(conn).upsert(ready_user, state="ready")  # finished or /cancel
+    assert _lookup(conn, hasher, session.session_token, T0 + 900) is not None
+    assert _kinds(conn) == ["session"]
+
+
+def test_web_R05_login_token_works_during_the_crypto_setup(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
+) -> None:
+    UserStore(conn).upsert(ready_user, state="awaiting_crypto_btc")
+    token = issue_login_token(conn, hasher, ready_user, ttl_seconds=LOGIN_TTL, now=T0)
+    result = _consume(conn, hasher, token)
+    assert result is not None and result.telegram_id == ready_user
+
+
+@pytest.mark.parametrize("fields", _PAUSED, ids=_ids)
+def test_web_R05_setup_pauses_the_session_without_deleting_it(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int, fields: dict[str, object]
+) -> None:
+    """/setup keeps the previous configuration until the new one is committed: requests
+    are refused meanwhile, but /cancel must not leave the user signed out."""
+    session = _login(conn, hasher)
+    before = _rows(conn)
+    UserStore(conn).upsert(ready_user, state=fields["state"])  # what /setup does
+    found = _check(conn, hasher, session.session_token, T0 + 600)
+    assert found == SessionPaused(telegram_id=ready_user, state=str(fields["state"]))
+    assert _lookup(conn, hasher, session.session_token, T0 + 610) is None
+    # Neither deleted nor slid.
+    assert [tuple(r) for r in _rows(conn)] == [tuple(r) for r in before]
+    UserStore(conn).upsert(ready_user, state="ready")  # /cancel
+    info = _lookup(conn, hasher, session.session_token, T0 + 900)
+    assert info is not None and info.expires_at == T0 + 900 + SESSION_TTL
+
+
+def test_web_R05_a_paused_session_still_expires(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
+) -> None:
+    """Pausing never extends a session: past its sliding expiry it is gone as usual."""
+    session = _login(conn, hasher)
+    UserStore(conn).upsert(ready_user, state="awaiting_budget")
+    assert isinstance(_check(conn, hasher, session.session_token, T0 + 60), SessionPaused)
+    assert _check(conn, hasher, session.session_token, T0 + 5 + SESSION_TTL + 1) is None
+    assert _rows(conn) == []
+    UserStore(conn).upsert(ready_user, state="ready")
+    assert _lookup(conn, hasher, session.session_token, T0 + SESSION_TTL + 10) is None
+
+
+def test_web_R05_setup_that_clears_the_configuration_deletes_the_session(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
+) -> None:
+    """Only a *complete* previous configuration pauses; anything less is revoked (F18)."""
+    session = _login(conn, hasher)
+    UserStore(conn).upsert(ready_user, state="awaiting_account", account_id=None)
+    assert _check(conn, hasher, session.session_token, T0 + 60) is None
+    assert _rows(conn) == []
+
+
+def test_web_R05_revoke_all_ends_a_paused_session(
+    conn: sqlite3.Connection, hasher: TokenHasher, ready_user: int
+) -> None:
+    """A /setup that changes the configuration revokes the sessions (the bot calls
+    revoke_all); a paused session is not exempt."""
+    session = _login(conn, hasher)
+    UserStore(conn).upsert(ready_user, state="awaiting_account")
+    assert revoke_all(conn, ready_user) == 1
+    UserStore(conn).upsert(ready_user, state="ready", budget_id="budget-2")
+    assert _check(conn, hasher, session.session_token, T0 + 60) is None
 
 
 # ── F86: concurrent consumption ───────────────────────────────────────────────

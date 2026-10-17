@@ -41,6 +41,9 @@ Extra keys per template:
 
 * ``login.html`` — ``message: str`` (what to do / what went wrong) and, on errors,
   ``error: True``. Status 400 (bad or used link), 403 (cross-site sign-in), 429 (rate limit).
+  ``setup_paused: True`` (``GET /`` while the browser's session is paused because the user
+  runs the main ``/setup`` in Telegram, R05): show ``message`` as a notice and a link back
+  to ``/`` instead of the sign-in steps (``/login`` is refused during the setup).
 * ``auth.html`` — ``login_token: str``, ``confirm_switch: bool`` and ``message`` (str or
   None): render ``<form id="auth-form" method="post" action="/auth">`` with ``<input
   type="hidden" name="t" value="{{ login_token }}">`` and a visible submit button
@@ -62,6 +65,7 @@ CSP (:data:`ynab_helper.web.middleware.CONTENT_SECURITY_POLICY`) forbids them.
 
 JSON conventions: money is integer milliunits with the budget ``currency`` (ISO code);
 errors are ``{error, message}`` (``401 session_expired`` → go to ``/?expired=1``;
+``401 setup_in_progress`` → the same, ``/`` then explains it and keeps the session;
 ``403 csrf_failed`` → reload; ``403 cross_site``; ``409 busy`` / ``409 stale``;
 ``429 rate_limited`` (YNAB) / ``429 throttled`` (too many syncing requests), both with
 ``retry_after`` seconds). Send ``X-CSRF-Token`` on **every** ``/api`` request (simplest in
@@ -98,6 +102,7 @@ from ynab_helper.web.background import BackgroundSyncer, DetachedRunner
 from ynab_helper.web.config import WebConfig
 from ynab_helper.web.deps import (
     SESSION_EXPIRED_MESSAGE,
+    SETUP_IN_PROGRESS_MESSAGE,
     ApiError,
     LoginRequired,
     WebState,
@@ -278,6 +283,15 @@ def _install_error_handlers(app: FastAPI, config: WebConfig) -> None:
     async def on_login_required(_request: Request, exc: Exception) -> Response:
         assert isinstance(exc, LoginRequired)
         response: Response
+        if exc.paused:
+            # The user is in the main /setup (R05): the session is kept, and so is the
+            # cookie. "/" explains what to do and leads back once the setup is over.
+            if exc.api:
+                return JSONResponse(
+                    {"error": "setup_in_progress", "message": SETUP_IN_PROGRESS_MESSAGE},
+                    status_code=401,
+                )
+            return RedirectResponse("/", status_code=303)
         if exc.api:
             response = JSONResponse(
                 {"error": "session_expired", "message": SESSION_EXPIRED_MESSAGE},

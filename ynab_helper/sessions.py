@@ -3,13 +3,14 @@
 Shared by the Telegram bot and the web UI (no FastAPI imports here):
 
 * the bot's ``/login`` mints a one-shot login token (:func:`issue_login_token`) and records
-  which message carries the link (:func:`attach_tg_message`); ``/deny``, ``/setup``,
-  ``/revoke`` and ``/logout_all`` call :func:`revoke_all` (F18, F61);
+  which message carries the link (:func:`attach_tg_message`); ``/deny``, ``/revoke``,
+  ``/logout_all`` and a ``/setup`` that changes token, budget or account call
+  :func:`revoke_all` (F18, F61);
 * the web's ``POST /auth`` exchanges the login token for a session cookie
   (:func:`consume_login_token`), every authenticated request resolves the cookie with
-  :func:`lookup_session`, ``/logout`` calls :func:`delete_session`, a background thread calls
-  :func:`purge_expired`, and state-changing requests are checked with
-  :meth:`TokenHasher.verify_csrf`.
+  :func:`check_session` (or :func:`lookup_session`), ``/logout`` calls
+  :func:`delete_session`, a background thread calls :func:`purge_expired`, and
+  state-changing requests are checked with :meth:`TokenHasher.verify_csrf`.
 
 Secrets never reach the database: a token is stored as ``HMAC-SHA256(WEB_UI_SECRET_KEY,
 token)`` (F89), so a leaked ``bot_users.db`` yields no usable token and rotating the key
@@ -28,9 +29,19 @@ threads under a lock. Pass that lock as ``lock=``. It is held for the whole tran
 the stores are used without a lock of their own, so a plain :class:`threading.Lock` works
 as well as an ``RLock``. Connections opened per request (the web) need no lock.
 
-Authorisation (F18): a login token or session only counts while its user exists and is
-fully onboarded (:attr:`ynab_helper.storage.User.is_ready`: state ``ready`` with YNAB
-token, budget and account set). A session found for any other user is deleted.
+Authorisation (F18, R05) is decided by :func:`session_access` from the user's row:
+
+* **allowed** — YNAB token, budget and account set, and state ``ready`` or one of the
+  crypto-setup states. ``/crypto_setup`` starts from ``ready``, never touches token, budget
+  or account and ends in ``ready`` again, so it must not cost the user their web sign-in.
+* **paused** — the same complete configuration while the main ``/setup`` runs
+  (``awaiting_token``/``awaiting_budget``/``awaiting_account``). The previous configuration
+  stays in the row until the new one is committed: requests are refused, but the session is
+  kept (and not slid). ``/cancel`` returns to ``ready`` and the session works again; a
+  commit that changes token, budget or account revokes the sessions itself (the bot's
+  onboarding calls :func:`revoke_all`).
+* **revoked** — everything else (unknown user, ``pending``, ``denied``, an unknown state,
+  an incomplete configuration): login tokens are rejected and sessions are deleted.
 
 v1 compatibility: v1 stored plain ``sha256(token)`` hashes. Those rows never match an HMAC,
 so v1 sessions and login links stop working once and users sign in again. The users-DB
@@ -41,6 +52,7 @@ expire. The cookie name :data:`SESSION_COOKIE` is unchanged (DESIGN §2.8).
 from __future__ import annotations
 
 import contextlib
+import enum
 import hashlib
 import hmac
 import logging
@@ -53,8 +65,9 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from ynab_helper.bot import states as S
 from ynab_helper.storage.db import transaction
-from ynab_helper.storage.users import SessionStore, UserStore
+from ynab_helper.storage.users import SessionStore, User, UserStore
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +168,60 @@ class SessionInfo:
     created_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class SessionPaused:
+    """A live session whose user is in the main ``/setup`` (:attr:`SessionAccess.PAUSED`).
+
+    The session row is kept and its expiry is not slid; the request must be refused
+    without signing the browser out (keep the cookie).
+    """
+
+    telegram_id: int
+    state: str
+
+
+class SessionAccess(enum.Enum):
+    """What a user's row means for their login tokens and sessions (see the module doc)."""
+
+    #: Sign-in works, sessions are used and slid.
+    ALLOWED = "allowed"
+    #: Sessions are kept but refused for now; login tokens are rejected.
+    PAUSED = "paused"
+    #: Login tokens are rejected and sessions are deleted.
+    REVOKED = "revoked"
+
+
+#: States in which a fully configured user may use the web UI: ``ready`` and the crypto
+#: setup, which starts from ``ready`` and never changes token, budget or account (R05).
+_ALLOWED_STATES: Final = S.READY_STATES | S.CRYPTO_STATES
+#: The main setup: the previous configuration stays active until the new one is committed.
+_PAUSED_STATES: Final = S.SETUP_STATES
+
+
+def session_access(user: User | None) -> SessionAccess:
+    """Whether ``user`` may use the web UI now (F18, R05).
+
+    ALLOWED needs YNAB token, budget and account plus state ``ready`` or a crypto-setup
+    state; PAUSED is the same complete configuration in a main-setup state; anything else
+    (no such user, ``pending``, ``denied``, an unknown state, a missing token, budget or
+    account) is REVOKED.
+    """
+    if user is None or not (user.ynab_token and user.budget_id and user.account_id):
+        return SessionAccess.REVOKED
+    if user.state in _ALLOWED_STATES:
+        return SessionAccess.ALLOWED
+    if user.state in _PAUSED_STATES:
+        return SessionAccess.PAUSED
+    return SessionAccess.REVOKED
+
+
+#: Log wording for a refused sign-in or session.
+_REFUSED_BECAUSE: Final = {
+    SessionAccess.PAUSED: "the YNAB setup is in progress",
+    SessionAccess.REVOKED: "user is not set up or not allowed",
+}
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 
@@ -236,10 +303,11 @@ def consume_login_token(
     """Exchange a login token for a new browser session, atomically and at most once.
 
     In one transaction: the login token is deleted (``DELETE … RETURNING``, so a second or
-    concurrent use finds nothing, F86); an expired token, or one whose user is missing or
-    not ready (state ``ready`` with YNAB token, budget and account, F18), is rejected; then
-    a ``session`` row is created with ``expires_at = min(now + session_ttl, now +
-    absolute_ttl)``. A rejected token stays burnt.
+    concurrent use finds nothing, F86); an expired token, or one whose user is not
+    :attr:`SessionAccess.ALLOWED` (F18, :func:`session_access`; a user in the main
+    ``/setup`` is refused too), is rejected; then a ``session`` row is created with
+    ``expires_at = min(now + session_ttl, now + absolute_ttl)``. A rejected token stays
+    burnt.
 
     Returns None for an unknown, used, expired or rejected token (also for anything that
     is not a plausible token string). Raises :class:`ValueError` for non-positive TTLs
@@ -253,15 +321,15 @@ def consume_login_token(
     login_hash = hasher.hash(token)
     session_token = new_token()
     session_hash = hasher.hash(session_token)
-    rejected_user: int | None = None
+    rejected: tuple[int, str] | None = None
     result: LoginResult | None = None
     with _held(lock), transaction(conn):
         sessions = SessionStore(conn)
         login = sessions.consume_login(login_hash, at)
         if login is not None:
-            user = UserStore(conn).get(login.telegram_id)
-            if user is None or not user.is_ready:
-                rejected_user = login.telegram_id
+            access = session_access(UserStore(conn).get(login.telegram_id))
+            if access is not SessionAccess.ALLOWED:
+                rejected = (login.telegram_id, _REFUSED_BECAUSE[access])
             else:
                 expires = min(at + sliding, at + absolute)
                 sessions.insert(
@@ -283,13 +351,76 @@ def consume_login_token(
                 )
     if result is not None:
         log.info("web sign-in of user %s", result.telegram_id)
-    elif rejected_user is not None:
-        log.warning(
-            "web sign-in refused for user %s: not set up (state is not ready)", rejected_user
-        )
+    elif rejected is not None:
+        log.warning("web sign-in refused for user %s: %s", *rejected)
     else:
         log.info("web sign-in refused: login link unknown, already used or expired")
     return result
+
+
+def check_session(
+    conn: sqlite3.Connection,
+    hasher: TokenHasher,
+    session_token: str | None,
+    *,
+    sliding_ttl: float,
+    absolute_ttl: float,
+    now: float | None = None,
+    lock: LockLike | None = None,
+) -> SessionInfo | SessionPaused | None:
+    """Resolve a session cookie: a usable session (expiry slid), a paused one, or None.
+
+    * None (and the row is deleted where there is one) when the session is unknown, past
+      its sliding expiry, older than ``absolute_ttl`` (counted from its creation), or when
+      its user is :attr:`SessionAccess.REVOKED` (F18).
+    * :class:`SessionPaused` when its user is :attr:`SessionAccess.PAUSED` (the main
+      ``/setup`` runs, R05): the row is kept as it is, neither deleted nor slid.
+    * Otherwise :class:`SessionInfo`, and ``expires_at`` becomes ``min(now + sliding_ttl,
+      created_at + absolute_ttl)``.
+
+    Login tokens are never accepted as sessions. Raises :class:`ValueError` for
+    non-positive TTLs.
+    """
+    sliding = _positive_seconds("sliding_ttl", sliding_ttl)
+    absolute = _positive_seconds("absolute_ttl", absolute_ttl)
+    if not _plausible_token(session_token):
+        return None
+    at = _now(now)
+    token_hash = hasher.hash(session_token)
+    dropped: tuple[int, str] | None = None
+    found: SessionInfo | SessionPaused | None = None
+    with _held(lock), transaction(conn):
+        sessions = SessionStore(conn)
+        record = sessions.get_session(token_hash)
+        if record is None:
+            return None
+        deadline = record.created_at + absolute
+        if record.expired(at) or deadline < at:
+            sessions.delete(token_hash)
+            dropped = (record.telegram_id, "expired")
+        else:
+            user = UserStore(conn).get(record.telegram_id)
+            access = session_access(user)
+            if user is None or access is SessionAccess.REVOKED:
+                sessions.delete(token_hash)
+                dropped = (record.telegram_id, _REFUSED_BECAUSE[SessionAccess.REVOKED])
+            elif access is SessionAccess.PAUSED:
+                found = SessionPaused(telegram_id=record.telegram_id, state=user.state)
+            else:
+                expires = min(at + sliding, deadline)
+                if expires != record.expires_at:
+                    sessions.slide(token_hash, expires)
+                found = SessionInfo(
+                    telegram_id=record.telegram_id,
+                    expires_at=expires,
+                    created_at=record.created_at,
+                )
+    if dropped is not None:
+        log.info("web session of user %s ended: %s", *dropped)
+    elif isinstance(found, SessionPaused):
+        reason = _REFUSED_BECAUSE[SessionAccess.PAUSED]
+        log.debug("web request of user %s refused for now: %s", found.telegram_id, reason)
+    return found
 
 
 def lookup_session(
@@ -302,48 +433,18 @@ def lookup_session(
     now: float | None = None,
     lock: LockLike | None = None,
 ) -> SessionInfo | None:
-    """Resolve a session cookie and slide its expiry.
-
-    Returns None (and deletes the row where there is one) when the session is unknown,
-    past its sliding expiry, older than ``absolute_ttl`` (counted from its creation), or
-    when its user is missing or not ready (F18). Otherwise ``expires_at`` becomes
-    ``min(now + sliding_ttl, created_at + absolute_ttl)``. Login tokens are never accepted
-    as sessions. Raises :class:`ValueError` for non-positive TTLs.
-    """
-    sliding = _positive_seconds("sliding_ttl", sliding_ttl)
-    absolute = _positive_seconds("absolute_ttl", absolute_ttl)
-    if not _plausible_token(session_token):
-        return None
-    at = _now(now)
-    token_hash = hasher.hash(session_token)
-    dropped: tuple[int, str] | None = None
-    info: SessionInfo | None = None
-    with _held(lock), transaction(conn):
-        sessions = SessionStore(conn)
-        record = sessions.get_session(token_hash)
-        if record is None:
-            return None
-        deadline = record.created_at + absolute
-        if record.expired(at) or deadline < at:
-            sessions.delete(token_hash)
-            dropped = (record.telegram_id, "expired")
-        else:
-            user = UserStore(conn).get(record.telegram_id)
-            if user is None or not user.is_ready:
-                sessions.delete(token_hash)
-                dropped = (record.telegram_id, "user is not set up (state is not ready)")
-            else:
-                expires = min(at + sliding, deadline)
-                if expires != record.expires_at:
-                    sessions.slide(token_hash, expires)
-                info = SessionInfo(
-                    telegram_id=record.telegram_id,
-                    expires_at=expires,
-                    created_at=record.created_at,
-                )
-    if dropped is not None:
-        log.info("web session of user %s ended: %s", *dropped)
-    return info
+    """:func:`check_session` reduced to "usable or not": a usable session (expiry slid),
+    else None. A paused session is None here too, but its row is kept (R05)."""
+    found = check_session(
+        conn,
+        hasher,
+        session_token,
+        sliding_ttl=sliding_ttl,
+        absolute_ttl=absolute_ttl,
+        now=now,
+        lock=lock,
+    )
+    return found if isinstance(found, SessionInfo) else None
 
 
 def delete_session(

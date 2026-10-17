@@ -11,6 +11,14 @@ line-length = 100
 target-version = "py312"
 extend-exclude = ["tests/legacy", ".cache"]
 
+[tool.ruff.per-file-target-version]
+# The documented entry points must still run (and only say which Python they need) on an
+# older system `python3`, as v1 did; see the version check at their top. py37 is the
+# oldest version ruff knows; tests/runtime keeps them free of f-strings and __future__.
+"revolut_to_ynab.py" = "py37"
+"revolut_ynab_bot.py" = "py37"
+"ynab_helper/__main__.py" = "py37"
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
 ignore = [

@@ -15,19 +15,25 @@ first does what the entrypoint does (:func:`ynab_helper.container.prepare_runtim
 ``/app/.env``, hand the data directory to the app user, drop privileges), so the CLI never
 leaves root-owned files in ``/app/bot_data`` that the bot could not open afterwards.
 
-The v1 Python API of this module (``import_and_track``, ``crypto_sync``, …) is gone; use
-:mod:`ynab_helper.services`. Importing this module runs nothing.
+The package needs Python 3.12+, but v1 ran on any ``python3``: this file avoids newer syntax
+(no f-strings, no ``__future__`` imports), so an older interpreter gets a one-line error
+instead of an ImportError traceback. Importing this module runs nothing.
 """
-
-from __future__ import annotations
 
 import os
 import sys
 from collections.abc import Sequence
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: "Sequence[str] | None" = None) -> int:
     """Drop root privileges like the container entrypoint, then run the CLI."""
+    if sys.version_info < (3, 12):
+        sys.stderr.write(
+            "YNAB Helper v2 needs Python 3.12 or newer, not " + sys.version.split()[0] + ": run "
+            "it with .venv/bin/python (see the README) or in the container (docker exec "
+            "revolut-ynab-bot python3 revolut_to_ynab.py ...).\n"
+        )
+        return 1
     from ynab_helper import cli, container
     from ynab_helper.errors import YnabHelperError
 
@@ -37,7 +43,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             container.prepare_runtime()
         except (OSError, YnabHelperError) as exc:
-            sys.stderr.write(f"refusing to run as root: preparing the runtime failed: {exc}\n")
+            sys.stderr.write(
+                "refusing to run as root: preparing the runtime failed: " + str(exc) + "\n"
+            )
             return 1
     return cli.main(argv)
 

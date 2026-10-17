@@ -42,7 +42,7 @@ import time
 from collections.abc import Callable, Iterable, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Final, TextIO
 
@@ -68,7 +68,7 @@ from ynab_helper.errors import (
 )
 from ynab_helper.importer.models import Change, ImportResult, TxRef
 from ynab_helper.maintenance.cleanup import CleanupResult
-from ynab_helper.money import format_money
+from ynab_helper.money import decimal_to_milli, format_money
 from ynab_helper.revolut.files import find_latest_revolut_csv
 from ynab_helper.revolut.parser import (
     HEADER_SNIFF_BYTES,
@@ -429,10 +429,6 @@ def _err(text: str) -> None:
     print(text, file=sys.stderr, flush=True)
 
 
-def _money(milli: int, currency: str | None = None, *, sign: bool = False) -> str:
-    return format_money(milli, currency, sign=sign)
-
-
 def _clip(text: str | None, width: int = 40) -> str:
     text = (text or "").strip()
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -446,14 +442,14 @@ def _limited(items: Sequence[Any], render: Callable[[Any], str], limit: int) -> 
 
 
 def _tx_line(mark: str, tx: TxRef, suffix: str = "") -> str:
-    return f"  {mark} {tx.date}  {_money(tx.amount):>12}  {_clip(tx.payee)}{suffix}"
+    return f"  {mark} {tx.date}  {format_money(tx.amount):>12}  {_clip(tx.payee)}{suffix}"
 
 
 def _field_value(name: str, value: Any) -> str:
     if value is None or value == "":
         return "(none)"
     if name == "amount" and isinstance(value, int) and not isinstance(value, bool):
-        return _money(value)
+        return format_money(value)
     return str(value)
 
 
@@ -643,7 +639,7 @@ def format_budgets(budgets: Sequence[BudgetSummary]) -> list[str]:
 def format_accounts(accounts: Sequence[YnabAccount]) -> list[str]:
     lines = [f"Found {len(accounts)} open account(s):", ""]
     for account in accounts:
-        balance = _money(account.balance) if account.balance is not None else "?"
+        balance = format_money(account.balance) if account.balance is not None else "?"
         lines += [
             f"  Name:    {account.name}",
             f"  ID:      {account.id}",
@@ -659,15 +655,18 @@ def format_reconcile_preview(preview: ReconcilePreview) -> list[str]:
     lines = [f"Statement: {preview.csv_name} (balance as of {preview.as_of})"]
     lines += _table(
         [
-            ("Statement balance", _money(preview.csv_balance, cur)),
-            (f"YNAB cleared balance on {preview.as_of}", _money(preview.ynab_cleared_as_of, cur)),
-            ("Difference", _money(preview.delta, cur, sign=True)),
+            ("Statement balance", format_money(preview.csv_balance, cur)),
+            (
+                f"YNAB cleared balance on {preview.as_of}",
+                format_money(preview.ynab_cleared_as_of, cur),
+            ),
+            ("Difference", format_money(preview.delta, cur, sign=True)),
         ]
     )
     if preview.cleared_after_as_of:
         lines.append(
-            f"   (YNAB's cleared balance today is {_money(preview.ynab_cleared_now, cur)}; "
-            f"{_money(preview.cleared_after_as_of, cur, sign=True)} of it is dated after "
+            f"   (YNAB's cleared balance today is {format_money(preview.ynab_cleared_now, cur)}; "
+            f"{format_money(preview.cleared_after_as_of, cur, sign=True)} of it is dated after "
             f"{preview.as_of} and not compared)"
         )
     if preview.problems:
@@ -677,7 +676,7 @@ def format_reconcile_preview(preview: ReconcilePreview) -> list[str]:
 
 
 def _adjustment_line(adjustment: AdjustmentResult, currency: str | None) -> str:
-    delta = _money(adjustment.delta_milli, currency, sign=True)
+    delta = format_money(adjustment.delta_milli, currency, sign=True)
     if adjustment.outcome == OUTCOME_CREATED:
         return f"✓ Posted '{adjustment.payee}' {delta} dated {adjustment.date} ({adjustment.import_id})."
     if adjustment.outcome == OUTCOME_DUPLICATE:
@@ -705,7 +704,7 @@ def format_cleanup_result(result: CleanupResult, *, limit: int = LIST_LIMIT) -> 
             _limited(
                 result.candidates,
                 lambda f: (
-                    f"  {f.date}  {_money(f.amount):>12}  {_clip(f.payee_name)}: "
+                    f"  {f.date}  {format_money(f.amount):>12}  {_clip(f.payee_name)}: "
                     f"{f.old_memo!r} → {f.new_memo!r}"
                 ),
                 limit,
@@ -737,17 +736,34 @@ def format_cleanup_result(result: CleanupResult, *, limit: int = LIST_LIMIT) -> 
     return lines
 
 
-def _amount_text(amount: Decimal) -> str:
-    text = format(amount.normalize(), "f")
-    return text
+# Crypto amounts and prices are shown exactly as the bot's /crypto shows them
+# (bot/render.py ``_amount`` / ``_price``), so both surfaces agree on every digit.
+_QUANTITY_QUANTUM: Final = Decimal("0.00000001")
+
+
+def _quantity_text(amount: Decimal) -> str:
+    """A coin amount with at most 8 decimals and no trailing zeros: ``0.12345679``."""
+    try:
+        return format(amount.quantize(_QUANTITY_QUANTUM).normalize(), "f")
+    except InvalidOperation:  # more digits than the decimal context holds
+        return str(amount)
+
+
+def _price_text(price: Decimal) -> str:
+    """A CHF price as milliunits through :func:`format_money` (half away from zero), like
+    every other amount: ``Decimal("0.125")`` → ``"0.13"``."""
+    try:
+        return format_money(decimal_to_milli(price))
+    except (TypeError, ValueError):  # not finite, or too large for a milliunit amount
+        return str(price)
 
 
 def format_crypto_result(result: CryptoSyncResult) -> list[str]:
     lines = ["Crypto portfolio (CHF):"]
     for holding in result.holdings:
         lines.append(
-            f"   {holding.symbol:<6} {_amount_text(holding.amount):>18} × "
-            f"{format_money_decimal(holding.price):>12} = {_money(holding.value_milli):>14}"
+            f"   {holding.symbol:<6} {_quantity_text(holding.amount):>18} × "
+            f"{_price_text(holding.price):>12} = {format_money(holding.value_milli):>14}"
         )
     if result.zero_balances:
         lines.append(f"   No balance: {', '.join(result.zero_balances)}")
@@ -758,15 +774,15 @@ def format_crypto_result(result: CryptoSyncResult) -> list[str]:
         )
     lines += _table(
         [
-            ("Portfolio value", _money(result.portfolio_milli, "CHF")),
-            ("YNAB balance (before)", _money(result.ynab_before_milli, "CHF")),
-            ("Difference", _money(result.adjustment.delta_milli, "CHF", sign=True)),
+            ("Portfolio value", format_money(result.portfolio_milli, "CHF")),
+            ("YNAB balance (before)", format_money(result.ynab_before_milli, "CHF")),
+            ("Difference", format_money(result.adjustment.delta_milli, "CHF", sign=True)),
         ]
     )
     if result.ynab_uncleared_milli:
         lines.append(
             "   (YNAB's balance includes uncleared "
-            f"{_money(result.ynab_uncleared_milli, 'CHF', sign=True)})"
+            f"{format_money(result.ynab_uncleared_milli, 'CHF', sign=True)})"
         )
     lines.extend(f"  ! {warning}" for warning in result.warnings)
     lines.append(_adjustment_line(result.adjustment, "CHF"))
@@ -778,18 +794,13 @@ def format_brokerage_result(result: BrokerageSyncResult) -> list[str]:
         f"IBKR account {result.ibkr_account_id}:",
         *_table(
             [
-                ("Net asset value", _money(result.nav_milli, "CHF")),
-                ("YNAB balance (before)", _money(result.ynab_before_milli, "CHF")),
-                ("Difference", _money(result.adjustment.delta_milli, "CHF", sign=True)),
+                ("Net asset value", format_money(result.nav_milli, "CHF")),
+                ("YNAB balance (before)", format_money(result.ynab_before_milli, "CHF")),
+                ("Difference", format_money(result.adjustment.delta_milli, "CHF", sign=True)),
             ]
         ),
         _adjustment_line(result.adjustment, "CHF"),
     ]
-
-
-def format_money_decimal(value: Decimal) -> str:
-    """A CHF price with grouping and two decimals (display only)."""
-    return f"{value:,.2f}"
 
 
 # ─── statement selection (v1 confirm_csv_selection) ──────────────────────────
@@ -820,7 +831,9 @@ def describe_csv(path: Path, *, recent: int = 3) -> list[str]:
         lines += ["", "   Most recent transactions:"]
         for row in newest:
             mark = "✓" if row.state == STATE_COMPLETED else "◌"
-            lines.append(f"     {mark} {row.date}  {_money(row.amount):>10}  {_clip(row.payee)}")
+            lines.append(
+                f"     {mark} {row.date}  {format_money(row.amount):>10}  {_clip(row.payee)}"
+            )
     return lines
 
 
@@ -1177,7 +1190,7 @@ def _run_reconcile(run: _Run) -> int:
         return EXIT_OK
     question = (
         f"\nPost a '{PAYEE_RECON}' adjustment of "
-        f"{_money(preview.delta, preview.currency, sign=True)} dated {preview.as_of}? [y/N]: "
+        f"{format_money(preview.delta, preview.currency, sign=True)} dated {preview.as_of}? [y/N]: "
     )
     if not args.yes and not _confirm(question, default=False):
         _err("Nothing was posted.")

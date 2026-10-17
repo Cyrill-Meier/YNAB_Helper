@@ -1,587 +1,406 @@
 # YNAB Helper
 
-A personal-finance assistant that pulls data from Revolut, your Ledger/Ethereum wallets, and Interactive Brokers into [YNAB](https://www.ynab.com/). Runs either as a **Telegram bot** (recommended — multi-user, phone-first, no laptop required) or as a **command-line tool** on your own machine.
+Imports Revolut account statements (CSV) into [YNAB](https://www.ynab.com/) and keeps them
+in sync, with a Telegram bot, a small web dashboard and a command-line tool on top of one
+shared service layer. It also posts balance adjustments for a crypto wallet (BTC/ETH/ERC-20)
+and an Interactive Brokers account into YNAB tracking accounts.
 
-- **Telegram bot** — Share a Revolut CSV straight from your phone to the bot and it lands in YNAB. Run `/crypto` to refresh your wallet-backed tracking account. Multi-tenant: each user has their own YNAB config and data.
-- **CLI** — Everything the bot does, scripted. Useful for local imports, cron jobs, or power-user workflows with IBKR, watch folders, and reconciliation.
+Version 2.0.0 is a rework of v1 that fixes the review findings listed in
+[CHANGELOG.md](CHANGELOG.md). It runs on the same host layout, the same `bot.env` and the same
+data directory; the first start migrates the data in place (with backups). Before deploying it
+over v1, read [The first v2 deploy](docs/OPERATIONS.md#the-first-v2-deploy).
+
+| Part | What it does |
+|---|---|
+| Telegram bot | Send it a Revolut CSV and it lands in YNAB. Also `/reconcile`, `/dedupe`, `/status`, `/crypto`, and more. Several users, each with their own YNAB token, budget and account, approved by the admin. |
+| Web UI | Dashboard, accounts, transactions, spending, subscriptions, CSV upload, reconcile, dedupe and settings. You sign in with a one-time button from the bot (`/login`). |
+| CLI | `python3 revolut_to_ynab.py` with every v1 flag: import, watch a folder, reconcile, crypto and IBKR sync, and more. |
+
+Documentation:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): module map, data model, import pipeline,
+  threading, security model and testing.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): deploying, the first v2 deploy, rollback,
+  backups, logs, health checks and dependency updates.
+- [docs/DESIGN.md](docs/DESIGN.md): the v2 specification, with an appendix of deviations.
+- [CHANGELOG.md](CHANGELOG.md) and [PENTEST_REPORT.md](PENTEST_REPORT.md) (now with a
+  status table).
 
 ## Contents
 
-- [Quick start (Telegram bot via Docker)](#quick-start-telegram-bot-via-docker)
-- [Web dashboard (optional)](#web-dashboard-optional)
-- [Commands](#commands)
-- [Crypto portfolio sync](#crypto-portfolio-sync)
-- [Interactive Brokers NAV sync](#interactive-brokers-nav-sync)
-- [CLI mode](#cli-mode)
-- [Configuration reference](#configuration-reference)
-- [Operations](#operations)
-- [Architecture](#architecture)
-- [Security & privacy](#security--privacy)
+- [Quick start (Docker)](#quick-start-docker)
+- [Configuration](#configuration)
+- [Telegram commands](#telegram-commands)
+- [Web UI](#web-ui)
+- [CLI](#cli)
+- [How imports work](#how-imports-work)
+- [Crypto and IBKR](#crypto-and-ibkr)
 - [Development](#development)
 
 ---
 
-## Quick start (Telegram bot via Docker)
+## Quick start (Docker)
 
-This is the canonical deployment: a small Linux host running Docker, pulling the prebuilt image from GHCR. AWS Lightsail ($5/month), Hetzner, a Raspberry Pi, a Synology NAS, or any VPS will all work.
+The image is `ghcr.io/cyrill-meier/ynab_helper` (`:latest`, plus one `:<short sha>` tag per
+published commit; built for linux/amd64). The host layout is the one production uses:
 
-### 1. Create the Telegram bot
-
-1. In Telegram, search for **@BotFather** → send `/newbot` → follow the prompts → copy the bot token.
-2. Search for **@userinfobot** → send `/start` → copy your numeric user ID. That's your admin ID.
-
-#### Optional — polish the bot's profile in BotFather
-
-The bot pushes its slash-command list to Telegram automatically on every startup (via `setMyCommands`), so users get autocomplete when they type `/` — and admin-only commands are scoped to the admin chat. The remaining BotFather settings are pure UX polish; do them once:
-
-| BotFather menu | What to set |
-| --- | --- |
-| `/mybots` → *Edit Bot* → *Edit Description* | Short intro shown above an empty chat. e.g. *"Forward your Revolut CSV → it lands in YNAB."* |
-| *Edit About* | One-liner shown in the bot's profile. e.g. *"Personal Revolut → YNAB importer with crypto + IBKR sync."* |
-| *Edit Botpic* | A 512×512 image. The Revolut/YNAB logos work fine; or anything recognizable. |
-| `/setcommands` | **Skip** — the bot does this itself. Don't override it here or your edits will be overwritten on the next restart. |
-| *Bot Settings* → *Menu Button* | Default ("show commands") is fine. The bot's commands feed straight into this. |
-
-### 2. Prepare the host
-
-On a fresh Ubuntu 24.04 VM (Lightsail, EC2, Hetzner, etc.):
-
-```bash
-sudo apt update
-sudo apt install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-sudo chmod a+r /etc/apt/keyrings/docker.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo usermod -aG docker $USER
-newgrp docker
+```
+~/ynab-bot/
+  docker-compose.yml   the bot, Caddy and Watchtower (reference: docker-compose.yml in this repo)
+  Caddyfile            HTTPS reverse proxy for the web UI (reference: Caddyfile in this repo)
+  bot.env              your settings and secrets, chmod 600 (template: .env.example)
+  bot_data/            created on first start: databases, statements, backups, bot.log
 ```
 
-### 3. Configure the bot
+If a server already runs v1 with its own compose file and Caddyfile, keep them: v2 needs no
+change on the host. [docs/OPERATIONS.md](docs/OPERATIONS.md#optional-host-side-improvements)
+lists the optional improvements.
+
+**1. Create the Telegram bot.** In Telegram, ask @BotFather for `/newbot` and copy the token.
+Ask @userinfobot for your numeric user id; this is the admin id. The bot registers its command
+menu itself on every start, so do not set `/setcommands` in BotFather.
+
+**2. Write `bot.env`.**
 
 ```bash
 mkdir -p ~/ynab-bot && cd ~/ynab-bot
-mkdir -p bot_data
-cat > bot.env <<'EOF'
-# ── Telegram (required) ────────────────────────────
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234...
-TELEGRAM_ADMIN_ID=123456789
-
-# ── Auto-register admin (optional — skip in-chat onboarding for yourself) ──
-YNAB_TOKEN=your-ynab-pat
-YNAB_BUDGET_ID=your-budget-id
-YNAB_ACCOUNT_ID=your-revolut-account-id
-
-# ── Auto-register admin crypto config (optional) ──
-YNAB_CRYPTO_ACCOUNT_ID=your-tracking-account-id
-CRYPTO_BTC_XPUB=xpub6C8BFPB...
-CRYPTO_ETH_ADDRESS=0x2a1EC41E...
-# ANKR_API_KEY=                         # only if ETH public RPCs rate-limit you
-
-# ── Logging ────────────────────────────────────────
-LOG_LEVEL=INFO
-LOG_FILE=/app/bot_data/bot.log
-EOF
-
-curl -O https://raw.githubusercontent.com/Cyrill-Meier/YNAB_Helper/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/Cyrill-Meier/YNAB_Helper/main/docker-compose.yml
+curl -fsSLO https://raw.githubusercontent.com/Cyrill-Meier/YNAB_Helper/main/Caddyfile
+curl -fsSL -o bot.env https://raw.githubusercontent.com/Cyrill-Meier/YNAB_Helper/main/.env.example
+chmod 600 bot.env
 ```
 
-If you don't yet know your budget/account IDs, leave the `YNAB_*` lines out — new users (including you) can onboard entirely in chat with `/setup`.
+Set at least `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ADMIN_ID`. The template already sets
+`LOG_FILE=/app/bot_data/bot.log`. To skip the in-chat onboarding for yourself, also set `YNAB_TOKEN`, `YNAB_BUDGET_ID` and
+`YNAB_ACCOUNT_ID` (the admin is then registered from them). For the web UI, set
+`WEB_UI_ENABLED=1`, `WEB_UI_PUBLIC_URL=https://bot.example.com` and a `WEB_UI_SECRET_KEY` of at
+least 32 characters:
 
-### 4. Start it
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+**3. Set up the web UI's hostname (optional).** Point a DNS record at the host, open TCP 80
+and 443 in the cloud firewall (80 is needed for Let's Encrypt), and replace `bot.example.com`
+in the `Caddyfile`. The bot's port 8080 is never published on the host; Caddy reaches it over
+the compose network.
+
+**4. Start it.**
 
 ```bash
 docker compose up -d
+docker logs -f revolut-ynab-bot
 ```
 
-The bot sends you a startup DM with the running version number. Watchtower polls GHCR every 5 minutes and auto-updates the bot on new releases.
+The admin gets a DM such as `🚀 Bot started v2.0.0 (abc1234, 2026-10-17 09:00 UTC) — web UI:
+enabled at https://bot.example.com`. This message is also the deploy notification. Watchtower
+then pulls every new `:latest` within 5 minutes. Other people message the bot, you get a
+notice, and you `/approve <id>` them.
 
-Stop everything with `docker compose down`. Persistent data lives in `./bot_data/` and survives restarts and image updates.
+The container starts as root only to take ownership of `bot_data/` (it becomes uid/gid
+10001, mode 0700/0600) and to read `bot.env`. It then drops to uid 10001 for good. Reading
+`bot_data/bot.log` on the host therefore needs `sudo`.
 
 ---
 
-## Web dashboard (optional)
-
-Alongside the Telegram bot, the same container can run a FastAPI web app with:
-
-- A clean dashboard (balance, transaction count, last import, last CSV)
-- Searchable / paginated transactions table
-- Drag-and-drop CSV upload (mirrors the Telegram CSV flow)
-- One-click reconcile
-- A much nicer dedupe view (multi-select with checkboxes, bulk delete with confirm)
-- Settings (auto-approve toggle)
-
-Auth is **bot-mediated** — no password, no email. Send `/login` in Telegram, the bot replies with a single-use URL that expires in 5 minutes. Click it once → cookie session → done.
-
-The included `docker-compose.yml` bundles a **Caddy** sidecar that terminates HTTPS on port 443 and reverse-proxies to the bot's web UI on the internal network. Caddy auto-provisions and renews Let's Encrypt certificates — no certbot, no nginx config reloads.
-
-### 1. Point a DNS record at the host
-
-Create an A record (or AAAA, or CNAME) for the hostname you want, e.g. `bot.example.com` → your host's public IP. Verify with:
-
-```bash
-dig +short bot.example.com
-```
-
-### 2. Open ports 80 and 443 on the cloud firewall
-
-Caddy needs both: port 80 for Let's Encrypt's HTTP-01 challenge, port 443 for the actual site. Note that the host's UFW (or equivalent) is irrelevant if your cloud provider firewall is closed.
-
-| Provider | Where to open |
-| --- | --- |
-| AWS Lightsail | Lightsail console → instance → *Networking* → add HTTP + HTTPS rules |
-| AWS EC2 | EC2 console → Security Groups → inbound: 80/tcp + 443/tcp from 0.0.0.0/0 |
-| Hetzner Cloud | Cloud console → Firewalls → inbound: TCP 80 + TCP 443 |
-| DigitalOcean | Networking → Firewalls → inbound: TCP 80 + TCP 443 |
-| Bare-metal / no cloud firewall | `sudo ufw allow 80,443/tcp` |
-
-### 3. Edit the `Caddyfile`
-
-In your deploy directory (next to `docker-compose.yml`), put a `Caddyfile` with your hostname:
-
-```caddyfile
-bot.example.com {
-    reverse_proxy revolut-ynab-bot:8080
-    header {
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
-        X-Content-Type-Options "nosniff"
-        Referrer-Policy "strict-origin-when-cross-origin"
-        X-Frame-Options "DENY"
-        -Server
-    }
-}
-```
-
-Use the [`Caddyfile`](Caddyfile) from this repo as a starting point. Set the global `email` directive to your address if you want Let's Encrypt expiry warnings.
-
-### 4. Configure the web UI in `bot.env`
-
-```bash
-WEB_UI_ENABLED=1
-WEB_UI_PUBLIC_URL=https://bot.example.com
-# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-WEB_UI_SECRET_KEY=put_a_random_48_byte_string_here
-```
-
-Optional knobs (defaults shown): `WEB_UI_HOST=0.0.0.0`, `WEB_UI_PORT=8080`, `WEB_UI_LOGIN_TTL=300`, `WEB_UI_SESSION_TTL=1800`, `WEB_UI_ALLOWED_IPS=` (comma-separated CIDRs). See `.env.example` for the full list.
-
-### 5. Restart
-
-```bash
-docker compose up -d
-docker compose logs --tail=30 caddy
-```
-
-You'll see Caddy provision the cert (~30 s on first run; subsequent restarts reuse the cert from the persistent `caddy_data` volume). In Telegram, send `/login` → tap the URL → you're in.
-
-### Security notes
-
-- Login URL tokens are **single-use** and stored hashed (SHA-256) in the bot DB.
-- Session cookies are HttpOnly, `SameSite=Lax`, and `Secure` when the public URL is HTTPS.
-- All state-changing endpoints require a CSRF header derived from the session cookie (double-submit pattern).
-- A simple in-process rate limiter caps `/auth` at 10 attempts/minute/IP.
-- Caddy adds HSTS, `X-Content-Type-Options`, `Referrer-Policy`, and `X-Frame-Options: DENY` to every response.
-- Optional `WEB_UI_ALLOWED_IPS` env var if you want to limit further (e.g. only your home network).
-- Don't forget — the `caddy_data` named volume holds the issued certificate. Keep it; rebuilding it from scratch hits Let's Encrypt's per-week issuance rate limits.
-
----
-
-## Commands
-
-### User commands
-
-Everything below is sent from your personal Telegram to the bot.
-
-| Command | What it does |
-|---|---|
-| *(send a CSV attachment)* | Import a Revolut statement into YNAB. The bot diffs against past imports so duplicates are skipped. |
-| `/reconcile` | Reconcile the YNAB balance against the last CSV you uploaded. |
-| `/cleanup_pending` | Scan YNAB and strip `(pending)` memos from transactions that have since cleared. Useful after a fresh deploy or DB wipe. |
-| `/status` | Show current YNAB balance and last-import state. |
-| `/setup` | Re-run onboarding — change your YNAB token, budget, or account. |
-| `/crypto` | Refresh BTC + ETH + ERC-20 balances, update the tracking account. |
-| `/crypto_setup` | Configure your BTC xpub, ETH address, and tracking account. |
-| `/crypto_status` | Show the currently configured crypto wallets (redacted). |
-| `/help` | List commands plus the running version. |
-
-### Admin commands
-
-Only the user whose ID matches `TELEGRAM_ADMIN_ID` can run these.
-
-| Command | What it does |
-|---|---|
-| `/approve <user_id>` | Approve a pending user — they get a welcome DM and move into onboarding. |
-| `/deny <user_id>` | Deny a pending user — they receive a polite rejection. |
-| `/users` | List all registered users with their current state (`ready`, `awaiting_token`, etc.). |
-
-### New-user onboarding flow
-
-1. New user messages the bot with `/start`.
-2. Bot replies with "request sent" and DMs the admin with the user's name + ID.
-3. Admin runs `/approve <user_id>` (or `/deny <user_id>`).
-4. Approved user is prompted for their **YNAB Personal Access Token** — get it at [app.ynab.com](https://app.ynab.com) → *Account Settings* → *Developer Settings* → *New Token*.
-5. Bot validates the token and offers a list of budgets — the user picks one.
-6. Bot lists accounts in that budget — the user picks their Revolut account.
-7. Done — the user can now send CSVs and run all commands.
-
-Users can re-run `/setup` at any time to switch budget/account without admin involvement.
-
----
-
-## Crypto portfolio sync
-
-Track the on-chain value of your Ledger (or any BTC/ETH/ERC-20) portfolio in a YNAB **tracking account**. No exchange API keys, no write access to wallets — xpubs and public addresses only.
-
-### What gets synced
-
-- **BTC** — all addresses derived locally from your BIP84 xpub (native SegWit `bc1…`), queried via Blockstream. Scans until 20 consecutive unused addresses (standard gap limit).
-- **ETH** — native balance via public JSON-RPC (8 fallback endpoints; authenticated Ankr first if `ANKR_API_KEY` is set).
-- **ERC-20 tokens** — AAVE, USDC, USDT, and aUSDT from the same ETH address.
-- **Prices** — CoinGecko (public API, no key), in CHF.
-- **Write to YNAB** — a single adjustment transaction in the tracking account so its balance matches the on-chain portfolio value. The `import_id` includes the date, so re-runs on the same day deduplicate.
-
-### Setup (via the bot)
-
-1. In YNAB, add a **Tracking → Asset** account (e.g. "Crypto").
-2. In Telegram, run `/crypto_setup`.
-3. Pick that account from the list the bot shows you.
-4. Paste your **BTC xpub** (or a single bech32 address) — or type `skip` to disable BTC tracking.
-5. Paste your **Ethereum address** (`0x…`) — or `skip`.
-6. Run `/crypto` any time to refresh. The bot fetches, prices, adjusts, and DMs back a summary.
-
-### Where to get an xpub
-
-- **Ledger Live** → select your Bitcoin account → *Edit* (wrench icon) → *Advanced* → *Extended Public Key* → copy.
-- The xpub lets anyone **view** all your addresses and balances — it does **not** allow spending.
-
-### Troubleshooting
-
-- **"Blockstream error: HTTP 429"** — rate-limited. The sync retries with exponential backoff (1/2/4/8 s) up to 5 times before giving up. If your host IP has been hammered recently, wait 10 minutes and try again, or deploy on a different host.
-- **"All ETH RPC endpoints failed"** — all 8 public endpoints are down or blocking you. Sign up at [ankr.com/rpc](https://www.ankr.com/rpc/) (free tier), drop the key into `ANKR_API_KEY`, and restart.
-- **`/crypto_status` shows nothing** — onboarding didn't complete. Re-run `/crypto_setup`.
-
----
-
-## Interactive Brokers NAV sync
-
-Track your IBKR portfolio Net Asset Value in a YNAB tracking account. **CLI only** for now — requires the IB Client Portal Gateway running locally on the same machine as the script.
-
-### Prerequisites
-
-1. Download the **[IB Client Portal Gateway](https://www.interactivebrokers.com/en/trading/ib-api.php)**.
-2. Start it: `bin/run.sh root/conf.yaml` (listens on port 5050).
-3. Authenticate in your browser at `https://localhost:5050`.
-
-### Config
-
-```dotenv
-YNAB_BROKERAGE_ACCOUNT_ID=your-brokerage-tracking-account-id
-# Optional — auto-detected if omitted:
-IBKR_ACCOUNT_ID=U1234567
-# Optional — default is https://localhost:5050:
-IBKR_BASE_URL=https://localhost:5050
-```
-
-### Run
-
-```bash
-python3 revolut_to_ynab.py --brokerage-sync              # real
-python3 revolut_to_ynab.py --brokerage-sync --dry-run    # preview only
-```
-
-The script pulls total NAV in CHF, compares to the YNAB tracking account, and posts an adjustment transaction for the difference.
-
----
-
-## CLI mode
-
-Everything the bot does (minus approvals) is available from the command line. Useful for cron, scripting, or a single-user setup without Telegram.
-
-### First-time setup
-
-```bash
-cp .env.example .env        # fill in YNAB_TOKEN, IDs, etc.
-python3 revolut_to_ynab.py --list-budgets
-python3 revolut_to_ynab.py --list-accounts --budget-id <id>
-```
-
-### Common invocations
-
-```bash
-# One-shot import
-python3 revolut_to_ynab.py ~/Downloads/account-statement*.csv
-
-# Dry run (no writes to YNAB)
-python3 revolut_to_ynab.py --dry-run ~/Downloads/account-statement*.csv
-
-# Let the script auto-pick the newest CSV in CSV_DIR (~/Downloads by default)
-python3 revolut_to_ynab.py
-
-# Watch mode — auto-import when a new CSV appears in a folder
-python3 revolut_to_ynab.py --watch ~/Downloads
-
-# Sync remote YNAB changes into the local dedup DB
-python3 revolut_to_ynab.py --sync --since-date 2026-01-01
-
-# Reconcile local state against YNAB balance
-python3 revolut_to_ynab.py --reconcile
-
-# Strip stale "(pending)" memos from transactions that have since cleared
-python3 revolut_to_ynab.py --cleanup-pending-memos
-python3 revolut_to_ynab.py --cleanup-pending-memos --dry-run
-
-# Crypto sync
-python3 revolut_to_ynab.py --crypto-sync
-python3 revolut_to_ynab.py --crypto-sync --dry-run
-
-# Non-interactive (skip all prompts, e.g. in cron)
-python3 revolut_to_ynab.py -y
-```
-
-### All flags
-
-Run `python3 revolut_to_ynab.py --help` for the full list. Notable ones:
-
-- `--skip-pending` — ignore pending transactions (they often re-export with different amounts).
-- `--db-stats` — show local dedup DB statistics.
-- `--db-path` / `--log-file` / `--log-level` — override paths and logging verbosity.
-- `--csv-dir` — look for new CSVs somewhere other than `~/Downloads`.
-
----
-
-## Configuration reference
-
-All settings can be provided via environment variables (exported, `.env` file, or Docker `env_file`). Shell-exported values take precedence over `.env`.
-
-### Core YNAB
-
-| Variable | Purpose |
-|---|---|
-| `YNAB_TOKEN` | Personal Access Token. Required for CLI; optional for bot (each bot user has their own). |
-| `YNAB_BUDGET_ID` | Budget containing your Revolut account. |
-| `YNAB_ACCOUNT_ID` | YNAB account ID for your Revolut account. |
-
-### Crypto sync (optional)
-
-| Variable | Purpose |
-|---|---|
-| `YNAB_CRYPTO_ACCOUNT_ID` | Tracking account ID to hold the on-chain portfolio value. |
-| `CRYPTO_BTC_XPUB` | BIP84 extended public key (`xpub…`, `ypub…`, `zpub…`) or a single bech32 address. |
-| `CRYPTO_ETH_ADDRESS` | Ethereum address. Used for native ETH + AAVE/USDC/USDT/aUSDT. |
-| `ANKR_API_KEY` | Optional — prepends an authenticated Ankr RPC endpoint ahead of the public fallbacks. |
-
-### Interactive Brokers sync (CLI only)
-
-| Variable | Purpose |
-|---|---|
-| `YNAB_BROKERAGE_ACCOUNT_ID` | Tracking account ID for brokerage NAV. |
-| `IBKR_BASE_URL` | IB Client Portal Gateway URL. Default `https://localhost:5050`. |
-| `IBKR_ACCOUNT_ID` | IB account like `U1234567`. Auto-detected from the gateway if omitted. |
+## Configuration
+
+Settings come from the environment and from `/app/.env` (that is, `bot.env`; the CLI reads
+`.env` next to the code). Variables that are already set in the environment win over the
+file. The file format is v1's: `KEY=VALUE`, an optional `export ` prefix, quotes, and ` #`
+comments after unquoted values. A malformed optional value is replaced by its default and
+reported in the log. If it is a web variable, the web UI stays off and the startup DM says why.
+Missing or malformed `TELEGRAM_*` variables stop the bot with a clear message.
+
+The bot reads `bot.env` only at startup. After changing it, run
+`docker restart revolut-ynab-bot`; `docker compose up -d` does not notice a change inside a
+mounted file (see [OPERATIONS.md](docs/OPERATIONS.md#changing-botenv)).
 
 ### Telegram bot
 
-| Variable | Purpose |
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | required | bot | From @BotFather. |
+| `TELEGRAM_ADMIN_ID` | required | bot | Your positive numeric Telegram user id. Admin commands only work for this id. |
+| `TELEGRAM_API_BASE` | `https://api.telegram.org` | bot | **Tests and smoke runs only.** Never set this in production. |
+
+### YNAB (CLI defaults and admin auto-registration)
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `YNAB_TOKEN` | — | CLI; bot (admin auto-register) | Personal access token (app.ynab.com → Account Settings → Developer Settings). Bot users enter their own token in chat. |
+| `YNAB_BUDGET_ID` | — | CLI; bot (admin auto-register) | `--list-budgets` shows the ids. |
+| `YNAB_ACCOUNT_ID` | — | CLI; bot (admin auto-register) | The Revolut account in YNAB (`--list-accounts`). |
+
+When all three are set, the admin is made a ready user at startup. This happens only if the
+admin's row is missing or not ready, so a setup chosen in the bot is never overwritten.
+
+### Crypto and IBKR
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `YNAB_CRYPTO_ACCOUNT_ID` | — | CLI `--crypto-sync`; bot (admin auto-register) | The YNAB tracking account that holds the portfolio value. |
+| `CRYPTO_BTC_XPUB` | — | same | xpub, ypub or zpub, or a single BTC address. Validated (checksum, version, curve). |
+| `CRYPTO_ETH_ADDRESS` | — | same | Native ETH plus AAVE, USDC, USDT and aUSDT. |
+| `ANKR_API_KEY` | — | crypto sync (bot and CLI) | Optional. Adds an authenticated Ankr RPC before the public endpoints. |
+| `YNAB_BROKERAGE_ACCOUNT_ID` | — | CLI `--brokerage-sync` | Tracking account for the IBKR NAV. |
+| `IBKR_BASE_URL` | `https://localhost:5050` | CLI | IB Client Portal Gateway. TLS is verified except for localhost, 127.0.0.1 and ::1. |
+| `IBKR_ACCOUNT_ID` | first account of the gateway | CLI | For example `U1234567`. |
+
+### Web UI
+
+| Variable | Default | Notes |
+|---|---|---|
+| `WEB_UI_ENABLED` | `0` | `1`, `true`, `yes` or `on` starts the web server inside the bot process. |
+| `WEB_UI_HOST` | `0.0.0.0` | Bind address inside the container. |
+| `WEB_UI_PORT` | `8080` | |
+| `WEB_UI_PUBLIC_URL` | required when enabled | For example `https://bot.example.com`, without a query or fragment; a trailing `/` is removed. Telegram only accepts public URLs for the sign-in button. |
+| `WEB_UI_SECRET_KEY` | required when enabled | At least 32 characters. HMAC key for login tokens, sessions and CSRF. Changing it signs everyone out. |
+| `WEB_UI_LOGIN_TTL` | `300` | Seconds a `/login` button stays valid. |
+| `WEB_UI_SESSION_TTL` | `1800` | Idle timeout in seconds (sliding). |
+| `WEB_UI_SESSION_ABS_TTL` | `43200` | Hard session limit in seconds (at least `WEB_UI_SESSION_TTL`; every TTL is at most 400 days). |
+| `WEB_UI_ALLOWED_IPS` | empty (all) | IPs or networks, separated by commas or spaces, for example `203.0.113.7, 192.168.1.0/24`. Fails closed: one bad entry keeps the web UI off. |
+| `WEB_UI_TRUSTED_PROXIES` | `*` | Proxies whose `X-Forwarded-For` is trusted (uvicorn `forwarded_allow_ips`; IPs or networks, comma-separated). `*` trusts any client that reaches port 8080 directly. On production the compose network is shared with other apps, so any container on it can reach `revolut-ynab-bot:8080` and spoof `X-Forwarded-For`. Today that only affects the `/auth` rate-limit key and logged IPs, but it would bypass `WEB_UI_ALLOWED_IPS`: with an allowlist, set Caddy's IP here (and give Caddy a fixed address). |
+
+The web UI only starts when all of these are valid. Otherwise the bot runs without it, and the
+startup DM says `web UI: disabled (configuration problem: …)`.
+
+### Logging, paths and runtime
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `LOG_LEVEL` | `INFO` | all | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` (`WARN` and `FATAL` are accepted). Audit lines (one per YNAB write) are logged at INFO regardless of this setting. |
+| `LOG_FILE` | `~/.revolut_to_ynab.log` | all | Rotated at 5 MB, 5 old files kept. Set it to an empty value to disable the log file (and `/logs`). In Docker use `/app/bot_data/bot.log`, so the host-side log is `bot_data/bot.log` as in v1; with the default it would be `bot_data/.revolut_to_ynab.log`, because inside the container `~` is `/app/bot_data`. |
+| `CSV_DIR` | `~/Downloads` | CLI | Where the CLI looks for the newest statement. |
+| `BOT_DATA_DIR` | `<repo>/bot_data` (`/app/bot_data` in the image) | bot, web, entrypoint, health check | Used as given, with no `~` expansion. |
+| `APP_UID`, `APP_GID` | `10001` | container entrypoint | The unprivileged user the container switches to (0 is refused). |
+| `HEALTHCHECK_MAX_AGE` | `180` | health check | Seconds the bot's heartbeat may be old. |
+| `TZ` | set by compose (`Europe/Zurich`) | all | Local "today" for adjustment dates and the web UI's month boundaries. |
+| `BUILD_SHA`, `BUILD_DATE` | `dev`, `local` | version line | Set by the image build. Do not set them in `bot.env`. |
+
+---
+
+## Telegram commands
+
+The bot only talks in private chats. Every message and every button press goes through one
+authorization gate. Strangers who write to the bot are registered as `pending`, and the admin
+is notified. Buttons from strangers, pending users and denied users do nothing.
+
+### User commands
+
+| Command | What it does |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather. |
-| `TELEGRAM_ADMIN_ID` | Your numeric Telegram user ID — the admin who approves/denies new users. |
-| `BOT_DATA_DIR` | Where the bot keeps its databases. Default `./bot_data/`. Mounted as a Docker volume. |
+| *(send a `.csv` file)* | Imports a Revolut statement (see [How imports work](#how-imports-work)). The reply lists the counts, the changes, the removals, skipped rows, warnings and failures, followed by the account balance. If some writes failed, it ends with "⚠ Partially applied — send the file again to retry". The bot accepts up to 25 MiB, but Telegram only lets bots download files up to 20 MB; upload a larger statement in the web UI. |
+| `/reconcile` | **Two steps.** It first shows a preview: the statement balance on the statement date, YNAB's cleared balance on that date, the difference and any warnings. The buttons are *Post adjustment* and *Cancel*. Only *Post adjustment* creates a `CSV Reconciliation` transaction (cleared `reconciled`, dated the statement date). The newest statement must have been imported successfully; otherwise you are asked to upload it again. The adjustment does not lock other transactions. |
+| `/cleanup_pending` | Removes leftover `(pending)` markers from the memos of cleared or reconciled transactions. It never changes the cleared state and never touches uncleared transactions. |
+| `/dedupe` | Finds importer transactions (`YNAB:…` import ids) inside the newest imported statement's dates that no statement row accounts for. You tick rows in a picker and press *Delete*. A **confirmation view** then lists exactly the selected rows, and only *Yes, delete* deletes them (at most 200 per run). |
+| `/dedupe_delete 1,3-5` or `all` | Selects by number and then shows the same confirmation view; it never deletes directly. Not in the menu. |
+| `/dedupe_cancel` | Discards the selection. Not in the menu. |
+| `/status` | Shows the working, cleared and uncleared balance, the last statement and its import status, the import ledger counts and the last sync. |
+| `/setup` | Re-runs the YNAB setup (token → budget → account) with buttons. Your previous setup stays saved, and `/cancel` restores it. While the setup is open, other commands (imports, `/reconcile`, `/status`, …) are refused, and the web UI does not accept your session (it needs a finished setup). The message with your token is deleted. Changing the token, budget or account signs you out of the web UI. |
+| `/settings` | A menu for auto-approve, crypto setup and YNAB setup. |
+| `/auto_approve [on\|off]` | Whether imported transactions are approved. When off, they land in YNAB's inbox for review. |
+| `/login` | Sends a **sign-in button** for the web UI. It works once, expires after `WEB_UI_LOGIN_TTL`, and is deleted after you sign in. The link is never in the message text, so do not forward the message. |
+| `/logout_all` | Signs you out of the web UI everywhere: all sessions and unused sign-in buttons. |
+| `/crypto` | Values the configured wallets in CHF and posts the difference to the tracking account. |
+| `/crypto_setup` | Sets the tracking account, the BTC xpub or address and the ETH address. Each step offers *Keep current*, *Skip* and *Cancel*, and nothing is saved until the end. |
+| `/crypto_status` | Shows the crypto configuration (masked). |
+| `/cancel` | Leaves the current setup step. |
+| `/help`, `/start` | The command list and the running version. |
 
-### Logging & runtime
+### Admin commands
 
-| Variable | Purpose |
+Admin commands exist only for `TELEGRAM_ADMIN_ID`. For everyone else they are unknown commands.
+
+| Command | What it does |
 |---|---|
-| `LOG_LEVEL` | `DEBUG` / `INFO` (default) / `WARNING` / `ERROR`. |
-| `LOG_FILE` | Path to a log file. Empty string disables file logging. In Docker, use a path under `/app/bot_data/` so it survives. |
-| `CSV_DIR` | Folder the CLI scans for auto-picked Revolut CSVs. Default `~/Downloads`. |
-| `PYTHONUNBUFFERED` | Set to `1` in Docker so logs stream to `docker logs` in real time. Already set in the provided `docker-compose.yml`. |
-| `TZ` | Timezone (e.g. `Europe/Zurich`) — affects timestamps in logs and dedup IDs. |
+| `/approve <id>` | Moves a pending or denied user to the token step and sends them a welcome message. Users who have already completed setup are left alone. |
+| `/deny <id>` | Blocks the user, signs them out of the web UI and drops their open flows. You cannot deny yourself. |
+| `/revoke <id>` | Signs a user out of the web UI without blocking them. |
+| `/users` | Lists the users and their states. |
+| `/logs [N]` | Sends the last N lines of the log as a file (default 500, at most 100,000, reading rotated files as needed). Unavailable only when `LOG_FILE` is set to an empty value. |
+| `/ip` | Shows the host's public IP and hostname. |
+
+Buttons from v1 messages still in your chats either work (`/settings` menus) or expire and
+lose their keyboard (old `/dedupe` pickers).
 
 ---
 
-## Operations
+## Web UI
 
-### Check the running version
+Enabled with `WEB_UI_ENABLED=1`. Sign in with `/login` in the bot. The button opens
+`/auth?t=…`, and a small page there submits the token. If the browser is already signed in,
+that page asks before switching accounts. Sessions expire after 30 minutes idle and 12 hours
+at most.
 
-In Telegram, send `/help` — the first line is the version (e.g. `v1.1.6 (cfabb75, 2026-04-16 20:06 UTC)`). From the host:
+| Page | What it shows |
+|---|---|
+| Dashboard | Working, cleared and uncleared balance of the import account, transaction and ledger counts, the last statement and its import status. |
+| Accounts | Every account of the budget from the YNAB mirror (closed and deleted ones listed separately). |
+| Transactions | Everything YNAB has, for all accounts, with filters for text (payee and memo), state (cleared, reconciled or uncleared), category, account and date range, plus sorting and pagination. |
+| Spending | Spending per category for the last N complete months plus the current month. Transfers, adjustments and split parents are excluded, and refunds are netted. |
+| Subscriptions | Recurring charges (weekly to yearly), price changes and the monthly run-rate. By default it looks back 13 months, so yearly charges are found. |
+| Upload | Import a statement (same import as in Telegram) and see the structured result. |
+| Reconcile | The preview, then a confirmation dialog (*Post adjustment of ±X*). |
+| Dedupe | Scan, select, confirm. Deletes in chunks of 200. |
+| Settings | Auto-approve, the active YNAB setup, *Sign out everywhere*. |
 
-```bash
-docker exec revolut-ynab-bot printenv BUILD_SHA BUILD_DATE
-```
+The data comes from a local mirror of YNAB. Pages refresh it in the background (at most every
+30 s), and *Refresh from YNAB* / *Sync* forces a refresh (at most once per 10 s). YNAB allows 200
+requests per hour per token. When YNAB answers "rate limited", syncs pause until its
+`Retry-After` has passed, up to an hour.
 
-### View logs
-
-```bash
-# Live, real-time
-docker logs -f revolut-ynab-bot
-
-# Last 200 lines
-docker logs --tail=200 revolut-ynab-bot
-
-# Persistent file log (if LOG_FILE=/app/bot_data/bot.log)
-tail -f ~/ynab-bot/bot_data/bot.log
-```
-
-Set `LOG_LEVEL=DEBUG` in `bot.env` and restart (`docker compose up -d`) to get noisier logs when debugging.
-
-### Force an immediate update
-
-Watchtower polls every 5 minutes. To pull a newly built image right now:
-
-```bash
-cd ~/ynab-bot
-docker compose pull
-docker compose up -d --force-recreate revolut-ynab-bot
-```
-
-Or trigger Watchtower manually:
-
-```bash
-docker exec watchtower /watchtower --run-once --cleanup
-```
-
-### Inspect the database
-
-The user DB is `bot_data/bot_users.db`. The bot's slim image has no `sqlite3` CLI, so use Python instead:
-
-```bash
-docker exec revolut-ynab-bot python3 -c "
-import sqlite3
-c = sqlite3.connect('/app/bot_data/bot_users.db')
-c.row_factory = sqlite3.Row
-for r in c.execute('SELECT telegram_user_id, state, budget_name, account_name FROM users'):
-    print(dict(r))"
-```
-
-### Run a crypto sync interactively (skip the Telegram round-trip)
-
-Useful for seeing full output when `/crypto` reports a cryptic failure:
-
-```bash
-docker exec -it revolut-ynab-bot python3 -c "
-import sys, sqlite3, traceback
-sys.path.insert(0, '/app')
-import revolut_to_ynab as r
-c = sqlite3.connect('/app/bot_data/bot_users.db')
-c.row_factory = sqlite3.Row
-row = dict(c.execute(\"SELECT * FROM users WHERE state='ready' LIMIT 1\").fetchone())
-try:
-    r.crypto_sync(row['ynab_token'], row['budget_id'], row['crypto_account_id'],
-                  btc_xpub=row.get('btc_xpub'), eth_address=row.get('eth_address'))
-except Exception:
-    traceback.print_exc()
-"
-```
-
-### Rotate or prune disk
-
-```bash
-docker system prune -af --volumes     # remove stopped containers + dangling images
-docker image prune -f                  # just unused images
-```
-
-Rotate the bot log file if it grows large:
-
-```bash
-mv ~/ynab-bot/bot_data/bot.log ~/ynab-bot/bot_data/bot.log.$(date +%F)
-docker compose restart revolut-ynab-bot
-```
-
-### Private GHCR image
-
-If the repo (and therefore its container image) is private:
-
-```bash
-docker login ghcr.io -u Cyrill-Meier -p <GITHUB_PAT_WITH_PACKAGES_READ>
-```
-
-Watchtower picks up credentials from `~/.docker/config.json` automatically. Alternatively, flip the image package to public under *Package settings → Danger Zone → Change visibility*.
+Security in short: the app sends a strict Content-Security-Policy (only `'self'`, with no
+inline scripts or CDN). Request bodies are size-limited before authentication. Every `/api`
+POST needs the CSRF header. Tokens are stored as HMACs. Details are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#security-model).
 
 ---
 
-## Architecture
+## CLI
 
-### Files
+`python3 revolut_to_ynab.py` keeps every v1 option. It uses its own database
+(`~/.revolut_to_ynab.db`, or `--db-path`) and the `YNAB_*` settings. `--help` lists all options.
 
-- `revolut_to_ynab.py` — the importer and all sync logic (Revolut parsing, YNAB API, crypto, IBKR). Usable standalone via CLI; also imported by the bot.
-- `revolut_ynab_bot.py` — Telegram bot front-end. Handles approvals, onboarding state machine, and per-user execution of the importer.
-- `Dockerfile` — python:3.12-slim base + pycryptodome (required for BTC xpub → bech32 derivation on Debian bookworm, where OpenSSL 3 has disabled legacy RIPEMD160). Build args `BUILD_SHA` and `BUILD_DATE` bake the commit SHA and timestamp into the image so `/help` can display them.
-- `docker-compose.yml` — the bot + Watchtower auto-updater, scoped by label.
-- `.github/workflows/docker-publish.yml` — builds and publishes `ghcr.io/cyrill-meier/ynab_helper:latest` on push to `main`.
+```bash
+python3 revolut_to_ynab.py --list-budgets
+python3 revolut_to_ynab.py --list-accounts --budget-id <id>
+python3 revolut_to_ynab.py ~/Downloads/account-statement_2026-09-01_2026-10-16.csv
+python3 revolut_to_ynab.py                 # newest statement in CSV_DIR, asks to confirm
+python3 revolut_to_ynab.py -y              # same, without asking
+python3 revolut_to_ynab.py statement.csv --dry-run      # show the plan, write nothing
+python3 revolut_to_ynab.py statement.csv --skip-pending # do not create pending rows
+python3 revolut_to_ynab.py --watch ~/Downloads          # import new statements as they appear
+python3 revolut_to_ynab.py --sync                        # refresh the local YNAB mirror
+python3 revolut_to_ynab.py --reconcile                   # preview, then asks before posting
+python3 revolut_to_ynab.py --cleanup-pending-memos [--dry-run]
+python3 revolut_to_ynab.py --crypto-sync [--dry-run] [--allow-zero]
+python3 revolut_to_ynab.py --brokerage-sync [--dry-run]
+python3 revolut_to_ynab.py --db-stats
+```
 
-### Data storage
+- If several mode flags are given, v1's precedence decides which mode runs (`--db-stats` >
+  `--list-budgets` > `--list-accounts` > `--sync` > `--crypto-sync` > `--brokerage-sync` >
+  `--watch` > `--cleanup-pending-memos` > `--reconcile` > import). Options the chosen mode
+  ignores are reported as warnings.
+- `--since-date` is accepted but ignored, because syncs are incremental now.
+  `--skip-pending` only stops creating pending rows; it never deletes pendings already in
+  YNAB. `--dry-run` writes nothing to YNAB or the import ledger.
+- `--watch` imports a file only once its size is stable, retries failed imports later, and
+  waits out YNAB's rate limit.
+- `--reconcile` reconciles against the newest **imported** statement. If you name a file, it
+  must be that statement.
+- Exit codes: `0` success; `1` configuration or usage error, or a declined prompt; `2` the
+  operation failed or was only partly applied; `130` interrupted with Ctrl+C.
 
-Bot data lives in the `bot_data/` directory (mounted as a Docker volume). Each user's data is fully isolated:
+Inside the container, run the CLI through the shim. It drops root privileges the way the
+entrypoint does, so it never leaves root-owned files in `bot_data/`:
 
-- `bot_users.db` — one row per Telegram user with their YNAB token, budget/account selection, crypto config, and onboarding state.
-- `transactions_<telegram_id>.db` — per-user dedup state: which YNAB transactions have been synced locally, which Revolut rows have been imported.
+```bash
+docker exec revolut-ynab-bot python3 revolut_to_ynab.py --db-stats
+docker exec revolut-ynab-bot python3 -m ynab_helper.container cli --list-budgets
+```
 
-### Deduplication
-
-Each transaction gets an `import_id` derived from its date, amount, and payee. YNAB drops duplicates on re-import, so running the same CSV twice is a no-op. The crypto sync uses a date-stamped `import_id` so re-runs within a day update the same adjustment rather than stacking new ones.
-
-**Pending → cleared drift.** When a row is first imported while still pending, its memo gets a `(pending)` tag and `cleared=uncleared`. On a later CSV where that row has cleared, the importer normally sees the state change in the local DB and issues a `PATCH` to strip the marker and flip `cleared`. If the local DB was wiped (fresh VM, deleted volume, etc.), that record is missing — the importer re-POSTs, YNAB returns it as a duplicate, and without intervention the original stale row would stay. The importer now fetches duplicates and patches any whose `cleared` / `memo` / `amount` has drifted. To clean up historic drift that predates this fix, run `/cleanup_pending` (bot) or `--cleanup-pending-memos` (CLI).
-
-**Pending → reverted.** When Revolut reverts a payment (failed or cancelled card authorization), the CSV keeps the row with state `REVERTED`. If that row was previously imported while pending, the importer deletes its YNAB transaction and marks the local record deleted; if it was never imported, it is skipped entirely — reverted payments never reach YNAB. Rows already deleted in YNAB by hand are tolerated (the 404 just updates local state).
-
-**Date-shifted rows.** Revolut renders a row's Started Date in whatever timezone your phone is in *when you export* — an export made in Las Vegas and one made back in Zürich differ by 9 hours on every row, so evening purchases land on the next calendar day. That changes the amount+date-based `import_id` and used to create a YNAB duplicate. The importer now stores each row's full started timestamp, learns the offset between the export and its local DB from the rows that still match by `import_id`, and treats a "new" row as the same transaction when its exact amount+payee exists locally ±1 day linked to YNAB, the old date has vanished from the CSV, and the time difference is exactly one of those observed offsets (a whole multiple of 15 minutes, at most ±14h) — the YNAB row is re-dated via PATCH and the local record re-keyed instead of creating a copy. Rows imported before timestamps were stored fall back to the older "started within 3h of midnight" rule.
-
-**Superseded pendings.** A pending authorization often settles under *different* rows than it was authorized as: a restaurant bill and tip split into two transactions, an FX re-quote changing the amount, one hotel hold splitting into several settlements. The pending's `import_id` then vanishes from the export while the settled rows arrive as new transactions — previously the pending's YNAB copy lingered uncleared forever. Now, a previously-imported pending whose `import_id` has disappeared from the CSV although its date is inside the CSV's window is deleted from YNAB (and listed in the Telegram summary under "Removed"). Pendings older than the CSV window and pendings still present in the export are never touched.
-
-### Auto-update flow
-
-1. You push to `main`.
-2. GitHub Actions builds + pushes `ghcr.io/cyrill-meier/ynab_helper:latest` tagged with the short SHA.
-3. Watchtower (polling every 5 min) sees the new image, pulls it, stops the old bot container, starts the new one.
-4. `bot_data/` persists across swaps via the Docker volume.
+Do not use `python3 -m ynab_helper …` with `docker exec`: it runs as root. Inside the container
+the CLI's database is `/app/bot_data/.revolut_to_ynab.db`, which is separate from the bot
+users' databases and has no imported statement, so `--reconcile` there fails. Use the bot's
+`/reconcile`, or see [OPERATIONS.md](docs/OPERATIONS.md#running-commands-in-the-container)
+for `--db-path` and its caveats.
 
 ---
 
-## Security & privacy
+## How imports work
 
-- **xpubs and public addresses are read-only.** They reveal balances and transaction history; they cannot spend. Still, exposing an xpub compromises your on-chain privacy (anyone with it can see all past and future addresses you'll generate). Don't commit one to a public repo.
-- **YNAB Personal Access Tokens are stored in plain text** in the bot's SQLite database. Anyone with shell access to the host (or the `bot_data/` directory) can read them. Protect the host accordingly — SSH keys only, disk at rest encryption, restrict who has shell access.
-- **Multi-tenant isolation** — user A cannot see or touch user B's data through the bot UI. Shell access to the host bypasses this boundary.
-- **Approve/deny gate** — only the admin (`TELEGRAM_ADMIN_ID`) can onboard new users. Random strangers who message the bot get a pending status and cannot do anything until approved.
-- **No outbound telemetry.** The only external services contacted are YNAB, Blockstream, CoinGecko, and the configured ETH RPC endpoints.
+**Identity.** Every Revolut row gets the same YNAB `import_id` as in v1:
+`YNAB:<amount in milliunits>:<date>:<n>`, where `n` counts rows with the same amount on the
+same day, in file order. YNAB refuses a second transaction with the same import id. That id
+is not a stable identity, though. The date follows the timezone your phone was in when you
+exported, and `n` shifts when a pending row completes, because Revolut sorts by completion
+date. So v2 keeps its own **import ledger** per YNAB account. It recognises a row by its
+**started timestamp and amount**, corrected for the export's timezone offset (learned from
+rows both exports share). For rows that v1 imported without a timestamp, it falls back to
+key, amount and date. A row seen before is updated; a row never seen is created. Statement
+rows for other Revolut products (savings pockets, deposits) are skipped and reported.
+
+**What a statement changes in YNAB:**
+
+| Situation | What happens |
+|---|---|
+| New completed row | Created as cleared. Approved if auto-approve is on. |
+| New pending row | Created as uncleared, with `(pending)` in the memo. |
+| Pending row completed | Set to cleared, and the `(pending)` marker is removed from the memo; the rest of the memo is kept. If it settled at a different amount (FX, tip), the amount is updated, unless you changed the amount in YNAB. |
+| Pending row vanished (settled under other rows) | Deleted from YNAB, but only if it is still uncleared there and the statement covers its date. |
+| Reverted row | Deleted from YNAB if it is still uncleared there; otherwise left alone with a warning. A reverted row that was never imported is never created. |
+| Export made in another timezone | Rows are recognised. If a row's date moved, YNAB is re-dated, but only if YNAB still has the date we wrote and the transaction is not reconciled. |
+| Older statement sent again | Nothing is downgraded, deleted or re-created. Its pending rows change nothing. |
+| `DECLINED`, `FAILED` and other states | Skipped and reported. |
+
+**What is never touched:**
+
+- A cleared or reconciled state is never changed. The importer only moves uncleared to
+  cleared, and `/cleanup_pending` never changes the cleared state.
+- Memos you wrote: only the `(pending)` marker the importer added is ever removed.
+- Your edits: payee, category, approval and flags are never sent after creation. An amount
+  or date you changed in YNAB is not overwritten (the import reports a conflict). Split and
+  reconciled transactions never get amount or date changes.
+- Transactions you deleted in YNAB are never re-created. Transactions you moved to another
+  account are left alone.
+- Transactions the importer did not create.
+
+**Safety rails.** Before planning, every import syncs the YNAB mirror, so each write is
+computed from YNAB's current state; if YNAB is rate limiting, the import stops before writing
+anything. The statement's currency must match the budget's. The account must still exist and
+be open. If some writes fail, the rest still run, local state only records what YNAB
+confirmed, and sending the same file again finishes the job. Each YNAB write is logged as an
+audit line in `bot.log`.
+
+---
+
+## Crypto and IBKR
+
+- **Crypto** (`/crypto`, `--crypto-sync`): BTC from an xpub, ypub or zpub (derived locally,
+  with each script type scanned as it should be; gap limit 20; balances from Blockstream) or
+  from a single address; ETH and ERC-20 balances over public JSON-RPC endpoints with failover;
+  CHF prices from CoinGecko. It posts one `Crypto Portfolio Adjustment`
+  (`CRYPTO:<delta>:<date>:1`) so the tracking account's working balance matches the
+  portfolio. It refuses to post when a price is missing, when the budget is not in CHF, or
+  when the BTC wallet shows no transactions at all while YNAB has a balance. Only the CLI's
+  `--allow-zero` overrides that last check.
+- **IBKR** (CLI only, `--brokerage-sync`): reads the NAV in CHF from a running IB Client
+  Portal Gateway and posts an `IBKR Portfolio Adjustment`. A NAV of zero or less is never
+  posted.
+
+Differences under 0.01 count as in sync, and nothing is posted. The import id is v1's
+(`PREFIX:<delta>:<date>:1`), so a second adjustment with exactly the same amount on the same
+day is refused by YNAB as a duplicate. The bot reports that; it is not an error.
 
 ---
 
 ## Development
 
-### Local Python run
+Python 3.12. The dependencies are hash-locked (`requirements*.txt`, compiled with uv).
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install pycryptodome             # required for BTC xpub derivation
-cp .env.example .env && vim .env
-python3 revolut_to_ynab.py --list-budgets
-python3 revolut_ynab_bot.py
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python --require-hashes -r requirements-dev.txt
+
+.venv/bin/pytest -q                       # ~4,200 tests, offline (network is blocked)
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+bash scripts/build_css.sh                 # rebuild web/static/app.css after changing classes
+bash scripts/build_css.sh --check         # what CI runs; fails if app.css is stale
+.venv/bin/python -m ynab_helper.web.devserver   # web UI on 127.0.0.1:8766 with fake data
 ```
 
-### Build a local image
-
-```bash
-docker build -t ynab-helper:dev \
-  --build-arg BUILD_SHA=$(git rev-parse --short HEAD) \
-  --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%MZ) \
-  .
-```
-
-### Release a new version
-
-1. Bump `__version__` at the top of `revolut_ynab_bot.py`.
-2. Commit the change with a short rationale.
-3. Push to `main`. GitHub Actions builds and publishes. Watchtower picks it up on the next poll (≤ 5 min).
-4. Confirm by sending `/help` in Telegram — the version string on the first line is what's now live.
-
-### Project philosophy
-
-- **Boring dependencies.** Only pycryptodome is required beyond the standard library. Makes the image tiny, cold-starts fast, and supply-chain risk low.
-- **Fail loud, not silent.** Earlier versions used `sys.exit(1)` for error paths, which breaks inside a bot (SystemExit bypasses `except Exception`). All network helpers now raise `RuntimeError` so the bot surfaces a real error message.
-- **Retry transient errors.** Blockstream and ETH RPCs rate-limit. Every external call has bounded retry with exponential backoff before giving up.
-- **Multi-tenant by default.** Even if you're the only user, the bot structure (per-user DB rows, per-user token) means adding family members later is a `/approve` away.
+- The devserver seeds a temporary data directory and serves the real app against an
+  in-process fake YNAB. It prints a sign-in URL, and `/dev/login` mints a new one.
+- `scripts/build_css.sh` downloads the pinned Tailwind standalone CLI (v3.4.17,
+  sha256-verified) into `.cache/`. Use `--offline` to forbid the download. The built CSS is
+  committed.
+- Run the bot or CLI from a checkout with `python3 revolut_ynab_bot.py`,
+  `python3 revolut_to_ynab.py` or `python3 -m ynab_helper [bot|cli|selfcheck]`, using a `.env`
+  in the repository root.
+- Build an image locally with
+  `docker build -t ynab-helper:dev .`, check it with `docker run --rm ynab-helper:dev selfcheck`
+  and `bash scripts/ci_smoke.sh ynab-helper:dev`.
+- Every push to `main` that changes code deploys to production within minutes. Work on a
+  branch, open a PR and let CI pass; see [docs/OPERATIONS.md](docs/OPERATIONS.md#deploy-flow).

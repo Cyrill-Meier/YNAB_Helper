@@ -1,5 +1,13 @@
 # YNAB Helper v2 — design
 
+> **Status: implemented** (v2.0.0, branch `rework/v2`, October 2026). The body below is the
+> specification the implementation was built from, left as written. Where the code
+> deliberately differs or goes further, [Appendix A](#appendix-a--deviations-and-clarifications)
+> says so, and for those details the code is the source of truth. The compatibility
+> constraints in §2 still bind: if the code conflicts with §2, the code has a bug. For an
+> overview, see [ARCHITECTURE.md](ARCHITECTURE.md); for running it, see
+> [OPERATIONS.md](OPERATIONS.md).
+
 Status: implementation spec for the v2 rework (branch `rework/v2`). Every module in
 `ynab_helper/` follows this document. Where this document and the legacy code disagree,
 this document wins — except for the **compatibility constraints** in §2, which are absolute.
@@ -958,3 +966,394 @@ pytest, no network (an autouse fixture makes `urllib.request.urlopen` and socket
 | F86/F87/F88/F89/F90 web auth details | §9.1 |
 | F94 web thread dies silently | serve_in_thread handle |
 | F112 stale version | version.py from build args + `__version__` 2.0.0 |
+
+---
+
+## Appendix A — Deviations and clarifications
+
+Added after implementation. This appendix collects every deliberate difference from the
+sections above that was recorded while each module was built and reviewed, in its final
+form. Items are additions or stricter behaviour unless they say otherwise. For these
+details the code and its tests are authoritative; §2 still binds the code.
+
+### A.0 Production assumptions (§2)
+
+- §2 assumes that browsers enforce the intersection of Caddy's CSP and the app's stricter
+  one. That may be false on production: a plain `Content-Security-Policy` line in a Caddy
+  `header` block that also deletes headers *replaces* the app's policy (verified with Caddy
+  2.11; see the reference `Caddyfile`). v2 still works under the old policy, because it
+  needs no new origin; switching the server's Caddyfile to `?Content-Security-Policy` is an
+  optional host change ([OPERATIONS.md](OPERATIONS.md#optional-host-side-improvements)).
+
+### A.1 Storage and migrations (§4.4, §5)
+
+- `migrate()` skips the backup for a brand-new empty database. A database whose
+  `user_version` is newer than the code is left unchanged, with a warning: migrations are
+  additive, so older code can run on a newer schema.
+- Backups go through a 0600 temp file, are checked with `PRAGMA quick_check` and are then
+  renamed. The newest 10 **per database, across all tags** are kept.
+- The legacy migration is **fail-closed**. An invalid legacy row aborts that database's
+  v0 → v1 step with `MigrationError` naming the key; the file stays at v0, the backup is
+  kept, and `migrate_data_dir` reports the failure per user (startup DM). Bad rows are not
+  skipped, because a skipped row could later be re-created as a duplicate.
+- The migration collapses F02 ghost rows. When several ACTIVE rows in one account share a
+  `ynab_tx_id`, one keeper stays ACTIVE (preferring the one with `started_at`, then the key
+  date equal to the row date, then the oldest); the others become REKEYED with `rekeyed_to`.
+- For keys of the form `YNAB:{milli}:{date}:{n}`, `csv_amount`/`pushed_amount` and
+  `csv_date`/`pushed_date` are taken from the key, not from the legacy columns. v1's web
+  sync had overwritten `amount` and `date` with YNAB's values, so a user's edit would have
+  looked like the CSV's value. Other key shapes use the columns (§5.3).
+- `refresh_from_mirror`:
+  - It sets `ynab_import_id` only when YNAB holds one.
+  - It fills `pushed_*` only while they are unknown.
+  - An UNLINKED entry that resolves to a deleted transaction becomes DELETED_IN_YNAB.
+  - An UNLINKED entry that resolves to a live transaction another entry already links
+    becomes a REKEYED tombstone pointing at the holder. Such keys are listed in
+    `RefreshResult.conflicts`.
+  - ACTIVE entries whose transaction vanished are left for the planner.
+- Extra indexes: `idx_csv_files_account` and `idx_accounts_budget` (and v1's two account
+  indexes on fresh databases).
+- Extra `sync_meta` keys: `budget_currency_checked_at:<budget>` (the daily currency
+  refresh) and `rate_limited_until:<budget>` (the 429 backoff, A.5).
+- `classify_account` follows §6.5 rather than v1: loan and debt types are `credit`, and an
+  unknown type is `cash` when on budget, else `tracking`.
+- `upsert_*` stores the delta cursor in the same transaction as the rows. A *full* listing
+  marks rows that are missing from it as deleted, except when the listing is empty (that is
+  more likely an API glitch). The first sync of a budget, and `full=True`, use
+  `last_knowledge_of_server=0` so that deleted rows arrive too.
+- `MirrorStore.accounts(budget_id)` hides legacy account rows (NULL `budget_id`) until the
+  first sync writes them.
+- `UserStore` refuses to write the legacy `approved` state or any unknown state, but reads all
+  of them. Storage errors (`StorageError`, `RecordNotFound`, `RecordExists`,
+  `MigrationError`) live in `storage/db.py`.
+- `CsvFileStore.set_status` treats `None` as "unchanged", stamps `imported_at` for
+  `imported`/`partial`, and returns the row. The legacy `csv_files` row stores the absolute
+  path and uses the file's mtime as `uploaded_at`.
+
+### A.2 YNAB client and network (§4.2, §4.3)
+
+- A POST is retried on a network error or 5xx only when every row has an `import_id` (YNAB
+  dedupes the replay). PUT, PATCH, DELETE and GET retry as specified.
+- A `Retry-After` above 10 s on a 5xx stops retrying at once. 403 (subscription lapsed or
+  wrong scope) maps to `YnabAuthError`. Unmapped statuses and 2xx responses without JSON
+  `data` raise a plain `YnabError` and are not retried.
+- Redirects are not followed, because urllib would resend the `Authorization` header.
+  Response bodies are capped (YNAB 64 MB, `net` 32 MiB). TLS certificate failures,
+  `InvalidURL` and oversized bodies are permanent errors. JSON `NaN`/`Infinity` is rejected.
+  Every message is redacted (`***`) for the token, including URL-encoded forms.
+- Payload programming errors raise `ValueError` before any request: a non-int amount, an
+  empty import id or one longer than 36 characters, a bulk update without `id` or with a
+  duplicate `id`, non-finite numbers.
+- API additions: `iter_create_transactions` and `iter_update_transactions` (so the executor
+  can persist each chunk), `CreateResult.server_knowledge`, `rate_limit_total`,
+  `requests_sent`, a public `urllib_transport`, and the test hooks `sleep`, `jitter` and
+  `backoff_base`. A `datetime` `since_date` is reduced to its date.
+- `net.request_json` adds `total_timeout` (a per-attempt deadline, default 3 × `timeout`),
+  `parse_float`, `max_response_bytes` and `clock`. A `Retry-After` above `max_backoff` raises
+  instead of waiting. Errors are raised without chaining, because urllib keeps the
+  unredacted URL. Retries re-send any method, so non-idempotent callers pass `retries=0`.
+
+### A.3 Parser and statement files (§6.1, §7)
+
+- Payee follows v1 byte for byte: the stripped Description, else the **unstripped** Type cell
+  (which can be empty or padded). "Unknown" is used only when there is no Type column.
+- State is stripped and upper-cased, so a lower-case `completed` imports as cleared (v1:
+  uncleared). The memo keeps v1's case-sensitive `(pending)` text.
+- Rows v1 crashed on (short rows, nan/inf, overflow) are skipped without using an
+  occurrence number. Rows v1 accepted but v2 refuses (|amount|, |fee| or |net| over 1e9;
+  year before 1970) still use one, and carry their key in `SkippedRow.key`.
+- An unparseable Fee stays 0.0, as in v1 (the key depends on it), with a warning.
+  `ParsedExport` gains `warnings` (at most 50, then a summary line) and `data_rows`.
+  `RevolutRow` gains `started_has_time`. Messages say "data row N".
+- The exact header names are required. A duplicate of a known column, more than 64 columns,
+  non-UTF-8 input or a mixed currency make the file a `CsvError`. So does an imported row
+  whose Currency is neither empty nor three letters A–Z.
+- The Balance bound is exclusive at 1e9 (high-nominal currencies stay usable for reconcile).
+- `strip_pending_marker` removes only the marker and one adjacent separator; everything else
+  in the memo stays as written.
+- `store_upload` parses the whole file **before** storing it, so a file that fails to parse is
+  never stored and gets no `csv_files` row. `StoredCsv.export` carries the parse. Retention
+  runs on every store: the newest 5, plus the new file, plus protected paths (the newest
+  imported statement). v1 files rank as older than any v2 file. Temp files older than 1 h are
+  removed. Symlinks and other non-regular files are never touched.
+- `find_latest_revolut_csv` accepts an undated file only if its content has a Revolut header.
+  `parse_filename_window` validates real dates with from ≤ to.
+
+### A.4 Planner (§6.2, §6.4)
+
+- **Offsets.** Besides key-equal pairs, an offset is allowed when it has at least 2 votes
+  from same-amount, same-payee pairs inside the window, or from one *distinctive* pair. A
+  lone distinctive pair one day outside the window counts only when nothing contradicts it.
+  |d| may be up to 26 h (two foreign renderings). d = 0 ranks first unless another offset has
+  more evidence. Date-only rows never teach offsets.
+- **Canonical frame.** A match never moves an entry's `started_at` to another rendering, and
+  rows from a shifted statement are normalised by its dominant offset
+  (`Plan.frame_offset`). `csv_date` stays the latest rendering. This deviates from §5.2's
+  "as rendered by the latest export seen", because mixed renderings made offsets
+  unlearnable.
+- **Passes.**
+  - Pass 1 ranks entry status (live before tombstones) before key equality.
+  - Pass 2 assigns each legacy (amount, date) group as a whole, ranked by state
+    plausibility, then status, then timestamp, then state distance, then payee, then key.
+    Exact keys are used for the rest.
+  - Pass 3 is direction-aware: a row one day later must start before 03:00, and one day
+    earlier at or after 21:00. It requires a non-empty payee only for csv-identity entries.
+  - Pass 4 requires the same sign, matches exact-instant candidates first, and may take a
+    REVERTED row at the same instant.
+  - A new **pass 4b (pre-settlement)** recognises an older statement's pending row at its
+    pre-settlement amount and does nothing with it.
+- **Older statements.** A statement is stale when `allow_sweep` is False, when a ledger entry
+  started after the statement's newest timestamp, or when it shows PENDING an instant that an
+  earlier statement showed COMPLETED or REVERTED. A stale statement never sweeps, never
+  re-creates, and leaves pendings unchanged; unmatched pendings are skipped with
+  `pending_older_export`. Never-downgrade applies to every status. Re-creating a removed
+  row needs a statement that is provably newer.
+- **Adoption** (deviation from §6.4). An unmatched row, a re-created row, or an UNLINKED
+  entry whose id is taken is LINKed instead of POSTed when YNAB holds a live transaction
+  that no ledger entry knows, with the import id `YNAB:{amount}:{date}:{n}` and the row's
+  amount and date. This is the create whose ledger write was lost. `resolve_duplicate`
+  likewise refuses to link a transaction whose amount or date differs.
+- A REVERTED row never imported becomes a local REVERTED ledger entry (a LEDGER action, no
+  YNAB write). A REVERTED row whose transaction is already gone sets REVERTED quietly.
+- **The sweep** deletes only entries the statement provably covers (inside the window, and
+  started before its newest timestamp under every plausible offset), never a transaction
+  moved to another account. "Vanished" COMPLETED entries are reported only when the sweep
+  runs, with at most 10 named.
+- When YNAB already holds the CSV's new amount or date, `pushed_*` is aligned. An emptied
+  memo is sent as `""`. A re-created row gets a new entry keyed by its fresh import id, and
+  the old entry becomes a REKEYED tombstone (not `LedgerStore.rekey`).
+- API: `actions_for_match` returns a `MatchOutcome`. `Plan` carries `frame_offset` and
+  `stale_export`, and `PlanContext` takes them from the plan. `ImportResult.ok` also requires
+  `not_applied == 0`, and `Plan.warnings` starts with the parser's warnings.
+
+### A.5 Executor, sync and services (§6.3, §6.5, §7)
+
+- A CREATE chunk rejected with 4xx is **bisected** with a cap of `2·ceil(log2 n)+4` extra POSTs
+  per chunk; rows not isolated within the cap fail and are retried on the next import. A 5xx
+  or network error fails the whole chunk.
+- A **404 on a create** stops every further write of that import (the budget or account is
+  gone), and the remaining actions become failures. This narrows §6.3's "execution
+  continues". A 404 on a per-row PUT is not a failure: the entry becomes DELETED_IN_YNAB with
+  a warning.
+- The ledger stores only what YNAB confirmed: a `pushed_*` value is not updated when the
+  returned transaction shows something else. A ledger write that fails after a confirmed YNAB
+  write is reported as the change plus a failure ("applied in YNAB, but the local record
+  could not be saved"). Each action's ledger effect runs in its own savepoint.
+- The executor refuses plans, actions or payloads for another account (`ValueError`), and
+  records a failure instead of writing to a transaction the mirror places elsewhere. After any
+  YNAB write it marks the mirror stale. `apply_plan` takes an extra `opts`.
+- **429 backoff.** A 429 stores `rate_limited_until:<budget>` (from Retry-After, else 60 s,
+  at most 1 h). Non-forced syncs honour it without sending a request. Imports and explicitly
+  forced syncs still try. A throttled sync sends and writes nothing, and the ledger refresh
+  runs only after a real sync.
+- **`import_csv` order:**
+  1. store the upload and add the `csv_files` row;
+  2. check the currency (refuse an unknown budget currency, or a statement with no
+     importable rows);
+  3. run a forced sync (a 429 raises `YnabRateLimited` and the status becomes `failed`);
+  4. check the account (missing, deleted, **closed** or in another budget gives
+     `ConfigError`, with nothing written);
+  5. claim unassigned legacy rows;
+  6. run `refresh_from_mirror`;
+  7. plan, apply, and set the status.
+- **Dry run:** the upload is not stored and no `csv_files` row is written (it would block
+  reconcile). The forced sync runs. Claims and the refresh are simulated inside a rolled-back
+  transaction. The first open of a v1 database still migrates it, with a backup.
+- `account_status` takes the `status` lock and falls back to the cached mirror (explained in
+  `sync_note`) when the user is busy, YNAB fails, or a backoff is running.
+- `UserContext` gains `backup_dir` and keeps the xpub and ETH address out of `repr`. A CLI
+  `Path` source is parsed in place and recorded with source `cli`.
+- The convergence test applies an injected 404 on DELETE before answering, because a real 404
+  there means "already gone". It excludes `pushed_cleared` from the ledger comparison: after
+  a lost PATCH response nothing reads it.
+
+### A.6 Balance, reconcile and maintenance (§6.6, §6.7)
+
+- **Reconcile tokens** are issued only when |delta| ≥ 10 milliunits and are single-use
+  (consumed at the start of apply). A new preview revokes the account's older tokens. Tokens
+  are bound to budget, account, file id, sha256, balance, `as_of`, cleared balance, currency
+  and delta. Apply always GETs the account and requires the mirror's cleared balance to equal
+  YNAB's live value.
+- Reconcile also refuses:
+  - a COMPLETED row with an unreadable Completed Date;
+  - an unknown statement or budget currency;
+  - a file whose sha256 changed on disk;
+  - an account that is missing or deleted, or has no cleared balance;
+  - a **superseded statement** (`older_statement`: the ledger's newest active date minus
+    1 day), even when the delta is 0. There is no override; upload the newest statement;
+  - a reconciliation adjustment already dated after `as_of` (`reconciled_after_as_of`).
+    This covers cleared `reconciled`, `RECON:` import ids and the payees "CSV
+    Reconciliation" and "Reconciliation Balance Adjustment".
+- Reconcile warnings (`problems`): cleared transactions after `as_of`; uncleared
+  transactions on or before `as_of` that are not known pendings; rows still pending at
+  Revolut but cleared in YNAB; a statement more than 7 days old; a closed account.
+- The refusal classes (`StatementUnavailable`, `ReconcileUnavailable`, `AdjustmentRefused`,
+  `DedupeSelectionError`) live in their modules and carry a machine-readable `.reason`.
+- **Dedupe** requires the newest statement to be `imported` (the reconcile rule). It
+  excludes import ids of UNLINKED entries. A new scan discards the old one. Processed ids
+  leave the scan, so one scan works for chunks of 200. Only ACTIVE or UNLINKED entries
+  pointing at a deleted id become DELETED_IN_YNAB.
+- **Crypto:**
+  - The zero-address guard also covers a single BTC address with no history.
+  - That guard and IBKR's NAV ≤ 0 raise `AdjustmentRefused` (IBKR before reading YNAB).
+  - Crypto and IBKR take `budget_currency` and refuse a non-CHF budget before any request.
+  - `holdings` lists only amounts > 0, and zeros go to `zero_balances`.
+  - The portfolio is the sum of the per-holding values, each quantized, so the lines add up.
+    The memo text keeps v1's float formatting.
+  - BTC depth is not restricted (Electrum exports depth-0/1 keys). Taproot single addresses
+    are accepted and witness v2+ addresses are rejected. A scan limit guards against a
+    broken API. Blockstream replies are validated strictly, with a 0.25 s pacing interval.
+- `post_balance_adjustment` uses the bulk create form. A 409 counts as a duplicate only if a
+  GET finds the live transaction.
+- **IBKR** is stricter than v1: the account must be listed by the gateway, a known non-CHF
+  base currency is refused, a malformed ledger raises instead of returning 0, and
+  `retries=2`.
+- **Cleanup:** a 4xx/404 chunk falls back to a per-row PUT, and a 5xx records a failure per
+  row. Audit lines omit the memo text.
+
+### A.7 Telegram bot (§8)
+
+- Onboarding and crypto-setup callbacks carry the flow nonce: `ob:<nonce>:b:<i>`,
+  `ob:<nonce>:a:<i>`, `ob:<nonce>:x`, and `cs:<nonce>:a:<i>|keep|skip|x`. §8.3 shows
+  `ob:b:<i>`. Typed numbers and names still work.
+- A `WorkerPool` of 4 daemon threads with one job per user replaces `ThreadPoolExecutor`,
+  whose threads would be joined at exit. On shutdown, queued jobs are dropped and running
+  ones get 4 s; affected users get a best-effort "bot restarted" notice; then the web server
+  stops. A supervisor ends the process 7.5 s after the signal, and a 1 s exit watchdog
+  follows `Bot.run`. `getUpdates` and `getMe` run on a helper thread so that SIGTERM is seen
+  within 0.25 s.
+- Crypto setup has a 30-minute TTL and a *Keep current* choice, and commits once at the end.
+  Main onboarding has no TTL (a token pasted later must still be deleted).
+- The dedupe confirmation is an edit of the picker message: it lists as many rows as fit
+  (about 85) plus "… and N more". *All* selects at most the first 200. A picker becomes live
+  only after its message is sent, and it is bound to that message id; presses on any other
+  message expire.
+- `/reconcile` keeps a bot nonce → service token mapping. A preview made in the web UI
+  replaces the service token, so an older bot preview then expires.
+- `/logout_all` works in every approved state. `/status` also replies "working…". `/logs`
+  reads rotated files, with N capped at 100,000.
+- A `ready` row without a token, budget or account goes back to `awaiting_token` on its next
+  message.
+- Unknown callback prefixes from approved users are only acknowledged, and their keyboard is
+  kept. Known prefixes pressed in the wrong state expire.
+- `link_preview_options` replaces the deprecated `disable_web_page_preview`.
+- **Refusal throttling** (changes v1): a pending or denied sender gets at most one reply per
+  5 minutes (the welcome counts), and further messages are dropped silently. No callback
+  answer waits out a 429.
+- `/login`: if sending the button fails, the token is burned (logged redacted). A 400 points
+  the admin to `WEB_UI_PUBLIC_URL`.
+- Leftover statement downloads in `<data>/tmp` are swept at startup only.
+
+### A.8 Web backend (§9.1–§9.3)
+
+- A missing cookie on an HTML route redirects to `/`. Only an invalid or expired cookie leads
+  to `/?expired=1`, and it is cleared.
+- Chunked bodies: on small-body paths the middleware reads the body itself up to the limit,
+  so the 413 comes before auth. On `/api/upload`, a body without `Content-Length` gets 411.
+- `POST /auth` requires a same-origin request (Origin, or Sec-Fetch-Site) against login
+  CSRF, and allows 10 attempts per minute per client key (an IPv4 address or an IPv6 /64).
+  There is **no global cap**, because 256-bit tokens make it pointless and it would allow a
+  lockout.
+- `GET /api/reconcile/preview` and `GET /api/dedupe/scan` stay GETs, but they require
+  `X-CSRF-Token` and are throttled (5 per 60 s per user and operation, 429 `throttled`),
+  because each forces a sync and replaces server-side state. The JSON API refuses
+  `Sec-Fetch-Site` values other than `same-origin`/`none` (403 `cross_site`).
+- `POST /api/sync` is "forced but throttled": one per user per 10 s (200
+  `{synced: false, reason: "throttled"}`). The sync and the two syncing GETs honour the YNAB
+  429 backoff (429 `rate_limited`); explicit writes do not check it up front.
+- The allowlist exempts loopback only for requests without `X-Forwarded-For`, `Forwarded` or
+  `X-Real-IP`. With an allowlist and `WEB_UI_TRUSTED_PROXIES='*'`, `make_app` logs a warning
+  instead of refusing to start.
+- Error mapping:
+  - `YnabAuthError` → 502 `ynab_auth` (never 401, which would sign the browser out);
+  - `ConfigError` → 409 `setup_required`;
+  - `StatementUnavailable`/`ReconcileUnavailable` → 409 `unavailable` with `reason`;
+  - `StorageError` → 500 `storage`;
+  - an unknown `/app/<page>` → JSON 404.
+- `make_app` refuses an enabled config with problems, and opens and migrates `bot_users.db`
+  itself (a no-op after the bot's migration). FastAPI's OpenTelemetry instrumentation is
+  disabled. The bot's users lock is held only around the web's own user-row write.
+  `WebConfig.validate()` rejects port 0.
+- `POST /logout`: a CSRF failure from a plain form gives a 303 to
+  `/app/dashboard?notice=logout_stale` (or to `/` if the session is already invalid). A
+  wrong `X-CSRF-Token` header still gives a JSON 403. `GET /auth` with a valid session shows
+  a "Switch account?" confirmation without auto-submit; the server does not enforce this,
+  it relies on the template/`auth.js` contract.
+- **Subscriptions:**
+  - The default lookback is 13 months (range 1–36).
+  - A group needs steady amounts: at most one price change per three charges, and amounts
+    within 5 % (at least 0.05) count as the same price. `price_changed` keeps the strict
+    0.05 tolerance.
+  - The yearly cadence is decided over the lookback plus 13 months and needs 2 charges.
+  - Results add `next_expected`, `active`, `monthly_equivalent` and `history_since`.
+- **Spending:** refunds are netted per category per month (a month can be negative).
+  Uncategorized inflows are not refunds. YNAB's system payees (Starting Balance,
+  Reconciliation Balance Adjustment) are excluded as well.
+- **Transactions and categories:**
+  - A named category matches a split only through its live subtransactions.
+  - `__none__` means on-budget, non-transfer, uncategorized lines, and the uncategorized
+    count matches it (RECON adjustments and future rows included).
+  - Text search also covers subtransactions.
+  - The v1 sort `imported_at` maps to `date`.
+  - `/api/categories` counts transactions, not split lines.
+  - Implemented in `web/queries.py`, with every WHERE fragment in parentheses.
+
+### A.9 Frontend (§9.4)
+
+- Brand buttons use dark text (white on the brand colour fails WCAG). Link and active-nav text
+  use `brand-800` and inflows `emerald-700` in light mode. Everything else follows v1's
+  palette.
+- Header: below `lg` it is one row with a disclosure menu (the toggle is last in tab order),
+  and from `lg` up the navigation is a second row. Toasts sit below the header. Titles keep
+  "Revolut → YNAB".
+- Timestamps that name a zone are shown in the browser's local time as `YYYY-MM-DD HH:MM`
+  (falling back to `… UTC`). Naive timestamps and dates are shown verbatim.
+- Subscriptions window options are 6/13/24/36 months, with a note when yearly charges cannot
+  be detected. *Sign out everywhere* calls `/api/logout-all` behind a confirmation.
+  Reconcile buttons say *Check balance* and then *Post adjustment of ±X*; with warnings the
+  dialog is destructive (*Post anyway*, focus on Cancel). List load failures show an inline
+  alert with *Retry*. The dedupe column is called *State* and uses the same badges.
+- `isSafeUrl` rejects control characters, whitespace and backslashes. Frontend tests use a
+  minimal fake DOM under Node, which is optional. `build_css.sh` has
+  `--offline`/`TAILWIND_OFFLINE=1`. Tests check the minified CSS for preflight variables,
+  because minification removes the banner.
+
+### A.10 Runtime, container, CI and configuration (§4, §10, §11)
+
+- **Entrypoint order:** load `.env`, then `umask 077`, then pin `BOT_DATA_DIR` to its
+  absolute path, then create the directory (missing parents root-owned, 0755), then `chown`,
+  then `setgroups`/`setgid`/`setuid`, then `HOME` = data dir. §10 lists the chown first;
+  `.env` comes first because `BOT_DATA_DIR` and `APP_UID`/`APP_GID` may be set there. A
+  top-level chown failure is logged, not fatal.
+- Container commands other than `bot`/`cli`/`selfcheck`/`healthcheck` are exec'd after the
+  privilege drop (entrypoint only). `healthcheck` skips the chown and the drop.
+  `python -m ynab_helper` never drops privileges (it warns when run as root). The shims
+  call `prepare_runtime()` themselves when they are root.
+- The health check reads `/app/.env` itself (Docker does not pass the entrypoint's
+  environment), and probes `WEB_UI_HOST` when it is a specific address. It always prints one
+  line and exits 0 or 1. `HEALTHCHECK_MAX_AGE` (default 180) is new.
+- `BOT_DATA_DIR` keeps v1's meaning: no `~` expansion, relative to the working directory.
+  `LOG_FILE` keeps v1's default `~/.revolut_to_ynab.log` (§11's open question; in the
+  container `~` is the data directory). `LOG_LEVEL=NOTSET` is rejected; `WARN`/`FATAL` are
+  aliases. `TELEGRAM_ADMIN_ID` is `None` when missing or malformed (validated by
+  `validate_for_bot`), and a malformed `TELEGRAM_API_BASE` stops the bot.
+  `WEB_UI_TRUSTED_PROXIES` is new (v1 hard-coded `*`).
+- `load_dotenv` keeps v1's parsing (a parity test checks it) but reads with `utf-8-sig`,
+  skips a variable that contains NUL, and warns (instead of crashing or staying silent) on a
+  non-regular file, invalid UTF-8 or a permission error. It stays quiet after the privilege
+  drop for a file it already loaded.
+- `setup_logging` pins `ynab_helper.audit` at INFO and masks registered secrets. Locks are
+  **not re-entrant** and have `acquire`/`release(token)` for handing over to workers.
+  `format_money` rounds half away from zero (like `Intl.NumberFormat`) and groups digits with
+  `sign=True`. A `BUILD_SHA` of `dev` or `local` gives a dev cache-bust token.
+- Image: the app user's home is `/app/bot_data`, and `BUILD_SHA` defaults to `dev`. The
+  reference compose file does not repeat the healthcheck (the image has it) and adds
+  `no-new-privileges`. The reference `Caddyfile` uses `max_size 26MiB` (Caddy's `MB` is
+  10⁶ bytes) and `?`-prefixed security headers, one per directive, so the app's own headers
+  are never replaced.
+- CI: no `docker/metadata-action`. The image is built once with `load: true`, checked
+  (`selfcheck`, `scripts/ci_smoke.sh`), exported, then verified and pushed by a separate
+  `publish` job (the only one with `packages: write`, on pushes to `main` only). Pushes to
+  `main` ignore docs-only paths. `queue: max` is not used (it cannot be combined with the
+  PRs' `cancel-in-progress`). Dependabot uses the `uv` ecosystem (re-runs `uv pip compile`
+  with hashes) and also watches `docker-compose`, with cooldowns.

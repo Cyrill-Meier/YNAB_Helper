@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from tests.fakes.fake_ynab import FAKE_TOKEN, FakeYnab
+from tests.importer.helpers import csv_bytes
 from tests.legacy import v1_revolut_to_ynab as v1
 from ynab_helper import services
 from ynab_helper.balance.adjust import AdjustmentRefused
@@ -27,6 +28,7 @@ from ynab_helper.errors import (
     Busy,
     ConfigError,
     StaleStateError,
+    YnabError,
     YnabHelperError,
     YnabRateLimited,
 )
@@ -614,3 +616,135 @@ def test_the_ankr_key_defaults_to_the_environment(crypto_ctx, fake, monkeypatch,
     del deps["eth_rpc"]
     services.crypto_sync(crypto_ctx, dry_run=True, ankr_api_key=given, **deps)
     assert keys == [expected]
+
+
+# ── legacy rows: only writes into the account claim them (F74) ─────────────
+
+
+def _v1_db_with_an_unclaimed_row(ctx: UserContext, fake: FakeYnab) -> str:
+    """A v1 database never opened by v2, holding one imported row without an account."""
+    topup = fake.add_transaction(
+        BUDGET,
+        ACCT,
+        amount=300_000,
+        date="2026-10-01",
+        payee_name="Top-Up",
+        import_id="YNAB:300000:2026-10-01:1",
+        cleared="cleared",
+    )
+    ctx.db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = v1.init_db(str(ctx.db_path))
+    conn.execute(
+        "INSERT INTO transactions (import_id, date, amount, payee_name, cleared, state, "
+        "ynab_tx_id, account_id, source, imported_at) VALUES ('YNAB:300000:2026-10-01:1', "
+        "'2026-10-01', 300000, 'Top-Up', 'cleared', 'COMPLETED', ?, NULL, 'revolut', 'x')",
+        (topup,),
+    )
+    conn.commit()
+    conn.close()
+    return topup
+
+
+def _ledger_owners(ctx: UserContext) -> list[tuple[str, str]]:
+    conn = connect(ctx.db_path)
+    try:
+        return [tuple(r) for r in conn.execute("SELECT account_id, key FROM import_ledger")]
+    finally:
+        conn.close()
+
+
+_READ_ONLY: dict[str, Callable[[UserContext], Any]] = {
+    "sync": lambda c: services.sync(c, force=True),
+    "account_status": lambda c: services.account_status(c),
+    "reconcile_preview": lambda c: services.reconcile_preview(c, tokens=ReconcileTokens()),
+    "dedupe_scan": lambda c: services.dedupe_scan(c, registry=DedupeScans()),
+    "cleanup_dry_run": lambda c: services.cleanup_pending(c, dry_run=True),
+}
+
+
+@pytest.mark.parametrize("operation", list(_READ_ONLY))
+def test_F74_read_only_operations_opening_a_v1_db_leave_its_rows_unclaimed(ctx, fake, operation):
+    topup = _v1_db_with_an_unclaimed_row(ctx, fake)
+    try:
+        _READ_ONLY[operation](ctx)
+    except StatementUnavailable:  # reconcile and dedupe need an imported statement first
+        pass
+    assert _ledger_owners(ctx) == [("", "YNAB:300000:2026-10-01:1")]  # migrated, unclaimed
+    assert _mutations(fake) == []
+
+    # The next real import claims the row for the account and does not create it again.
+    result = services.import_csv(
+        ctx,
+        csv_bytes([("2026-10-01 09:00:00", "Top-Up", "300.00", "COMPLETED", "Topup")]),
+        original_name="s.csv",
+        source_kind="telegram",
+    )
+    assert result.ok and result.created == [] and result.unchanged == 1
+    assert _ledger_owners(ctx) == [(ACCT, "YNAB:300000:2026-10-01:1")]
+    assert [t["id"] for t in fake.transactions(BUDGET, account_id=ACCT)] == [topup]
+
+
+# ── an account YNAB no longer offers (dedupe, cleanup) ─────────────────────
+
+
+@pytest.mark.parametrize("change", ["closed", "deleted"])
+def test_dedupe_and_cleanup_refuse_an_account_ynab_no_longer_offers(ctx, fake, scans, change):
+    _import(ctx)
+    stray = fake.add_transaction(
+        BUDGET, ACCT, amount=-11_200, date="2026-10-10", import_id="YNAB:-11200:2026-10-10:2"
+    )
+    fake.add_transaction(
+        BUDGET, ACCT, amount=-4_500, date="2026-10-01", memo="(pending)", cleared="cleared"
+    )
+    scan = services.dedupe_scan(ctx, registry=scans)
+    assert [c.id for c in scan.candidates] == [stray]
+    fake.edit_account(BUDGET, ACCT, **{change: True})
+    fake.reset_log()
+
+    for operation in (
+        lambda: services.dedupe_delete(ctx, scan.scan_id, [stray], registry=scans),
+        lambda: services.dedupe_scan(ctx, registry=scans),
+        lambda: services.cleanup_pending(ctx),
+        lambda: services.cleanup_pending(ctx, dry_run=True),
+    ):
+        with pytest.raises(ConfigError) as err:
+            operation()
+        message = err.value.user_message
+        assert f"{change} in YNAB" in message and "Nothing was changed." in message
+        assert "/setup" in message
+    assert _mutations(fake) == []
+    assert fake.tx(stray)["deleted"] is False
+
+
+def test_cleanup_refuses_an_account_of_another_budget(data_dir, fake):
+    fake.add_budget("b2", currency="CHF")
+    fake.add_account("b2", "acct-b2", "Revolut")
+    ctx = make_ctx(data_dir, "acct-b2")  # budget b1, but the account lives in b2
+    with pytest.raises(ConfigError) as err:
+        services.cleanup_pending(ctx)
+    assert "is not in your YNAB budget" in err.value.user_message
+    assert _mutations(fake) == []
+
+
+# ── reconcile_apply: the mirror is marked stale only when YNAB may have changed ──
+
+
+def test_a_refused_reconcile_apply_keeps_the_mirror_fresh(ctx, fake, tokens):
+    _seed_opening_balance(fake, 995_000)
+    _import(ctx)
+    with pytest.raises(StaleStateError):
+        services.reconcile_apply(ctx, "unknown-token", now=TODAY, tokens=tokens)
+    assert _meta(ctx, f"last_sync_at:{BUDGET}") is not None  # nothing was posted
+    fake.reset_log()
+    services.account_status(ctx)  # within the throttle: answered from the mirror
+    assert fake.calls == []
+
+
+def test_a_failed_reconcile_post_marks_the_mirror_stale(ctx, fake, tokens):
+    _seed_opening_balance(fake, 995_000)
+    _import(ctx)
+    preview = services.reconcile_preview(ctx, now=TODAY, tokens=tokens)
+    fake.fail_next("POST", TX_PATH, 500)
+    with pytest.raises(YnabError):
+        services.reconcile_apply(ctx, preview.token, now=TODAY, tokens=tokens)
+    assert _meta(ctx, f"last_sync_at:{BUDGET}") is None  # the POST may have reached YNAB

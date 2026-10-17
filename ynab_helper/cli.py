@@ -22,8 +22,9 @@ Fixes over v1: ``--skip-pending`` only stops *creating* pending rows and never d
 pendings already in YNAB (F09); ``--dry-run`` writes nothing to YNAB or the import ledger
 (F74); ``--db-stats`` and ``--sync`` use and show the ``--db-path`` database (C07);
 ``--watch`` honours ``--dry-run``, ``--db-path`` and ``--skip-pending``, imports a file only
-once its size is stable, marks it done only after a successful import and retries failed
-imports later (F51).
+once its size is stable, marks it done only after a successful import, retries failed
+imports later, and waits out YNAB's rate limit or a file that cannot be read yet instead of
+giving up on it (F51).
 """
 
 from __future__ import annotations
@@ -68,11 +69,13 @@ from ynab_helper.errors import (
 from ynab_helper.importer.models import Change, ImportResult, TxRef
 from ynab_helper.maintenance.cleanup import CleanupResult
 from ynab_helper.money import format_money
-from ynab_helper.revolut.files import find_latest_revolut_csv, is_revolut_csv
+from ynab_helper.revolut.files import find_latest_revolut_csv
 from ynab_helper.revolut.parser import (
+    HEADER_SNIFF_BYTES,
     MAX_CSV_BYTES,
     STATE_COMPLETED,
     STATE_PENDING,
+    looks_like_revolut_csv,
     parse_export,
     parse_filename_window,
 )
@@ -91,7 +94,10 @@ __all__ = [
     "EXIT_USAGE",
     "MODES",
     "FolderWatcher",
+    "RetryLater",
     "WatchOutcome",
+    "WatchResult",
+    "backup_dir_for",
     "build_parser",
     "main",
     "select_mode",
@@ -371,6 +377,19 @@ def _apply_overrides(
     return updated, warnings
 
 
+def backup_dir_for(db_path: Path, settings: config.Settings) -> Path | None:
+    """Where a migration backs up ``db_path``: the bot's ``<data dir>/backups`` for a
+    database in the bot's data directory (an operator running the CLI on a bot user's
+    ``transactions_<id>.db``, or the CLI inside the container, whose HOME is the data
+    directory), else None — ``<db name>_backups`` next to the database."""
+    try:
+        if db_path.parent.resolve() == settings.data_dir.resolve():
+            return settings.backups_dir
+    except (OSError, RuntimeError):  # unresolvable path (symlink loop): keep the default
+        pass
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class _Run:
     """Everything a mode handler needs."""
@@ -386,6 +405,7 @@ class _Run:
             budget_id=ynab.budget_id,
             account_id=ynab.account_id,
             db_path=self.db_path,
+            backup_dir=backup_dir_for(self.db_path, self.settings),
         )
 
     def valuation_target(self, account_id: str) -> ValuationTarget:
@@ -527,7 +547,10 @@ def format_import_result(result: ImportResult, *, limit: int = LIST_LIMIT) -> li
     if dry:
         if not result.has_changes:
             lines.append("Dry run: nothing would change.")
-        lines.append("Dry run: nothing was written to YNAB or the local database.")
+        lines.append(
+            "Dry run: nothing was written to YNAB and the import ledger is unchanged "
+            "(only the local copy of YNAB was refreshed)."
+        )
     elif not result.ok:
         lines.append("✗ The import was only partly applied. Run it again to retry the rest.")
     elif not result.has_changes:
@@ -848,14 +871,44 @@ class WatchOutcome(enum.Enum):
 
     DONE = "done"  # imported: never again unless the file changes
     SKIP = "skip"  # not importable as it is (wrong file, refused): only after it changes
-    RETRY = "retry"  # failed for a reason that may pass (network, rate limit, partial)
+    RETRY = "retry"  # failed for a reason that may pass (network, YNAB error, partial)
+
+
+@dataclass(frozen=True, slots=True)
+class RetryLater:
+    """Handler result for a failure that passes on its own: YNAB's rate limit, or a file
+    that cannot be read yet (locked by the app that wrote it, a cloud placeholder still
+    downloading).
+
+    The file is tried again after ``after`` seconds (YNAB's ``Retry-After``, capped at the
+    watcher's ``max_wait``) or the watcher's backoff, whichever is longer. Unlike
+    :attr:`WatchOutcome.RETRY` these waits never count toward ``max_attempts``: a statement
+    dropped while the token is rate limited is imported once the limit lifts (F51).
+    """
+
+    after: float | None = None
+
+
+#: What a :class:`FolderWatcher` handler returns.
+WatchResult = WatchOutcome | RetryLater
 
 
 @dataclass(slots=True)
 class _Candidate:
     signature: tuple[int, int]  # (size, mtime_ns)
-    attempts: int = 0
+    attempts: int = 0  # RETRY results (bounded by max_attempts)
+    waits: int = 0  # RetryLater results (unbounded: they pass on their own)
     retry_at: float = 0.0
+
+
+def _duration(seconds: float) -> str:
+    """``"60 s"``, ``"240 s"``, ``"15 min"``, ``"1 h"`` for watch messages."""
+    if seconds < 300:
+        return f"{seconds:.0f} s"
+    if seconds < 3600:
+        return f"{round(seconds / 60)} min"
+    hours = seconds / 3600
+    return f"{hours:.0f} h" if hours == round(hours) else f"{hours:.1f} h"
 
 
 class FolderWatcher:
@@ -866,20 +919,24 @@ class FolderWatcher:
       on two consecutive polls — an AirDrop or download still in progress is not read
       half-written (F51).
     * A file counts as done only after the handler reports :attr:`WatchOutcome.DONE` (or
-      ``SKIP``, e.g. not a Revolut statement); until the file changes again it is not
-      handled a second time. ``RETRY`` schedules another attempt with exponential backoff
-      (``retry_delay`` doubling up to ``max_retry_delay``); after ``max_attempts`` the file
-      waits until it changes.
+      ``SKIP``: readable but not a Revolut statement, or refused as it is); until the file
+      changes again it is not handled a second time. ``RETRY`` schedules another attempt
+      with exponential backoff (``retry_delay`` doubling up to ``max_retry_delay``); after
+      ``max_attempts`` the file waits until it changes.
+    * A file that cannot be read for the moment, and a handler result :class:`RetryLater`
+      (rate limit), wait with the same backoff (or the requested delay, up to ``max_wait``)
+      but are never given up on — such a condition clears without the file changing.
     """
 
     def __init__(
         self,
         folder: Path,
-        handler: Callable[[Path], WatchOutcome],
+        handler: Callable[[Path], WatchResult],
         *,
         retry_delay: float = 60.0,
         max_retry_delay: float = 900.0,
         max_attempts: int = 5,
+        max_wait: float = 3600.0,
         clock: Callable[[], float] | None = None,
         notify: Callable[[str], None] | None = None,
     ) -> None:
@@ -888,18 +945,30 @@ class FolderWatcher:
         self._retry_delay = retry_delay
         self._max_retry_delay = max_retry_delay
         self._max_attempts = max(1, max_attempts)
+        self._max_wait = max_wait
         self._clock = clock or time.monotonic
         self._notify = notify or (lambda _message: None)
         self._done: dict[str, tuple[int, int]] = {}
         self._pending: dict[str, _Candidate] = {}
+        self._unlisted = False
 
-    def _scan(self) -> dict[str, tuple[Path, tuple[int, int]]]:
-        found: dict[str, tuple[Path, tuple[int, int]]] = {}
+    def _scan(self) -> tuple[dict[str, tuple[Path, tuple[int, int]]], set[str]] | None:
+        """``(found, unreadable)``: every ``*.csv`` file with its (size, mtime_ns), and the
+        names that could not be examined this time. None if the folder cannot be listed
+        (unmounted drive, cloud folder offline, …)."""
         try:
             entries = sorted(self.folder.iterdir())
         except OSError as exc:
-            log.warning("cannot list %s: %s", self.folder, exc)
-            return found
+            if not self._unlisted:
+                log.warning("cannot list %s: %s", self.folder, exc)
+                self._notify(f"Cannot read {self.folder} right now; still watching.")
+            self._unlisted = True
+            return None
+        if self._unlisted:
+            log.info("%s can be listed again", self.folder)
+            self._unlisted = False
+        found: dict[str, tuple[Path, tuple[int, int]]] = {}
+        unreadable: set[str] = set()
         for path in entries:
             name = path.name
             if name.startswith(".") or not name.lower().endswith(".csv"):
@@ -907,22 +976,32 @@ class FolderWatcher:
             try:
                 info = path.stat()
             except OSError:
+                unreadable.add(name)
                 continue
             if stat.S_ISREG(info.st_mode):
                 found[name] = (path, (info.st_size, info.st_mtime_ns))
-        return found
+        return found, unreadable
 
     def prime(self) -> int:
         """Mark every statement already in the folder as done; returns how many."""
-        for name, (_path, signature) in self._scan().items():
-            self._done[name] = signature
+        scan = self._scan()
+        if scan is not None:
+            for name, (_path, signature) in scan[0].items():
+                self._done[name] = signature
         return len(self._done)
 
-    def poll(self) -> list[tuple[Path, WatchOutcome]]:
-        """One scan: handle every file that is new (or changed) and has stopped growing."""
+    def poll(self) -> list[tuple[Path, WatchResult]]:
+        """One scan: handle every file that is new (or changed) and has stopped growing.
+
+        A file is forgotten only once a listing no longer shows it; while the folder (or a
+        file) cannot be read, everything already handled stays handled, so a folder that
+        comes back is not imported a second time."""
         now = self._clock()
-        handled: list[tuple[Path, WatchOutcome]] = []
-        found = self._scan()
+        handled: list[tuple[Path, WatchResult]] = []
+        scan = self._scan()
+        if scan is None:
+            return handled
+        found, unreadable = scan
         for name, (path, signature) in found.items():
             if self._done.get(name) == signature:
                 continue
@@ -935,7 +1014,13 @@ class FolderWatcher:
                 continue
             outcome = self._handle(path)
             handled.append((path, outcome))
-            if outcome is WatchOutcome.RETRY:
+            if isinstance(outcome, RetryLater):
+                candidate.waits += 1
+                requested = min(outcome.after or 0.0, self._max_wait)
+                delay = max(requested, self._backoff(candidate.waits))
+                candidate.retry_at = now + delay
+                self._notify(f"Will retry {name} in {_duration(delay)}.")
+            elif outcome is WatchOutcome.RETRY:
                 candidate.attempts += 1
                 if candidate.attempts >= self._max_attempts:
                     self._finish(name, signature)
@@ -944,20 +1029,33 @@ class FolderWatcher:
                         "tried again when the file changes."
                     )
                 else:
-                    delay = min(
-                        self._retry_delay * 2 ** (candidate.attempts - 1), self._max_retry_delay
-                    )
+                    delay = self._backoff(candidate.attempts)
                     candidate.retry_at = now + delay
-                    self._notify(f"Will retry {name} in {delay:.0f} s.")
+                    self._notify(f"Will retry {name} in {_duration(delay)}.")
             else:
                 self._finish(name, signature)
+        listed = found.keys() | unreadable
         for registry in (self._pending, self._done):
-            for name in [n for n in registry if n not in found]:
+            for name in [n for n in registry if n not in listed]:
                 del registry[name]
         return handled
 
-    def _handle(self, path: Path) -> WatchOutcome:
-        if not is_revolut_csv(path):
+    def _backoff(self, count: int) -> float:
+        """``retry_delay`` doubled per earlier try, at most ``max_retry_delay``. The exponent
+        is clamped: waits are unbounded, and ``60.0 * 2**1024`` would overflow a float."""
+        return min(self._retry_delay * 2 ** min(max(0, count - 1), 30), self._max_retry_delay)
+
+    def _handle(self, path: Path) -> WatchResult:
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(HEADER_SNIFF_BYTES)
+        except OSError as exc:
+            # Locked by the app writing it, permissions not set yet, a cloud placeholder
+            # still downloading: no verdict on the content, look again later (F51).
+            log.info("watch: cannot read %s yet: %s", path.name, exc)
+            self._notify(f"Cannot read {path.name} yet ({exc.strerror or exc}).")
+            return RetryLater()
+        if not looks_like_revolut_csv(head):
             self._notify(f"Ignoring {path.name}: not a Revolut statement.")
             return WatchOutcome.SKIP
         return self._handler(path)
@@ -1110,8 +1208,8 @@ def _run_import(run: _Run) -> int:
     return EXIT_OK if result.ok else EXIT_FAILED
 
 
-def _watch_handler(run: _Run, ctx: UserContext) -> Callable[[Path], WatchOutcome]:
-    def handle(path: Path) -> WatchOutcome:
+def _watch_handler(run: _Run, ctx: UserContext) -> Callable[[Path], WatchResult]:
+    def handle(path: Path) -> WatchResult:
         _out(f"\nNew Revolut statement: {path.name}")
         try:
             result = services.import_csv(
@@ -1124,8 +1222,17 @@ def _watch_handler(run: _Run, ctx: UserContext) -> Callable[[Path], WatchOutcome
             )
         except YnabAuthError:
             raise  # the token is unusable for every later file too
-        except (CsvError, ConfigError) as exc:
-            # Refused as it is (wrong file, currency, account): only after the file changes.
+        except YnabRateLimited as exc:
+            # Nothing was written; the limit lifts on its own, so the file is never given up.
+            _err(f"  ✗ {path.name}: {exc.user_message}")
+            return RetryLater(exc.retry_after)
+        except CsvError as exc:
+            _err(f"  ✗ {path.name}: {exc.user_message}")
+            if isinstance(exc.__cause__, OSError):
+                return RetryLater()  # could not be read for the moment: not a verdict (F51)
+            return WatchOutcome.SKIP  # refused as it is: only after the file changes
+        except ConfigError as exc:
+            # The account was deleted, closed or moved: no file can be imported as it is.
             _err(f"  ✗ {path.name}: {exc.user_message}")
             return WatchOutcome.SKIP
         except (YnabHelperError, OSError, sqlite3.Error) as exc:
@@ -1139,7 +1246,10 @@ def _watch_handler(run: _Run, ctx: UserContext) -> Callable[[Path], WatchOutcome
             return WatchOutcome.RETRY
         for line in format_import_result(result):
             _out(line)
-        return WatchOutcome.DONE if result.ok else WatchOutcome.RETRY
+        if result.ok:
+            return WatchOutcome.DONE
+        # Partly applied: the next run converges. A rate limit mid-way is waited out.
+        return RetryLater() if result.rate_limited else WatchOutcome.RETRY
 
     return handle
 
@@ -1156,7 +1266,7 @@ def _run_watch(run: _Run) -> int:
     _out(f"Watching {folder} for new Revolut statements (every {WATCH_INTERVAL:.0f} s).")
     _out(f"   Database: {run.db_path}; {existing} existing CSV file(s) are left alone.")
     if run.args.dry_run:
-        _out("   Dry run: nothing is written to YNAB or the local database.")
+        _out("   Dry run: nothing is written to YNAB or the import ledger.")
     if run.args.skip_pending:
         _out("   Pending transactions are not created (--skip-pending).")
     _out("   Press Ctrl+C to stop.")

@@ -13,6 +13,7 @@ from typing import Final
 
 from ynab_helper.balance import brokerage as _brokerage
 from ynab_helper.balance import reconcile as _reconcile
+from ynab_helper.balance.adjust import OUTCOME_CREATED, OUTCOME_DUPLICATE
 from ynab_helper.balance.brokerage import BrokerageSyncResult
 from ynab_helper.balance.crypto import btc as _btc
 from ynab_helper.balance.crypto import eth as _eth
@@ -52,9 +53,11 @@ def reconcile_preview(
     Under the user's ``reconcile`` lock: forced mirror sync, account check, then
     :func:`ynab_helper.balance.reconcile.reconcile_preview` with the budget currency from
     the mirror (one more GET cross-checks the mirror's cleared balance). Nothing is written
-    to YNAB. ``preview.token`` (None when already in sync) confirms exactly these numbers
-    for :func:`reconcile_apply` within ``preview.token_ttl_seconds``. ``now`` (local) only
-    drives the statement-age warning; ``tokens`` replaces the process-wide registry (tests).
+    to YNAB, and a first v2 open of a v1 database leaves its legacy ledger rows unclaimed
+    (a preview is read-only, F74). ``preview.token`` (None when already in sync) confirms
+    exactly these numbers for :func:`reconcile_apply` within ``preview.token_ttl_seconds``.
+    ``now`` (local) only drives the statement-age warning; ``tokens`` replaces the
+    process-wide registry (tests).
 
     Raises:
         Busy; YnabRateLimited: the sync was rate limited (nothing computed).
@@ -65,7 +68,10 @@ def reconcile_preview(
         StaleStateError: YNAB changed while the preview was computed.
         YnabError: any other YNAB failure.
     """
-    with LOCKS.operation(ctx.key, OP_RECONCILE), closing(_common.open_db(ctx)) as conn:
+    with (
+        LOCKS.operation(ctx.key, OP_RECONCILE),
+        closing(_common.open_db(ctx, assign_legacy=False)) as conn,
+    ):
         ynab = client or _common.client_for(ctx)
         mirror = _common.synced_mirror(ctx, conn, ynab)
         _common.check_account(ctx, mirror, nothing="Nothing can be reconciled.")
@@ -108,7 +114,7 @@ def reconcile_apply(
         currency = _common.budget_currency(ctx.budget_id, mirror, ynab)
         try:
             with _common.rate_limit_remembered(conn, ctx.budget_id):
-                return _reconcile.reconcile_apply(
+                result = _reconcile.reconcile_apply(
                     conn,
                     ynab,
                     budget_id=ctx.budget_id,
@@ -118,9 +124,13 @@ def reconcile_apply(
                     now=now,
                     tokens=tokens,
                 )
-        finally:
-            # Whatever happened, the POST may have reached YNAB: let the next status sync run.
+        except YnabError:
+            # The POST may have reached YNAB: let the next status sync run.
             _common.mark_stale(conn, ctx.budget_id)
+            raise
+        if result.adjustment.outcome in (OUTCOME_CREATED, OUTCOME_DUPLICATE):
+            _common.mark_stale(conn, ctx.budget_id)
+        return result
 
 
 # ── valuation syncs: crypto, IBKR (§6.6) ─────────────────────────────────────

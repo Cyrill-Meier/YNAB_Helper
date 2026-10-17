@@ -8,7 +8,8 @@ on captured stdout. Here every scenario imports real Revolut-shaped statements t
 1. reverted rows are deleted once, never created, and a re-import converges;
 2. a date-shifted row (statement exported in another timezone) is re-dated, not duplicated;
 3. a +9 h export offset is learned from the statement, evening rows are re-dated;
-4. a pending that vanished behind differently-named settled rows is removed as superseded;
+4. a pending that vanished behind differently-named settled rows is removed as superseded
+   (v1's own example, a pending that settled under the same payee, is a settlement in v2);
 5. amount changes are reported as such; a plain clearing carries no amount change.
 
 Where v2's rules differ from v1 on purpose, the test says so (window boundary F10,
@@ -263,6 +264,46 @@ def test_a_superseded_pending_is_removed_and_reported_and_guards_hold(ctx, fake)
 
     fake.reset_log()
     assert not _import(ctx, later).has_changes and _writes(fake) == []
+
+
+def test_v1s_tanta_settlement_is_an_amount_update_in_v2(ctx, fake):
+    """v1's own superseded case: a dinner pending of -57.48 that settled as "Tanta" -51.06
+    plus a separate "Propina Tanta" tip of -5.23. v1 deleted the pending and created both
+    rows; v2 recognises the settlement (same payee, same day, other amount, F35) and updates
+    the pending in place — keeping its id, category and any edits — and creates only the tip.
+    The guards of the v1 test still hold: an old pending outside the statement and a pending
+    that is still pending are left alone."""
+    _import(
+        ctx,
+        [
+            ("2026-07-01 09:00:00", "Old Hold", "-990.00", "PENDING"),
+            ("2026-08-18 10:59:18", "Tanta", "-57.48", "PENDING"),
+            ("2026-08-19 08:00:00", "Hotel Hold", "-110.00", "PENDING"),
+        ],
+    )
+    ids = {t["payee_name"]: t["id"] for t in _live(fake)}
+    fake.reset_log()
+
+    settled = [
+        ("2026-08-18 10:59:18", "Tanta", "-51.06"),
+        ("2026-08-18 13:59:18", "Propina Tanta", "-5.23"),
+        ("2026-08-19 08:00:00", "Hotel Hold", "-110.00", "PENDING"),
+    ]
+    result = _import(ctx, settled)
+    assert result.ok and result.removed == []
+    assert _refs(result.created) == [("2026-08-18", -5_230, "Propina Tanta")]
+    (change,) = result.updated
+    assert change.tx.payee == "Tanta"
+    assert change.fields["amount"] == (-57_480, -51_060)
+    assert change.fields["cleared"] == ("uncleared", "cleared")
+    tanta = fake.tx(ids["Tanta"])
+    assert (tanta["deleted"], tanta["amount"], tanta["cleared"]) == (False, -51_060, "cleared")
+    assert fake.tx(ids["Old Hold"])["deleted"] is False
+    assert fake.tx(ids["Hotel Hold"])["deleted"] is False
+    assert sorted(m for m, _ in _writes(fake)) == ["PATCH", "POST"]
+
+    fake.reset_log()
+    assert not _import(ctx, settled).has_changes and _writes(fake) == []
 
 
 def test_a_pending_still_cleared_in_ynab_is_never_swept(ctx, fake):

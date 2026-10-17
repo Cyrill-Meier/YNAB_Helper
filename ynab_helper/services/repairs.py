@@ -22,6 +22,7 @@ __all__ = ["cleanup_pending", "dedupe_delete", "dedupe_scan"]
 
 OP_DEDUPE: Final = "dedupe"
 OP_CLEANUP: Final = "cleanup"
+_NOTHING_CHANGED: Final = "Nothing was changed."
 
 
 # ── dedupe / cleanup (§6.7) ──────────────────────────────────────────────────
@@ -36,16 +37,22 @@ def dedupe_scan(
 ) -> DedupeScan:
     """List importer-created transactions of the account that no statement row accounts for.
 
-    Under the user's ``dedupe`` lock, after a forced mirror sync. The candidates are kept
-    server-side as the user's current scan (``scan.scan_id``, 10-minute TTL; ``registry``
-    replaces the process-wide one in tests). Nothing is written to YNAB.
+    Under the user's ``dedupe`` lock, after a forced mirror sync and the account check. The
+    candidates are kept server-side as the user's current scan (``scan.scan_id``, 10-minute
+    TTL; ``registry`` replaces the process-wide one in tests). Nothing is written to YNAB,
+    and a first v2 open of a v1 database leaves its legacy ledger rows unclaimed (F74).
 
     Raises:
-        Busy; YnabRateLimited; StatementUnavailable (no successfully imported statement);
+        Busy; YnabRateLimited; ConfigError (the account was deleted or closed in YNAB, or is
+        in another budget); StatementUnavailable (no successfully imported statement);
         YnabError.
     """
-    with LOCKS.operation(ctx.key, OP_DEDUPE), closing(_common.open_db(ctx)) as conn:
-        _common.synced_mirror(ctx, conn, client or _common.client_for(ctx))
+    with (
+        LOCKS.operation(ctx.key, OP_DEDUPE),
+        closing(_common.open_db(ctx, assign_legacy=False)) as conn,
+    ):
+        mirror = _common.synced_mirror(ctx, conn, client or _common.client_for(ctx))
+        _common.check_account(ctx, mirror, nothing=_NOTHING_CHANGED)
         return _dedupe.dedupe_scan(
             conn,
             budget_id=ctx.budget_id,
@@ -67,13 +74,15 @@ def dedupe_delete(
     """Delete the confirmed selection ``ids`` (at most 200) of the user's scan ``scan_id``.
 
     Under the user's ``dedupe`` lock. The scan is checked first (an expired or replaced
-    scan costs no YNAB request), then the mirror is synced (forced) so every id is
-    re-checked against YNAB's current state before its DELETE. Per-id failures are in the
-    result; a 429 stops the run (``result.rate_limited``) and starts the sync backoff.
+    scan costs no YNAB request), then the mirror is synced (forced) and the account checked,
+    so every id is re-checked against YNAB's current state before its DELETE. Per-id
+    failures are in the result; a 429 stops the run (``result.rate_limited``) and starts
+    the sync backoff.
 
     Raises:
         Busy; StaleStateError (scan unknown, replaced, expired, of another account, or ids
         outside it); DedupeSelectionError (empty, malformed or too many ids);
+        ConfigError (the account was deleted or closed in YNAB, or is in another budget);
         YnabRateLimited (the sync); YnabAuthError (deletions so far stay recorded).
     """
     scans = registry if registry is not None else _dedupe.DEDUPE_SCANS
@@ -81,7 +90,8 @@ def dedupe_delete(
         scans.lookup(ctx.key, scan_id)
         with closing(_common.open_db(ctx)) as conn:
             ynab = client or _common.client_for(ctx)
-            _common.synced_mirror(ctx, conn, ynab)
+            mirror = _common.synced_mirror(ctx, conn, ynab)
+            _common.check_account(ctx, mirror, nothing=_NOTHING_CHANGED)
             try:
                 result = _dedupe.dedupe_delete(
                     conn,
@@ -108,20 +118,23 @@ def cleanup_pending(
 ) -> CleanupResult:
     """Strip stale ``(pending)`` memo markers from the account's cleared transactions.
 
-    Under the user's ``cleanup`` lock, after a forced mirror sync. Only ``memo`` is ever
-    sent, and only for cleared/reconciled transactions (F01, C02). A dry run lists the
-    candidates and writes nothing to YNAB (and, on a first v2 open of a legacy DB, does not
-    assign the legacy rows: F74). A 429 stops the run and starts the sync backoff.
+    Under the user's ``cleanup`` lock, after a forced mirror sync and the account check.
+    Only ``memo`` is ever sent, and only for cleared/reconciled transactions (F01, C02). A
+    dry run lists the candidates and writes nothing to YNAB (and, on a first v2 open of a
+    legacy DB, does not assign the legacy rows: F74). A 429 stops the run and starts the
+    sync backoff.
 
     Raises:
-        Busy; YnabRateLimited (the sync); YnabAuthError; YnabError.
+        Busy; YnabRateLimited (the sync); ConfigError (the account was deleted or closed in
+        YNAB, or is in another budget); YnabAuthError; YnabError.
     """
     with (
         LOCKS.operation(ctx.key, OP_CLEANUP),
         closing(_common.open_db(ctx, assign_legacy=not dry_run)) as conn,
     ):
         ynab = client or _common.client_for(ctx)
-        _common.synced_mirror(ctx, conn, ynab)
+        mirror = _common.synced_mirror(ctx, conn, ynab)
+        _common.check_account(ctx, mirror, nothing=_NOTHING_CHANGED)
         try:
             result = _cleanup.cleanup_pending_memos(
                 conn, ynab, budget_id=ctx.budget_id, account_id=ctx.account_id, dry_run=dry_run

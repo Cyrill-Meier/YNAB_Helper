@@ -31,7 +31,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     from ynab_helper import cli, container
     from ynab_helper.errors import YnabHelperError
 
-    if os.geteuid() == 0:
+    # os.geteuid does not exist on Windows (v1 ran wherever Python ran): no root to drop.
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() == 0:
         try:
             container.prepare_runtime()
         except (OSError, YnabHelperError) as exc:

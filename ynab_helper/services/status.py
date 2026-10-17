@@ -42,8 +42,15 @@ def sync(
     runs (no request is sent then; ``retry_after`` says how long it still lasts). Other YNAB
     errors are raised. Raises :class:`~ynab_helper.errors.Busy` while another operation of
     the user runs.
+
+    A sync writes only the mirror (a cache): on the first v2 open of a v1 database the
+    legacy ledger rows are left unclaimed — the next real import decides which account owns
+    them (F74).
     """
-    with LOCKS.operation(ctx.key, OP_SYNC), closing(_common.open_db(ctx)) as conn:
+    with (
+        LOCKS.operation(ctx.key, OP_SYNC),
+        closing(_common.open_db(ctx, assign_legacy=False)) as conn,
+    ):
         result = sync_and_refresh(
             client or _common.client_for(ctx),
             conn,
@@ -127,10 +134,14 @@ def account_status(
     The sync is skipped when another operation of the user is running (the cached mirror is
     shown) and while the backoff after a recent 429 runs (no request is sent, F17); a YNAB
     failure other than a rejected token is reported in ``sync_note`` instead of raised.
-    :class:`~ynab_helper.errors.YnabAuthError` propagates.
+    :class:`~ynab_helper.errors.YnabAuthError` propagates. Like :func:`sync`, it never
+    assigns legacy ledger rows to an account.
     """
     try:
-        with LOCKS.operation(ctx.key, OP_STATUS), closing(_common.open_db(ctx)) as conn:
+        with (
+            LOCKS.operation(ctx.key, OP_STATUS),
+            closing(_common.open_db(ctx, assign_legacy=False)) as conn,
+        ):
             note: str | None = None
             result: SyncResult | None = None
             try:
@@ -149,7 +160,7 @@ def account_status(
                 note = "YNAB's rate limit was reached; the numbers may be out of date."
             return _status_from_db(ctx, conn, result, note)
     except Busy as busy:
-        with closing(_common.open_db(ctx)) as conn:
+        with closing(_common.open_db(ctx, assign_legacy=False)) as conn:
             return _status_from_db(
                 ctx,
                 conn,

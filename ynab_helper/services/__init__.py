@@ -29,8 +29,19 @@ re-entrant, so composed operations call the ``_..._unlocked`` helpers under one 
 **Fresh state.** Operations that plan YNAB writes (import, reconcile, dedupe, cleanup) run
 a *forced* mirror sync first and refuse to continue when it was rate limited
 (:class:`~ynab_helper.errors.YnabRateLimited`): planning from a stale mirror could undo the
-user's edits in YNAB (F01). After a write the mirror is marked stale (the next non-forced
-sync runs) and a 429 starts the sync backoff (F17).
+user's edits in YNAB (F01). They then refuse, with
+:class:`~ynab_helper.errors.ConfigError` and before any write, an account YNAB no longer
+offers (deleted, closed, or not in the budget). After a write the mirror is marked stale
+(the next non-forced sync runs) and a 429 starts the sync backoff (F17).
+
+**Legacy rows.** The first v2 open of a v1 database migrates it (with a backup) and, if
+that open is allowed to, assigns the v1 ledger rows that have no account to
+``ctx.account_id``. Dry runs, previews, scans, syncs, status and the valuation syncs never
+assign them: they stay unclaimed (``''``). In practice the rows are claimed by the first
+real import (which claims unclaimed rows on every run) or by a non-dry memo cleanup that
+happens to be the first open; :func:`reconcile_apply` and :func:`dedupe_delete` allow the
+assignment too, but always follow the preview or scan that already migrated the database
+(F74).
 
 **Hooks.** YNAB clients come from :func:`make_client`, which delegates to the module
 attributes :data:`client_factory` (per :class:`UserContext`) and :data:`token_client_factory`
@@ -151,8 +162,9 @@ def _open_db(ctx: UserContext, *, assign_legacy: bool = True) -> sqlite3.Connect
     """Open (and migrate, with a backup first) the user's transactions DB.
 
     On the first v2 open of a legacy DB the migration assigns ledger rows without an account
-    to ``ctx.account_id``. ``assign_legacy=False`` (a dry run, F74) leaves them unclaimed
-    (``''``): which account owns the legacy history is decided by the next real import.
+    to ``ctx.account_id``. ``assign_legacy=False`` (read-only operations and dry runs, F74)
+    leaves them unclaimed (``''``): which account owns the legacy history is decided by the
+    next real import.
     """
     ctx.db_path.parent.mkdir(parents=True, exist_ok=True)
     cache = ctx.csv_dir if ctx.csv_dir is not None and ctx.csv_dir.is_dir() else None

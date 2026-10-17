@@ -279,7 +279,9 @@ def test_an_invalid_bitcoin_key_is_a_configuration_error(run_cli: Cli, fake: Fak
     assert code == cli.EXIT_USAGE and "Bitcoin" in err and "xpubTYPO" not in err
 
 
-def test_brokerage_sync(run_cli: Cli, fake: FakeYnab, monkeypatch: pytest.MonkeyPatch):
+@pytest.fixture
+def gateway(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """A fake IBKR gateway (account U7, NAV 2,500.50 CHF); returns the URLs requested."""
     seen: list[str] = []
 
     def request(method: str, url: str, **kwargs: Any) -> Any:
@@ -291,6 +293,11 @@ def test_brokerage_sync(run_cli: Cli, fake: FakeYnab, monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         services, "ibkr_client_factory", lambda url: IbkrClient(url, request=request)
     )
+    return seen
+
+
+def test_brokerage_sync(run_cli: Cli, fake: FakeYnab, gateway: list[str]):
+    seen = gateway
     code, out, _err = run_cli.run(
         "--brokerage-sync",
         "--brokerage-account-id",
@@ -303,6 +310,15 @@ def test_brokerage_sync(run_cli: Cli, fake: FakeYnab, monkeypatch: pytest.Monkey
     assert seen[0] == "https://localhost:5055/v1/api/portfolio/accounts"
     tx = next(t for t in live(fake, IBKR))
     assert tx["payee_name"] == "IBKR Portfolio Adjustment" and tx["amount"] == 2_500_500
+
+
+def test_brokerage_sync_dry_run_posts_nothing(run_cli: Cli, fake: FakeYnab, gateway: list[str]):
+    code, out, _err = run_cli.run("--brokerage-sync", "--brokerage-account-id", IBKR, "--dry-run")
+    assert code == cli.EXIT_OK
+    assert "IBKR account U7:" in out and "+2,500.50 CHF" in out
+    assert "Dry run: would post 'IBKR Portfolio Adjustment' +2,500.50 CHF" in out
+    assert mutations(fake) == [] and live(fake, IBKR) == []
+    assert not run_cli.db.exists()  # the valuation syncs touch no local database
 
 
 def test_brokerage_sync_with_a_bad_gateway_url_is_a_configuration_error(run_cli: Cli, fake):

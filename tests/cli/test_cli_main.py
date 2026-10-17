@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 from tests.fakes.fake_ynab import FAKE_TOKEN, FakeYnab
-from ynab_helper import cli, services
+from tests.legacy import v1_revolut_to_ynab as v1
+from ynab_helper import cli, config, services
 
-from .conftest import ACCT, BUDGET, OTHER, PENDING_A, Cli, live, mutations
+from .conftest import ACCT, BUDGET, OTHER, Cli, live, mutations
 
 #: Every v1 option with a sample value (store_true options get None).
 V1_OPTIONS: dict[str, str | None] = {
@@ -221,7 +222,8 @@ def test_a_ynab_failure_exits_two(run_cli: Cli, fake: FakeYnab):
 def test_a_rejected_token_exits_two_with_its_message(run_cli: Cli, fake: FakeYnab):
     fake.fail_next("GET", None, 401)
     code, _out, err = run_cli.run("--list-budgets")
-    assert code == cli.EXIT_FAILED and "Error:" in err
+    assert code == cli.EXIT_FAILED
+    assert "Error: YNAB rejected the access token" in err and FAKE_TOKEN not in err
 
 
 def test_ctrl_c_exits_130(run_cli: Cli, monkeypatch: pytest.MonkeyPatch):
@@ -255,10 +257,16 @@ def test_another_operation_on_the_same_db_exits_two(run_cli: Cli, fake: FakeYnab
 
 
 def test_no_v1_mode_writes_when_only_listing(run_cli: Cli, fake: FakeYnab):
-    for argv in (("--list-budgets",), ("--list-accounts",), ("--db-stats",)):
-        run_cli.run(*argv)
+    expected = {
+        "--list-budgets": cli.EXIT_OK,
+        "--list-accounts": cli.EXIT_OK,
+        "--db-stats": cli.EXIT_USAGE,  # no database yet: reported, and none is created
+    }
+    for option, exit_code in expected.items():
+        code, _out, _err = run_cli.run(option)
+        assert code == exit_code, option
     assert mutations(fake) == []
-    assert run_cli.statement(PENDING_A).exists()  # sanity: fixture helper works
+    assert not run_cli.db.exists()
 
 
 def test_a_file_that_is_not_a_database_exits_two(run_cli: Cli, tmp_path: Path, fake: FakeYnab):
@@ -269,3 +277,32 @@ def test_a_file_that_is_not_a_database_exits_two(run_cli: Cli, tmp_path: Path, f
         assert code == cli.EXIT_FAILED and err.startswith("Error:"), argv
         assert "unexpected" not in err
     assert fake.calls == []
+
+
+# ── backups of a migrated database ──────────────────────────────────────────
+
+
+def test_a_database_outside_the_bot_data_dir_is_backed_up_next_to_itself(tmp_path: Path):
+    settings = config.Settings.from_env(
+        {"HOME": str(tmp_path), "BOT_DATA_DIR": str(tmp_path / "bot_data")}
+    )
+    assert cli.backup_dir_for(tmp_path / "bot_data" / "transactions_42.db", settings) == (
+        settings.backups_dir
+    )
+    assert cli.backup_dir_for(tmp_path / ".revolut_to_ynab.db", settings) is None
+
+
+def test_the_cli_backs_up_a_bot_users_database_where_the_bot_keeps_its_backups(
+    run_cli: Cli, tmp_path: Path, fake: FakeYnab
+):
+    data = tmp_path / "bot_data"
+    data.mkdir()
+    run_cli.env["BOT_DATA_DIR"] = str(data)
+    db = data / "transactions_42.db"
+    v1.init_db(str(db)).close()  # a v1 database: the first v2 open migrates it
+    code, _out, _err = run_cli.run("--sync", "--db-path", str(db))
+    assert code == cli.EXIT_OK
+    backups = sorted(p.name for p in (data / "backups").iterdir())
+    assert len(backups) == 1 and backups[0].startswith("transactions_42.db.")
+    assert backups[0].endswith(".pre-v1.db")
+    assert not (data / "transactions_42_backups").exists()

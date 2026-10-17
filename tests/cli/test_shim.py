@@ -101,6 +101,13 @@ def test_as_a_normal_user_the_shim_only_runs_the_cli(shim, monkeypatch):
     assert calls == [("cli", ["--db-stats"])]
 
 
+def test_without_geteuid_windows_the_shim_runs_the_cli(shim, monkeypatch):
+    module, calls = shim
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    assert module.main(["--help"]) == 7  # v1 ran wherever Python ran; no AttributeError
+    assert calls == [("cli", ["--help"])]
+
+
 @pytest.mark.parametrize("error", [OSError("read-only file system"), YnabHelperError("drop")])
 def test_as_root_a_failed_preparation_refuses_to_run(monkeypatch, capsys, error):
     module = importlib.import_module("revolut_to_ynab")

@@ -523,44 +523,11 @@ def populated(mirror: MirrorStore) -> MirrorStore:
     return mirror
 
 
-def test_search_transactions_filters_and_escapes(populated: MirrorStore) -> None:
-    total, rows = populated.search_transactions(BUDGET)
-    assert total == 5 and [r["id"] for r in rows] == ["t6", "t5", "t3", "t2", "t1"]
-    assert rows[1]["account_name"] == "Revolut" and rows[1]["account_classification"] == "cash"
-
-    # LIKE wildcards are literal: '%' and '_' must not match everything.
-    assert [r["id"] for r in populated.search_transactions(BUDGET, text="100%")[1]] == ["t1"]
-    assert [r["id"] for r in populated.search_transactions(BUDGET, text="_")[1]] == ["t2"]
-    assert populated.search_transactions(BUDGET, text="%")[0] == 1
-    assert [r["id"] for r in populated.search_transactions(BUDGET, cleared="reconciled")[1]] == [
-        "t2"
-    ]
-    assert [r["id"] for r in populated.search_transactions(BUDGET, uncategorized=True)[1]] == ["t3"]
-    assert [r["id"] for r in populated.search_transactions(BUDGET, category="Dining")[1]] == ["t1"]
-    assert [
-        r["id"] for r in populated.search_transactions(BUDGET, account_ids=["acct-house"])[1]
-    ] == ["t6"]
-    ranged = populated.search_transactions(BUDGET, date_from="2026-08-02", date_to="2026-08-03")
-    assert [r["id"] for r in ranged[1]] == ["t3", "t2"]
-    total, page = populated.search_transactions(BUDGET, sort="amount", limit=2, offset=1)
-    assert total == 5 and [r["id"] for r in page] == ["t2", "t1"]
-    _, by_bad_sort = populated.search_transactions(BUDGET, sort="amount; DROP TABLE x")
-    assert by_bad_sort  # unknown sort column falls back to date
-    with pytest.raises(ValueError):
-        populated.search_transactions(BUDGET, cleared="everything")
-
-
-def test_categories_expand_splits(populated: MirrorStore) -> None:
-    cats = {c["name"]: (c["count"], c["spent"]) for c in populated.categories(BUDGET)}
-    # The split parent ("Split") is replaced by its lines; the deleted t4 is ignored.
-    assert cats == {
-        "": (1, 0),  # the uncategorised salary inflow
-        "Dining": (1, -1000),
-        "Groceries": (3, -2000 - 300 - 6000),
-        "Household": (1, -4000),
-    }
-    only_house = populated.categories(BUDGET, account_ids=["acct-house"])
-    assert [(c["name"], c["spent"]) for c in only_house] == [("Groceries", -300)]
+def test_core_R08_transaction_search_has_a_single_implementation() -> None:
+    # The web UI's search (web/queries.py) is the only one; a second, divergent copy on the
+    # store (it ignored split lines and off-budget accounts) must not come back.
+    assert not hasattr(MirrorStore, "search_transactions")
+    assert not hasattr(MirrorStore, "categories")
 
 
 def test_analytics_rows_replace_split_parents(populated: MirrorStore) -> None:

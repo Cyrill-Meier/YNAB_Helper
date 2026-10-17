@@ -556,7 +556,8 @@ def test_pass4_settlement_updates_the_amount() -> None:
     ("rows", "entry_kw", "why"),
     [
         ((_PAD, _SETTLED), {"csv_state": "COMPLETED"}, "entry not pending"),
-        ((_PAD, _SETTLED), {"status": "UNLINKED", "ynab_tx_id": None}, "entry not ACTIVE"),
+        ((_PAD, _SETTLED), {"status": "SUPERSEDED", "ynab_tx_id": None}, "entry removed by us"),
+        ((_PAD, _SETTLED), {"status": "REVERTED", "ynab_tx_id": None}, "entry reverted"),
         ((_PAD, _SETTLED), {"csv_payee": "Amazon US"}, "payee differs"),
         ((_PAD, ("2026-10-13 22:15:00", "Amazon EU", "-90.41")), {}, "two days apart"),
         (

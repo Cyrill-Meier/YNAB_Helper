@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -55,7 +55,6 @@ _CREDIT_TYPES = frozenset(
 )
 _TRACKING_TYPES = frozenset({"otherAsset", "otherLiability"})
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_SORT_COLUMNS = {"date": "t.date", "amount": "t.amount", "payee_name": "t.payee_name"}
 
 
 def classify_account(account_type: str | None, on_budget: bool) -> str:
@@ -388,17 +387,9 @@ def _account(row: sqlite3.Row) -> MirrorAccount:
     )
 
 
-def _escape_like(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 def _require_budget(budget_id: str) -> None:
     if not isinstance(budget_id, str) or not budget_id:
         raise ValueError("budget_id must be a non-empty string")
-
-
-def _placeholders(values: Sequence[Any]) -> str:
-    return ", ".join("?" for _ in values)
 
 
 # ── store ─────────────────────────────────────────────────────────────────────
@@ -671,106 +662,6 @@ class MirrorStore:
         return int(row[0])
 
     # ── reads for the web UI ──
-
-    def search_transactions(
-        self,
-        budget_id: str,
-        *,
-        account_ids: Sequence[str] | None = None,
-        text: str | None = None,
-        cleared: str | None = None,
-        category: str | None = None,
-        uncategorized: bool = False,
-        date_from: str | None = None,
-        date_to: str | None = None,
-        sort: str = "-date",
-        limit: int = 50,
-        offset: int = 0,
-    ) -> tuple[int, list[dict[str, Any]]]:
-        """Paginated list of live transactions for the web UI; returns ``(total, rows)``.
-
-        ``text`` matches payee or memo as a literal substring (LIKE wildcards escaped).
-        ``cleared`` ∈ {cleared, reconciled, uncleared} matches exactly that bucket. ``sort`` is
-        one of date/amount/payee_name with an optional ``-`` prefix for descending. Rows are
-        dicts with the transaction columns plus ``account_name`` and
-        ``account_classification``.
-        """
-        clauses = ["t.budget_id = ?", "t.deleted = 0"]
-        params: list[Any] = [budget_id]
-        if account_ids:
-            clauses.append(f"t.account_id IN ({_placeholders(account_ids)})")
-            params.extend(account_ids)
-        if text:
-            like = f"%{_escape_like(text)}%"
-            clauses.append("(t.payee_name LIKE ? ESCAPE '\\' OR t.memo LIKE ? ESCAPE '\\')")
-            params.extend([like, like])
-        if cleared:
-            if cleared not in (CLEARED, UNCLEARED, RECONCILED):
-                raise ValueError(f"unknown cleared filter {cleared!r}")
-            clauses.append("t.cleared = ?")
-            params.append(cleared)
-        if uncategorized:
-            clauses.append("(t.category_name IS NULL OR t.category_name = '')")
-        elif category:
-            clauses.append("t.category_name = ?")
-            params.append(category)
-        if date_from:
-            clauses.append("t.date >= ?")
-            params.append(date_from)
-        if date_to:
-            clauses.append("t.date <= ?")
-            params.append(date_to)
-        descending = sort.startswith("-")
-        column = _SORT_COLUMNS.get(sort.lstrip("-"), "t.date")
-        direction = "DESC" if descending else "ASC"
-        where = " AND ".join(clauses)
-        total = self._conn.execute(
-            f"SELECT COUNT(*) FROM ynab_transactions t WHERE {where}", params
-        ).fetchone()[0]
-        rows = self._conn.execute(
-            f"""SELECT t.id, t.account_id, t.date, t.amount, t.payee_name, t.memo, t.cleared,
-                       t.approved, t.category_name, t.import_id, t.transfer_account_id,
-                       t.flag_color, a.name AS account_name,
-                       a.classification AS account_classification
-                FROM ynab_transactions t LEFT JOIN accounts a ON a.account_id = t.account_id
-                WHERE {where}
-                ORDER BY {column} {direction}, t.id {direction}
-                LIMIT ? OFFSET ?""",
-            (*params, max(0, int(limit)), max(0, int(offset))),
-        ).fetchall()
-        return int(total), [dict(r) for r in rows]
-
-    def categories(
-        self, budget_id: str, *, account_ids: Sequence[str] | None = None
-    ) -> list[dict[str, Any]]:
-        """Distinct category names of live transactions with line count and outflow sum.
-
-        Split parents contribute through their live subtransactions. Uncategorised lines are
-        reported under the name ``''``.
-        """
-        clauses = ["t.budget_id = ?", "t.deleted = 0"]
-        params: list[Any] = [budget_id]
-        if account_ids:
-            clauses.append(f"t.account_id IN ({_placeholders(account_ids)})")
-            params.extend(account_ids)
-        where = " AND ".join(clauses)
-        rows = self._conn.execute(
-            f"""SELECT COALESCE(name, '') AS name, COUNT(*) AS n,
-                       SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS spent
-                FROM (
-                    SELECT t.category_name AS name, t.amount AS amount
-                    FROM ynab_transactions t
-                    WHERE {where} AND NOT EXISTS (
-                        SELECT 1 FROM ynab_subtransactions s
-                        WHERE s.transaction_id = t.id AND s.deleted = 0)
-                    UNION ALL
-                    SELECT s.category_name AS name, s.amount AS amount
-                    FROM ynab_subtransactions s JOIN ynab_transactions t ON t.id = s.transaction_id
-                    WHERE {where} AND s.deleted = 0)
-                GROUP BY COALESCE(name, '') ORDER BY name COLLATE NOCASE""",
-            (*params, *params),
-        ).fetchall()
-        return [{"name": r["name"], "count": r["n"], "spent": r["spent"] or 0} for r in rows]
 
     def analytics_rows(
         self,

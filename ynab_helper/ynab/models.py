@@ -21,6 +21,7 @@ from ynab_helper.errors import YnabError
 
 __all__ = [
     "CLEARED_STATES",
+    "MAX_IMPORT_ID_LENGTH",
     "YnabAccount",
     "YnabSubtransaction",
     "YnabTransaction",
@@ -29,6 +30,10 @@ __all__ = [
 #: Values YNAB uses for ``cleared``. Unknown values are kept verbatim (not rejected) so a
 #: future API addition does not break syncing; consumers compare against these constants.
 CLEARED_STATES = frozenset({"cleared", "uncleared", "reconciled"})
+
+#: YNAB rejects longer import_ids. Defined here (not in the client) so data-only users such as
+#: the pure import planner can check ids without importing the HTTP client.
+MAX_IMPORT_ID_LENGTH = 36
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 

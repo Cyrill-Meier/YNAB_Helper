@@ -6,9 +6,10 @@ in file order, ledger entries in key order). Every YNAB write is computed from Y
 
 Outline (:func:`plan_import`):
 
-1. *Learn export offsets* — rows whose key equals an ACTIVE/UNLINKED entry's key reveal the
-   timezone the export was rendered in (:func:`learn_offsets`); same-amount, same-payee pairs
-   inside the export window add votes (:func:`vote_offsets`, :func:`export_offsets`).
+1. *Learn export offsets* — rows whose key equals the key of an entry whose row every later
+   export still shows (ACTIVE, UNLINKED, DELETED_IN_YNAB, REVERTED) reveal the timezone the
+   export was rendered in (:func:`learn_offsets`); same-amount, same-payee pairs inside the
+   export window add votes (:func:`vote_offsets`, :func:`export_offsets`).
 2. *Match* CSV rows to ledger entries of this account (REKEYED tombstones ignored), each side
    at most once (:func:`match_rows`): timestamp identity, (amount, date) group assignment for
    legacy and date-only data, exact key, legacy date shift, settlement — plus
@@ -19,8 +20,11 @@ Outline (:func:`plan_import`):
    stripped), amount/date are written only when YNAB still holds what we wrote, never on
    reconciled or split transactions. Deleted-in-YNAB rows are never re-created.
 4. *Unmatched rows* → CREATE with a per-account unique import_id (:class:`ImportIdAllocator`),
-   unless YNAB already holds the row under an import_id no ledger entry knows (a create whose
-   ledger write was lost): that transaction is adopted instead.
+   unless YNAB already holds the row under an import_id no ledger entry knows: a transaction
+   with the row's amount and date (a create whose ledger write was lost, maybe settled since)
+   is adopted; then, for a row whose key no ledger entry knows, the transaction carrying that
+   key — live (adopted whatever the user changed) or deleted (recorded, never re-created).
+   That is v1's import_id dedupe, so a lost, wiped or restored ledger never duplicates (R02).
 5. *Superseded sweep* (only with ``opts.allow_sweep`` and an export that is not older than the
    ledger): unmatched pending entries the export provably covers, whose YNAB transaction is
    still uncleared, are deleted.
@@ -84,6 +88,7 @@ from ynab_helper.importer.models import (
     PlanOptions,
     PlanSkip,
     TxRef,
+    unconfirmed_write,
 )
 from ynab_helper.money import format_money
 from ynab_helper.revolut.parser import (
@@ -103,7 +108,7 @@ from ynab_helper.storage.ledger import (
     LedgerStatus,
 )
 from ynab_helper.storage.mirror import CLEARED, RECONCILED, UNCLEARED, MirrorView, YnabTx
-from ynab_helper.ynab.client import MAX_IMPORT_ID_LENGTH
+from ynab_helper.ynab.models import MAX_IMPORT_ID_LENGTH
 
 __all__ = [
     "MAX_EXPORT_OFFSET_SECONDS",
@@ -116,6 +121,7 @@ __all__ = [
     "actions_for_match",
     "compute_allow_sweep",
     "export_offsets",
+    "is_another_transaction",
     "is_timezone_offset",
     "learn_offsets",
     "match_rows",
@@ -162,6 +168,21 @@ _RECENCY_EVIDENCE = frozenset(
         LedgerStatus.DELETED_IN_YNAB.value,
         LedgerStatus.REVERTED.value,
     }
+)
+#: Entries whose timestamps tell which timezone an export is rendered in: the same set. A
+#: transaction the user deleted in YNAB, or one Revolut reverted, is still in every statement
+#: at its instant, so it identifies the export's frame as well as a live one does (R06) —
+#: otherwise a statement whose only overlap is such rows re-creates them. SUPERSEDED rows
+#: vanished from Revolut and say nothing about later statements.
+_FRAME_EVIDENCE = _RECENCY_EVIDENCE
+#: Pass 4 (settlement) considers pendings in these statuses, live ones first: a pending the
+#: user deleted in YNAB must be recognised when it settles at another amount, or the settled
+#: row would be POSTed again (R01); an UNLINKED pending (a create whose outcome is unknown)
+#: settles like an ACTIVE one.
+_SETTLEMENT_STATUSES = (
+    LedgerStatus.ACTIVE.value,
+    LedgerStatus.UNLINKED.value,
+    LedgerStatus.DELETED_IN_YNAB.value,
 )
 
 _LIVE_ROW_STATES = frozenset({STATE_COMPLETED, STATE_PENDING})
@@ -376,15 +397,27 @@ def _account_entries(ledger: Iterable[LedgerEntry], account_id: str) -> list[Led
 
 
 def _orphan_index(mirror: MirrorView) -> dict[tuple[int, str], list[YnabTx]]:
-    """Live transactions of the account whose import_id is a CSV-derived id that still
-    describes them (``YNAB:{amount}:{date}:{n}`` with the transaction's own amount and date),
-    grouped by (amount, date). Candidates for :func:`_find_orphan`."""
+    """Live transactions of the account whose import_id is a CSV-derived id
+    ``YNAB:{amount}:{date}:{n}`` that still describes them — with the transaction's own amount
+    and date, or one a settlement or re-dating changed since (:func:`_settled_since`) —
+    grouped by their *current* (amount, date). Candidates for :func:`_find_orphan`."""
     index: dict[tuple[int, str], list[YnabTx]] = defaultdict(list)
     for y in mirror.transactions():
         parsed = _parse_key(y.import_id)
-        if parsed is not None and (parsed[0], parsed[1]) == (y.amount, y.date):
+        if parsed is not None and (
+            (parsed[0], parsed[1]) == (y.amount, y.date) or _settled_since(parsed, y)
+        ):
             index[(y.amount, y.date)].append(y)
     return dict(index)
+
+
+def _settled_since(parsed: tuple[int, str, int], y: YnabTx) -> bool:
+    """True if ``y``, created as ``YNAB:{amount}:{date}:{n}`` (``parsed``), plausibly got its
+    current amount/date from a settlement or a timezone re-dating we wrote: same sign, and
+    at most one day from the date it was created with."""
+    amount, day, _n = parsed
+    days = _days_between(y.date, day)
+    return days is not None and abs(days) <= 1 and amount * y.amount > 0
 
 
 @dataclass(slots=True)
@@ -586,14 +619,15 @@ def _export_is_older(entries: Iterable[LedgerEntry], frame: ExportFrame) -> Ledg
 
 
 def learn_offsets(rows: Sequence[RevolutRow], entries: Iterable[LedgerEntry]) -> Counter[int]:
-    """Export offsets (seconds) observed on rows whose key equals an ACTIVE/UNLINKED entry's
-    key, both with started_at: ``row.started_at − entry.started_at`` when timezone-shaped.
+    """Export offsets (seconds) observed on rows whose key equals the key of an entry whose
+    row later exports still show (ACTIVE, UNLINKED, DELETED_IN_YNAB, REVERTED), both with
+    started_at: ``row.started_at − entry.started_at`` when timezone-shaped.
 
     Returns observation counts (0 is never counted; it is always an allowed offset).
     """
     by_key: dict[str, datetime] = {}
     for entry in entries:
-        if entry.status not in (LedgerStatus.ACTIVE, LedgerStatus.UNLINKED):
+        if entry.status not in _FRAME_EVIDENCE:
             continue
         ts = _parse_ts(entry.started_at)
         if ts is not None:
@@ -617,7 +651,8 @@ def _offset_votes(
     whose entry is inside the window, and those of distinctive pairs whose entry is one day
     outside it (see :func:`export_offsets`).
 
-    Voters are ACTIVE/UNLINKED timestamped entries dated inside the export window, plus —
+    Voters are timestamped entries whose row later exports still show (ACTIVE, UNLINKED,
+    DELETED_IN_YNAB, REVERTED) dated inside the export window, plus —
     with distinctive pairs only — entries dated one day outside it: a statement rendered in a
     timezone east (west) of the ledger's moves rows of the previous (next) day into its first
     (last) day, so with back-to-back statements every overlapping row crossed midnight.
@@ -632,7 +667,7 @@ def _offset_votes(
     entry_instants: set[tuple[int, datetime]] = set()
     voters: list[tuple[int, str, datetime, bool]] = []  # (amount, payee, ts, adjacent)
     for entry in entries:
-        if entry.status not in (LedgerStatus.ACTIVE, LedgerStatus.UNLINKED):
+        if entry.status not in _FRAME_EVIDENCE:
             continue
         ts = _parse_ts(entry.started_at)
         if ts is None:
@@ -676,7 +711,8 @@ def _offset_votes(
 
 def vote_offsets(export: ParsedExport, entries: Iterable[LedgerEntry]) -> Counter[int]:
     """Offset votes from same-amount, same-payee (CSV side) row/entry pairs, both timestamped,
-    the entry ACTIVE/UNLINKED and dated inside the export window (so its row must be in it) —
+    the entry's row still in every later export (ACTIVE, UNLINKED, DELETED_IN_YNAB, REVERTED)
+    and dated inside the export window (so its row must be in it) —
     or one day outside it, for pairs with non-zero seconds. Rows and entries that have a
     same-instant, same-amount counterpart do not vote.
 
@@ -722,12 +758,13 @@ def _shift_contradicted(export: ParsedExport, entries: Iterable[LedgerEntry], de
     """True if, rendered at ``delta``, the export would have to show a COMPLETED ledger
     entry (inside its window, before its newest timestamp) that it does not show at that
     instant — so the export is not rendered at ``delta``. (A pending may legitimately have
-    vanished or settled at another amount; a completed row stays.)"""
+    vanished or settled at another amount; a completed row stays, also when the user deleted
+    it in YNAB.)"""
     frame = ExportFrame.of(export, (delta,))
     row_instants = {(r.amount, s) for r in export.rows if (s := _row_started(r)) is not None}
     shift = timedelta(seconds=delta)
     for entry in entries:
-        if entry.status not in (LedgerStatus.ACTIVE, LedgerStatus.UNLINKED):
+        if entry.status not in _FRAME_EVIDENCE:
             continue
         ts = _parse_ts(entry.started_at)
         if ts is None or entry.csv_state != CsvState.COMPLETED or not frame.covers(entry):
@@ -738,13 +775,13 @@ def _shift_contradicted(export: ParsedExport, entries: Iterable[LedgerEntry], de
 
 
 def _zero_offset_evidence(rows: Sequence[RevolutRow], entries: Iterable[LedgerEntry]) -> int:
-    """How many rows have an ACTIVE/UNLINKED entry of the same amount at the very same
-    instant: the evidence that the export is rendered in the ledger's frame (d = 0)."""
+    """How many rows have an entry of the same amount at the very same instant (an entry
+    whose row later exports still show, :data:`_FRAME_EVIDENCE`): the evidence that the
+    export is rendered in the ledger's frame (d = 0)."""
     instants = {
         (e.csv_amount, ts)
         for e in entries
-        if e.status in (LedgerStatus.ACTIVE, LedgerStatus.UNLINKED)
-        and (ts := _parse_ts(e.started_at)) is not None
+        if e.status in _FRAME_EVIDENCE and (ts := _parse_ts(e.started_at)) is not None
     }
     return sum(1 for r in rows if (s := _row_started(r)) is not None and (r.amount, s) in instants)
 
@@ -790,8 +827,12 @@ def match_rows(
        with both timestamps present but not offset-compatible is a renumbering collision.
     3. *Legacy date shift* across midnight (F10 guards; the CSV payee must match for csv
        entries only — a legacy entry's payee may be YNAB's renamed one, F11).
-    4. *Settlement*: a pending (ACTIVE) settled at a different amount, maybe re-dated; at the
-       very instant also a REVERTED row (re-quoted, then reverted).
+    4. *Settlement*: a pending settled at a different amount, maybe re-dated; at the very
+       instant also a REVERTED row (re-quoted, then reverted). ACTIVE pendings are matched
+       first, then UNLINKED ones, then — at their very instant only — pendings the user
+       deleted in YNAB (whose settled row must not be POSTed again, R01). The entry's date
+       (``csv_date``, §6.2) or its instant under a plausible offset must lie inside the
+       window.
     4b. *Pre-settlement*: an older export still shows a since-settled (re-quoted, reverted,
         removed) pending at its earlier amount.
 
@@ -929,22 +970,32 @@ def match_rows(
     for ri, ei in _unique_pairs(pass3):
         take(ri, ei, MatchMethod.DATE_SHIFT)
 
-    # Pass 4 — settlement: a pending (ACTIVE) settled at a different amount, maybe re-dated.
-    # The window test shifts the entry by the offsets the matches so far actually used.
+    # Pass 4 — settlement: a pending settled at a different amount, maybe re-dated. The entry
+    # is in the window by its date as last rendered (§6.2) or by its instant shifted by the
+    # offsets the matches so far actually used (a statement in another timezone, R06). While
+    # the statement taught no offset, an entry outside the window but within any plausible
+    # rendering of it is a candidate for *distinctive* instant pairs only (see below).
     frame = ExportFrame.of(export, _used_offsets(matched_rows.values()))
+    unlearned = not any(ranks)  # 0 is the only allowed offset
+    any_rendering = ExportFrame.of(export, (-MAX_EXPORT_OFFSET_SECONDS, MAX_EXPORT_OFFSET_SECONDS))
+    in_window: set[int] = set()
     pass4: list[tuple[int, int]] = []
     if window is not None:
         pending_by_payee: dict[str, list[int]] = defaultdict(list)
         for ei in eligible:
             entry = entries[ei]
             if (
-                ei not in matched_entries
-                and entry.status == LedgerStatus.ACTIVE
-                and entry.csv_state == CsvState.PENDING
-                and frame.touches_window(entry)
-                and _norm_payee(entry.csv_payee)
+                ei in matched_entries
+                or entry.status not in _SETTLEMENT_STATUSES
+                or entry.csv_state != CsvState.PENDING
+                or not _norm_payee(entry.csv_payee)
             ):
-                pending_by_payee[_norm_payee(entry.csv_payee)].append(ei)
+                continue
+            if _in_window(entry.csv_date, window) or frame.touches_window(entry):
+                in_window.add(ei)
+            elif not (unlearned and any_rendering.touches_window(entry)):
+                continue
+            pending_by_payee[_norm_payee(entry.csv_payee)].append(ei)
         for ri, row in enumerate(rows):
             if ri in matched_rows:
                 continue
@@ -959,23 +1010,61 @@ def match_rows(
                 if row.amount * entry.csv_amount <= 0:
                     continue  # a sign flip (refund vs charge) is never a settlement
                 pass4.append((ri, ei))
+
     # Revolut keeps the Started Date when a pending settles: a candidate at the entry's very
     # instant (modulo an offset) is decisive even when other rows of the merchant are near
     # (several Amazon orders). Those pairs are matched first; the rest needs uniqueness.
     # A REVERTED row is only taken at the very instant: a pending re-quoted by FX and then
-    # reverted (it is deleted from YNAB like any reverted pending).
-    timed = [(ri, ei) for ri, ei in pass4 if delta_of(ri, ei) in ranks]
-    for ri, ei in _unique_pairs(timed):
-        take(ri, ei, MatchMethod.SETTLEMENT, delta_of(ri, ei))
-    rest = [
-        (ri, ei)
-        for ri, ei in pass4
-        if ri not in matched_rows
-        and ei not in matched_entries
-        and rows[ri].state in _LIVE_ROW_STATES
+    # reverted (it is deleted from YNAB like any reverted pending). Each round takes live
+    # entries first (ACTIVE, then UNLINKED, then DELETED_IN_YNAB), uniqueness within a tier.
+    # A pending the user deleted is only recognised at its very instant: matching it to a
+    # merely unique nearby row could swallow a new purchase (it would never be created).
+    # Without a learned offset, "its very instant" may be under any timezone-shaped delta
+    # whose timestamps have non-zero seconds (two transactions of one merchant an exact
+    # multiple of 15 minutes apart to the second are a ~1/900 coincidence; F10's round-time
+    # transfers never qualify) — the settled row is then the only overlap of a statement
+    # rendered in another timezone.
+    def instant(ri: int, ei: int) -> bool:
+        delta = delta_of(ri, ei)
+        if delta in ranks:
+            return True
+        started = row_ts[ri]
+        return (
+            unlearned
+            and delta is not None
+            and started is not None
+            and started.second != 0
+            and is_timezone_offset(delta)
+        )
+
+    tiers = [
+        [(ri, ei) for ri, ei in pass4 if entries[ei].status == status]
+        for status in _SETTLEMENT_STATUSES
     ]
-    for ri, ei in _unique_pairs(rest):
-        take(ri, ei, MatchMethod.SETTLEMENT)
+    live_tiers = [
+        tier
+        for status, tier in zip(_SETTLEMENT_STATUSES, tiers, strict=True)
+        if status != LedgerStatus.DELETED_IN_YNAB
+    ]
+    for tier in tiers:
+        timed = [
+            (ri, ei)
+            for ri, ei in tier
+            if ri not in matched_rows and ei not in matched_entries and instant(ri, ei)
+        ]
+        for ri, ei in _unique_pairs(timed):
+            take(ri, ei, MatchMethod.SETTLEMENT, delta_of(ri, ei))
+    for tier in live_tiers:
+        rest = [
+            (ri, ei)
+            for ri, ei in tier
+            if ri not in matched_rows
+            and ei not in matched_entries
+            and ei in in_window
+            and rows[ri].state in _LIVE_ROW_STATES
+        ]
+        for ri, ei in _unique_pairs(rest):
+            take(ri, ei, MatchMethod.SETTLEMENT)
 
     # Pass 4b — a pending seen from an older export: a PENDING row at the very instant
     # (modulo an offset) and payee of an entry that is no longer a live pending (settled,
@@ -1195,6 +1284,14 @@ def actions_for_match(
     if entry.ynab_tx_id and status != LedgerStatus.UNLINKED:
         ctx.claimed_tx_ids.add(entry.ynab_tx_id)
     if status == LedgerStatus.DELETED_IN_YNAB:
+        if row.state == STATE_REVERTED:
+            # Reverted by Revolut and gone from YNAB: the intended end state, whoever removed
+            # it (v1's importer deleted reverted pendings and its YNAB sync then made them
+            # look user-deleted, R17). Recorded as REVERTED, not reported as a user deletion.
+            updates = {"status": LedgerStatus.REVERTED.value, **_backfill(row, entry, ctx, method)}
+            out = MatchOutcome(unchanged=True)
+            out.actions.append(_ledger_action(entry, row, updates, REASON_REVERTED))
+            return out
         out = MatchOutcome(ignored_deleted=True)
         updates = {} if _row_is_older(row, entry, ctx) else _backfill(row, entry, ctx, method)
         if updates:
@@ -1514,15 +1611,23 @@ def _active_entry(
             fields["memo"] = memo
             changes["memo"] = (y.memo, memo)
 
+    # YNAB holding what we wrote: the pushed value, or the value of a write whose outcome we
+    # never learned. YNAB already showing the statement's new value is not ours otherwise
+    # (the user's edit): pushed_* then stays, so a later re-rendering does not undo it (R11).
+    intent = unconfirmed_write(entry)
+    if intent:
+        updates["last_error"] = None
     if row.amount != entry.csv_amount:
-        ours = entry.pushed_amount if entry.pushed_amount is not None else entry.csv_amount
-        if y.amount == ours and not y.has_subtransactions and y.cleared != RECONCILED:
+        ours = {entry.pushed_amount if entry.pushed_amount is not None else entry.csv_amount}
+        if "amount" in intent:
+            ours.add(intent["amount"])
+        if y.amount == row.amount:
+            if entry.pushed_amount is None or intent.get("amount") == row.amount:
+                updates["pushed_amount"] = row.amount
+        elif y.amount in ours and not y.has_subtransactions and y.cleared != RECONCILED:
             fields["amount"] = row.amount
             changes["amount"] = (y.amount, row.amount)
             updates["pushed_amount"] = row.amount
-        elif y.amount == row.amount:
-            if entry.pushed_amount != row.amount:
-                updates["pushed_amount"] = row.amount  # YNAB already agrees with the CSV
         else:
             out.warnings.append(
                 f"{ctx.describe_row(row)}: amount changed in Revolut "
@@ -1532,12 +1637,15 @@ def _active_entry(
             )
 
     if row.date != entry.csv_date:
-        ours_date = entry.pushed_date or entry.csv_date
-        if y.date == ours_date and y.cleared != RECONCILED and not y.has_subtransactions:
+        ours_dates = {entry.pushed_date or entry.csv_date}
+        if "date" in intent:
+            ours_dates.add(intent["date"])
+        if y.date == row.date:
+            if entry.pushed_date is None or intent.get("date") == row.date:
+                updates["pushed_date"] = row.date
+        elif y.date in ours_dates and y.cleared != RECONCILED and not y.has_subtransactions:
             fields["date"] = row.date
             changes["date"] = (y.date, row.date)
-            updates["pushed_date"] = row.date
-        elif y.date == row.date and entry.pushed_date != row.date:
             updates["pushed_date"] = row.date
 
     updates = {k: v for k, v in updates.items() if getattr(entry, k) != v}
@@ -1583,6 +1691,13 @@ def _active_entry(
 # ── executor support: a CREATE answered "duplicate import_id" (§6.3 step 2) ──
 
 
+def is_another_transaction(row: RevolutRow, y: YnabTx | None) -> bool:
+    """True if ``y`` — the live transaction YNAB holds under the import_id POSTed for ``row``
+    — has another amount or date than the row, so a duplicate answer does not prove it is
+    this row (:func:`resolve_duplicate` does not link it)."""
+    return y is not None and not y.deleted and (y.amount != row.amount or y.date != row.date)
+
+
 #: Columns a duplicate resolution sets on an existing entry besides its planned updates.
 _LINK_COLUMNS = (
     "status",
@@ -1610,9 +1725,9 @@ def resolve_duplicate(
     * deleted in YNAB → DELETED_IN_YNAB (never re-created);
     * already linked from another entry → no link, warning (never two live links, F02); a new
       row's entry is recorded as UNLINKED;
-    * live, but with another amount or date than the row → not linked (it may be a different
-      transaction whose amount was settled), nothing recorded, warning: the next import
-      creates the row under a fresh import_id;
+    * live, but with another amount or date than the row (:func:`is_another_transaction`) →
+      not linked (it may be a different transaction whose amount was settled), nothing
+      recorded, warning: the next import decides with the whole statement (§6.2 step 4);
     * otherwise → LINK, followed by the same treatment as any ACTIVE match, computed from
       ``y``'s current state (cleared/memo; amount and date already equal the row's).
 
@@ -1682,12 +1797,12 @@ def resolve_duplicate(
         if not action.entry_exists:
             record(placeholder, REASON_LINK_UNKNOWN)
         return out
-    if y.amount != row.amount or y.date != row.date:
+    if is_another_transaction(row, y):
         out.unchanged = True
         out.warnings.append(
             f"{ctx.describe_row(row)}: YNAB already has import_id {action.import_id} for "
-            f"{y.date} {format_money(y.amount, ctx.currency)} — not linked; the next import "
-            "creates the row under a new import_id. Please check for a duplicate."
+            f"{y.date} {format_money(y.amount, ctx.currency)} — not linked in this import; "
+            "the next one checks it against the whole statement. Please check for a duplicate."
         )
         return out
     linked = dataclasses.replace(placeholder, status=LedgerStatus.ACTIVE.value, **observed)
@@ -1703,12 +1818,14 @@ def resolve_duplicate(
 
 def _find_orphan(row: RevolutRow, ctx: PlanContext) -> YnabTx | None:
     """A live YNAB transaction of the account that is our own earlier create of ``row`` whose
-    ledger write was lost (crash after the POST, lost response, a row imported through
-    another DB such as the CLI's): its import_id is ``YNAB:{row.amount}:{row.date}:{n}`` (the
-    row's key or a fresh id of §6.4), it still has the row's amount and date, no ledger entry
-    knows the id and none links the transaction. Prefers the row's own key, then the smallest
-    n. v1 converged the same way through YNAB's import_id dedupe."""
-    best: tuple[bool, int, str] | None = None
+    ledger write was lost (crash after the POST, lost response, a lost or restored ledger, a
+    row imported through another DB such as the CLI's): it has the row's amount and date, its
+    import_id is a CSV-derived id that no ledger entry knows — ``YNAB:{row.amount}:{row.date}:
+    {n}`` (the row's key or a fresh id of §6.4), or the id of the pending it was before a
+    settlement or re-dating changed it (:func:`_settled_since`) — and no entry links it.
+    Prefers the row's own key, then ids with the row's amount and date, then the smallest n.
+    v1 converged the same way through YNAB's import_id dedupe."""
+    best: tuple[bool, bool, int, str] | None = None
     found: YnabTx | None = None
     for y in ctx.orphans.get((row.amount, row.date), ()):
         import_id = y.import_id or ""
@@ -1719,10 +1836,74 @@ def _find_orphan(row: RevolutRow, ctx: PlanContext) -> YnabTx | None:
         ):
             continue
         parsed = _parse_key(import_id)
-        rank = (import_id != row.key, parsed[2] if parsed else 0, y.id)
+        exact = parsed is not None and (parsed[0], parsed[1]) == (row.amount, row.date)
+        rank = (import_id != row.key, not exact, parsed[2] if parsed else 0, y.id)
         if best is None or rank < best:
             best, found = rank, y
     return found
+
+
+def _key_holder(row: RevolutRow, ctx: PlanContext) -> YnabTx | None:
+    """The transaction of the account carrying ``row.key`` as its import_id when no ledger
+    entry knows that key, none links the transaction and this plan does not POST the key:
+    YNAB would refuse the row as a duplicate of it (v1's idempotency, R02). Live or deleted,
+    whatever amount or date the user (or another database's settlement) gave it since."""
+    if ctx.ids.known_to_ledger(row.key) or ctx.ids.is_planned(row.key):
+        return None
+    y = ctx.mirror.by_import_id(row.key)
+    if y is None or y.id in ctx.holders:
+        return None
+    return y
+
+
+def _deleted_key_holder(
+    row: RevolutRow, y: YnabTx, opts: PlanOptions, ctx: PlanContext
+) -> MatchOutcome:
+    """Record ``row`` as the deleted transaction ``y`` that carries its key (no ledger entry
+    knew it): DELETED_IN_YNAB — never re-created — or REVERTED for a reverted row."""
+    reverted = row.state == STATE_REVERTED
+    status = LedgerStatus.REVERTED if reverted else LedgerStatus.DELETED_IN_YNAB
+    recorded = LedgerEntry(
+        account_id=opts.account_id,
+        key=row.key,
+        ynab_import_id=row.key,
+        ynab_tx_id=y.id,
+        status=status.value,
+        csv_date=row.date,
+        csv_amount=row.amount,
+        csv_payee=row.payee,
+        csv_type=row.type,
+        csv_state=row.state,
+        started_at=ctx.started_text(row),
+        identity=IDENTITY_CSV,
+        pushed_cleared=_observed_cleared(y),
+        pushed_amount=row.amount,  # what was POSTed under the row's key (see _adopt_orphan)
+        pushed_date=row.date,
+    )
+    ctx.holders[y.id] = row.key
+    ctx.claimed_tx_ids.add(y.id)
+    ctx.ids.reserve(row.key)
+    ref = _tx_ref(y, row.payee)
+    out = MatchOutcome(unchanged=reverted, ignored_deleted=not reverted)
+    if not reverted:
+        out.warnings.append(
+            f"{ctx.describe_row(row)}: deleted in YNAB — it will not be re-created."
+        )
+    out.actions.append(
+        PlannedAction(
+            kind=ActionKind.LEDGER,
+            account_id=opts.account_id,
+            entry_key=row.key,
+            reason=REASON_REVERTED if reverted else REASON_DELETED_IN_YNAB,
+            row=row,
+            ynab_tx_id=y.id,
+            entry=recorded,
+            before=ref,
+            after=ref,
+            note="YNAB already had this row (deleted); its ledger entry was missing",
+        )
+    )
+    return out
 
 
 def _adopt_orphan(
@@ -1733,9 +1914,17 @@ def _adopt_orphan(
     *,
     replaces_key: str | None = None,
 ) -> MatchOutcome:
-    """LINK ``row`` to the orphan ``y`` (:func:`_find_orphan`) as a new ledger entry keyed by
-    ``y``'s import_id, then apply the usual per-match rules to it. ``replaces_key`` is the
-    removed entry a re-created row replaces (it becomes a REKEYED tombstone)."""
+    """LINK ``row`` to the orphan ``y`` (:func:`_find_orphan`, or the transaction carrying the
+    row's key, :func:`_key_holder`) as a new ledger entry keyed by ``y``'s import_id, then
+    apply the usual per-match rules to it. ``replaces_key`` is the removed entry a re-created
+    row replaces (it becomes a REKEYED tombstone).
+
+    The entry describes the row (``csv_state`` included: a pending row stays a pending that
+    can settle later, even when YNAB shows it cleared). ``pushed_amount``/``pushed_date`` are
+    the row's: what an importer wrote — the orphan has them (§6.4 id with the row's amount
+    and date, or what a settlement wrote), the key holder was created with them. Another
+    amount or date on a key holder is therefore an edit in YNAB, and is never overwritten.
+    The usual rules (clear, strip the marker, delete if reverted) apply to what YNAB holds."""
     import_id = y.import_id or row.key
     linked = LedgerEntry(
         account_id=opts.account_id,
@@ -1747,14 +1936,12 @@ def _adopt_orphan(
         csv_amount=row.amount,
         csv_payee=row.payee,
         csv_type=row.type,
-        # The state YNAB reflects, so the usual rules (clear, strip the marker, delete if
-        # reverted) apply to what is actually there.
-        csv_state=(CsvState.PENDING if y.cleared == UNCLEARED else CsvState.COMPLETED).value,
+        csv_state=row.state,
         started_at=ctx.started_text(row),
         identity=IDENTITY_CSV,
         pushed_cleared=_observed_cleared(y),
-        pushed_amount=y.amount,
-        pushed_date=y.date,
+        pushed_amount=row.amount,
+        pushed_date=row.date,
     )
     ctx.holders[y.id] = import_id
     ctx.claimed_tx_ids.add(y.id)
@@ -1898,20 +2085,41 @@ def plan_import(
 
     # Step 4.
     matched_rows = {p.row_index for p in pairs}
-    held_back = 0
-    for ri, row in enumerate(rows):
-        if ri in matched_rows:
-            continue
-        orphan = _find_orphan(row, ctx)
+    unmatched = [ri for ri in range(len(rows)) if ri not in matched_rows]
+    adopted_rows: set[int] = set()
+
+    def adopt(ri: int, outcome: MatchOutcome) -> None:
+        row = rows[ri]
+        adopted_rows.add(ri)
+        plan.matches.append(
+            MatchInfo(row.line_no, row.key, outcome.actions[0].entry_key, MatchMethod.ADOPTED)
+        )
+        method_counts[MatchMethod.ADOPTED.value] += 1
+        actions.extend(outcome.actions)
+        plan.warnings.extend(outcome.warnings)
+        skipped.extend(outcome.skipped)
+        if outcome.ignored_deleted:
+            plan.ignored_deleted += 1
+
+    # Transactions YNAB holds for unmatched rows that no ledger entry knows: first by the
+    # row's amount and date (all rows, so a settled transaction goes to its settled row and
+    # not to a new row that now carries its old key), then by the row's key.
+    for ri in unmatched:
+        orphan = _find_orphan(rows[ri], ctx)
         if orphan is not None:
-            adopted = _adopt_orphan(row, orphan, opts, ctx)
-            plan.matches.append(
-                MatchInfo(row.line_no, row.key, adopted.actions[0].entry_key, MatchMethod.ADOPTED)
-            )
-            method_counts[MatchMethod.ADOPTED.value] += 1
-            actions.extend(adopted.actions)
-            plan.warnings.extend(adopted.warnings)
-            skipped.extend(adopted.skipped)
+            adopt(ri, _adopt_orphan(rows[ri], orphan, opts, ctx))
+    for ri in unmatched:
+        holder = None if ri in adopted_rows else _key_holder(rows[ri], ctx)
+        if holder is None:
+            continue
+        if holder.deleted:
+            adopt(ri, _deleted_key_holder(rows[ri], holder, opts, ctx))
+        else:
+            adopt(ri, _adopt_orphan(rows[ri], holder, opts, ctx))
+    held_back = 0
+    for ri in unmatched:
+        row = rows[ri]
+        if ri in adopted_rows:
             continue
         if row.state == STATE_REVERTED:
             skipped.append(

@@ -51,15 +51,17 @@ from ynab_helper.errors import (
     YnabValidationError,
 )
 from ynab_helper.net import parse_retry_after, redact_text
-from ynab_helper.ynab.models import YnabAccount, YnabTransaction
+from ynab_helper.ynab.models import MAX_IMPORT_ID_LENGTH, YnabAccount, YnabTransaction
 
 __all__ = [
     "CREATE_CHUNK_SIZE",
     "DEFAULT_BASE_URL",
     "MAX_IMPORT_ID_LENGTH",
     "MAX_RETRY_AFTER",
+    "TOTAL_TIMEOUT_FACTOR",
     "UPDATE_CHUNK_SIZE",
     "CreateResult",
+    "ResponseDeadlineExceeded",
     "ResponseTooLarge",
     "Transport",
     "YnabClient",
@@ -73,14 +75,19 @@ DEFAULT_BASE_URL = "https://api.ynab.com/v1"
 CREATE_CHUNK_SIZE = 100
 #: Bulk PATCH chunk size (kept small so one rejected row affects few others).
 UPDATE_CHUNK_SIZE = 50
-#: YNAB rejects longer import_ids.
-MAX_IMPORT_ID_LENGTH = 36
 #: The longest server-requested ``Retry-After`` (seconds) we are willing to sleep for.
 MAX_RETRY_AFTER = 10.0
 #: Upper bound for the computed (non Retry-After) backoff delay.
 MAX_BACKOFF = 10.0
 #: Defensive cap on response bodies (a full budget delta is a few MB).
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+#: Per-attempt deadline of the default transport, as a multiple of ``timeout``. The socket
+#: timeout bounds each single read only, so a server trickling its body slower than that
+#: could otherwise hold the user's operation lock and a worker indefinitely (the same policy
+#: as :mod:`ynab_helper.net`).
+TOTAL_TIMEOUT_FACTOR = 3
+#: Bodies are read in chunks so the deadline is checked between socket reads.
+_READ_CHUNK_BYTES = 64 * 1024
 
 USER_AGENT = f"ynab-helper/{__version__}"
 
@@ -118,11 +125,39 @@ class ResponseTooLarge(http.client.HTTPException):
     """
 
 
-def _read_capped(stream: Any) -> bytes:
-    payload = stream.read(MAX_RESPONSE_BYTES + 1)
-    if len(payload) > MAX_RESPONSE_BYTES:
+class ResponseDeadlineExceeded(TimeoutError):
+    """The response did not arrive completely within the per-attempt deadline.
+
+    Raised by :func:`urllib_transport`; an ``OSError``, so the client reports a (retriable)
+    network error.
+    """
+
+
+def _read_capped(
+    stream: Any,
+    deadline: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> bytes:
+    """Read ``stream`` to EOF, at most :data:`MAX_RESPONSE_BYTES`, before ``deadline``.
+
+    ``read1`` (one socket read per call) is preferred: ``read(n)`` keeps reading until ``n``
+    bytes arrived, which would hide a trickling server from the deadline check.
+    """
+    read1 = getattr(stream, "read1", None)
+    read = read1 if callable(read1) else stream.read
+    chunks: list[bytes] = []
+    size = 0
+    while size <= MAX_RESPONSE_BYTES:
+        if deadline is not None and clock() >= deadline:
+            raise ResponseDeadlineExceeded("response body not complete before the deadline")
+        chunk = read(min(_READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    if size > MAX_RESPONSE_BYTES:
         raise ResponseTooLarge(f"response body exceeds {MAX_RESPONSE_BYTES} bytes")
-    return payload
+    return b"".join(chunks)
 
 
 def urllib_transport(
@@ -132,15 +167,21 @@ def urllib_transport(
     body: bytes | None,
     timeout: float,
 ) -> tuple[int, Mapping[str, str], bytes]:
-    """Default :data:`Transport` built on ``urllib`` (stdlib only, redirects disabled)."""
+    """Default :data:`Transport` built on ``urllib`` (stdlib only, redirects disabled).
+
+    ``timeout`` applies to every socket operation; the whole exchange must also finish
+    within ``timeout × TOTAL_TIMEOUT_FACTOR`` (:class:`ResponseDeadlineExceeded`).
+    """
+    deadline = time.monotonic() + timeout * TOTAL_TIMEOUT_FACTOR
     request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
     try:
         with _OPENER.open(request, timeout=timeout) as response:
-            return response.status, dict(response.headers.items()), _read_capped(response)
+            payload = _read_capped(response, deadline)
+            return response.status, dict(response.headers.items()), payload
     except urllib.error.HTTPError as err:
         # An HTTP error status is a response, not a transport failure.
         try:
-            payload = _read_capped(err)
+            payload = _read_capped(err, deadline)
         except _NETWORK_ERRORS:
             payload = b""
         finally:

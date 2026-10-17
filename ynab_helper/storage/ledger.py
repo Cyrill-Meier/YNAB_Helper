@@ -344,6 +344,18 @@ class LedgerStore:
             )
             return updated
 
+    def delete_unlinked(self, account_id: str, key: str) -> bool:
+        """Remove an UNLINKED entry that links nothing (the executor's placeholder for a
+        create, :mod:`ynab_helper.importer.executor`). Any other entry is left alone.
+        Returns whether a row was removed."""
+        with transaction(self._conn):
+            removed = self._conn.execute(
+                "DELETE FROM import_ledger WHERE account_id = ? AND key = ? AND status = ? "
+                "AND ynab_tx_id IS NULL",
+                (account_id, key, LedgerStatus.UNLINKED.value),
+            ).rowcount
+        return bool(removed)
+
     def set_status(
         self, account_id: str, key: str, status: str, *, last_error: str | None = None
     ) -> LedgerEntry:

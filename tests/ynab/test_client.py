@@ -30,8 +30,8 @@ from ynab_helper.errors import (
     YnabValidationError,
 )
 from ynab_helper.net import parse_retry_after
-from ynab_helper.ynab import YnabClient, YnabTransaction
-from ynab_helper.ynab.client import ResponseTooLarge, _parse_rate_limit
+from ynab_helper.ynab.client import ResponseTooLarge, YnabClient, _parse_rate_limit
+from ynab_helper.ynab.models import YnabTransaction
 
 SECRET = "sEcReT-PAT-0123456789abcdef"
 

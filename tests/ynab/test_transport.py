@@ -14,8 +14,8 @@ import pytest
 
 from ynab_helper import __version__
 from ynab_helper.errors import YnabError, YnabNetworkError, YnabNotFound
-from ynab_helper.ynab import YnabClient, urllib_transport
 from ynab_helper.ynab import client as client_module
+from ynab_helper.ynab.client import YnabClient, urllib_transport
 
 TOKEN = "loopback-token-123"
 
@@ -65,6 +65,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"data": {}})
         elif self.path == "/v1/close":
             self.close_connection = True  # read the request, answer nothing
+        elif self.path == "/v1/trickle":
+            body = json.dumps({"data": {"user": {"id": "slowpoke"}}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for byte in body:  # one byte every 50 ms: each read is well within timeout
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except OSError:
+                pass  # the client gave up
         else:
             self._send(404, {"error": {"id": "404.1", "name": "not_found", "detail": "nope"}})
 
@@ -203,3 +216,48 @@ def test_oversized_body_is_not_retried(server: _Server, monkeypatch: pytest.Monk
     assert info.value.retriable is False
     assert "large" in info.value.user_message
     assert [s["path"] for s in server.seen] == ["/v1/user"]  # one download, not three
+
+
+def test_core_R15_trickling_body_hits_the_per_attempt_deadline(server: _Server) -> None:
+    # Every byte arrives well within the 0.2 s socket timeout, but the whole body would take
+    # ~2.5 s: the attempt must end at its deadline (3 × timeout) as a retriable network error.
+    client = _client(server, timeout=0.2, max_retries=0)
+    started = time.monotonic()
+    with pytest.raises(YnabNetworkError) as info:
+        client._request("GET", "/trickle")
+    elapsed = time.monotonic() - started
+    assert 0.5 <= elapsed < 1.5
+    assert info.value.retriable is True
+
+
+def test_core_R15_read_capped_checks_the_deadline_between_reads() -> None:
+    now = [0.0]
+
+    class Stream:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read1(self, _n: int) -> bytes:
+            self.reads += 1
+            now[0] += 1.0  # each socket read takes one "second"
+            return b"x"
+
+    stream = Stream()
+    with pytest.raises(client_module.ResponseDeadlineExceeded):
+        client_module._read_capped(stream, deadline=3.0, clock=lambda: now[0])
+    assert stream.reads == 3
+    assert isinstance(client_module.ResponseDeadlineExceeded(), OSError)
+
+
+def test_core_R15_read_capped_prefers_single_socket_reads() -> None:
+    class Stream:
+        def __init__(self) -> None:
+            self.parts = [b'{"a"', b":1}", b""]
+
+        def read1(self, _n: int) -> bytes:
+            return self.parts.pop(0)
+
+        def read(self, _n: int) -> bytes:  # would block until n bytes arrived
+            raise AssertionError("read() must not be used when read1() exists")
+
+    assert client_module._read_capped(Stream(), deadline=None) == b'{"a":1}'

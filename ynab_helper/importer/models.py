@@ -17,7 +17,10 @@ Ledger effects of an action, applied by the executor **only after YNAB confirmed
   ``store.update(a.account_id, a.entry_key, **a.success_updates(t.id, t.import_id))``, else
   ``store.insert(a.success_entry(t.id, t.import_id))``. If YNAB answers "duplicate import_id",
   resolve it after the post-create sync with
-  :func:`~ynab_helper.importer.planner.resolve_duplicate`.
+  :func:`~ynab_helper.importer.planner.resolve_duplicate`. (The real executor additionally
+  writes ``a.entry`` — or ``a.ledger_updates`` — *before* the POST, still UNLINKED, and then
+  updates that row instead of inserting it, so a POST whose outcome is never learned leaves
+  its import_id in the ledger; the end state after a confirmed create is the same.)
 * UPDATE / DELETE — after success: ``store.update(a.account_id, a.entry_key,
   **a.ledger_updates)`` (a DELETE's updates carry the status REVERTED/SUPERSEDED).
 * LINK / LEDGER — if ``a.entry`` is set and not ``a.entry_exists``: ``store.insert(a.entry)``;
@@ -30,6 +33,7 @@ Ledger effects of an action, applied by the executor **only after YNAB confirmed
 from __future__ import annotations
 
 import dataclasses
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -59,6 +63,8 @@ __all__ = [
     "Removal",
     "TxRef",
     "entry_update_fields",
+    "unconfirmed_write",
+    "unconfirmed_write_note",
 ]
 
 _EMPTY: Mapping[str, Any] = MappingProxyType({})
@@ -229,6 +235,38 @@ def _frozen_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if not value:
         return _EMPTY
     return MappingProxyType(dict(value))
+
+
+#: ``last_error`` of an entry whose PATCH may or may not have reached YNAB (a network error or
+#: 5xx after the retries, a lost response): ``unconfirmed write: {"amount": …, "date": …}``.
+#: When the next import finds YNAB showing those values, they are ours and ``pushed_*``
+#: follows them; YNAB showing the statement's value *without* such a note is the user's
+#: edit, which ``pushed_*`` must keep recognising (R11).
+UNCONFIRMED_WRITE_PREFIX = "unconfirmed write: "
+_UNCONFIRMED_FIELDS = ("amount", "date")
+
+
+def unconfirmed_write_note(fields: Mapping[str, Any]) -> str | None:
+    """The ``last_error`` note for an UPDATE with ``fields`` whose outcome is unknown, or None
+    when it carries neither an amount nor a date (the only values ``pushed_*`` tracks)."""
+    values = {name: fields[name] for name in _UNCONFIRMED_FIELDS if name in fields}
+    if not values:
+        return None
+    return UNCONFIRMED_WRITE_PREFIX + json.dumps(values, sort_keys=True)
+
+
+def unconfirmed_write(entry: LedgerEntry) -> dict[str, Any]:
+    """The amount/date of ``entry``'s unconfirmed write (:func:`unconfirmed_write_note`)."""
+    text = entry.last_error or ""
+    if not text.startswith(UNCONFIRMED_WRITE_PREFIX):
+        return {}
+    try:
+        values = json.loads(text[len(UNCONFIRMED_WRITE_PREFIX) :])
+    except ValueError:
+        return {}
+    if not isinstance(values, dict):
+        return {}
+    return {name: values[name] for name in _UNCONFIRMED_FIELDS if name in values}
 
 
 def entry_update_fields(entry: LedgerEntry) -> dict[str, Any]:

@@ -2,9 +2,16 @@
 
 Version 1 adds the importer ledger (``import_ledger``), the YNAB mirror (``ynab_transactions``,
 ``ynab_subtransactions``, ``accounts.budget_id``) and ``csv_files``, then copies the importer's
-own rows out of the v1 ``transactions`` table into the ledger. The legacy table itself is never
-modified (an emergency rollback to the v1 image still finds it), and rows that v1's YNAB sync
-wrote (``source='ynab'``) are not migrated: the first v2 sync rebuilds the mirror from YNAB.
+own rows out of the v1 ``transactions`` table into the ledger. Rows that v1's YNAB sync wrote
+(``source='ynab'``) are not migrated: the first v2 sync rebuilds the mirror from YNAB.
+
+The legacy table itself is never modified, by this migration or by any later v2 import: it is
+a frozen archive of the state at the v2 deploy (DESIGN §5.2), kept so the v1 image still
+*starts* after an emergency rollback (§2.4). It does not make importing with v1 after v2 has
+imported safe, and neither does restoring the pre-migration backup (the same state): v1
+imports against the state of the deploy, so a pending that v2 settled at another amount (YNAB
+keeps its pending import_id) is POSTed a second time under its settled key, and pendings v2
+created are unknown to v1's superseded sweep and stay uncleared in YNAB (review finding R03).
 
 Every statement is idempotent (``IF NOT EXISTS``, ``INSERT OR IGNORE``, column checks), so the
 step is safe on fresh DBs, on the production DDL, on older DBs that lack columns or the

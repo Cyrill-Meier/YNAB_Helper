@@ -358,12 +358,13 @@ def test_lost_ledger_write_after_reposting_an_unlinked_entry_converges() -> None
     assert s.run(exp).actions == []
 
 
-# ── adoption only takes our own create of the very row ───────────────────────
+# ── adoption after a lost ledger: by amount and date first, then by key (R02) ─
 
 
-def test_adoption_requires_the_rows_own_amount_and_date() -> None:
+def test_core_R02_a_settled_transaction_goes_to_its_settled_row_not_to_its_old_key() -> None:
     # YNAB holds the 08:10 ride created as YNAB:-3600:2026-10-05:1 and since settled (PATCHed)
-    # to -3.80; the ledger lost it. After the renumbering the 17:40 ride carries that key.
+    # to -3.80; the ledger lost it. After the renumbering the 17:40 ride carries that key. The
+    # settled row adopts it (amount and date match); the new ride is created under a fresh id.
     y1 = ytx(
         "y1",
         amount=-3800,
@@ -376,12 +377,24 @@ def test_adoption_requires_the_rows_own_amount_and_date() -> None:
         ("2026-10-05 08:10:00", "SBB CFF FFS", "-3.80"),
     )
     p = plan(exp, [], [y1])
+    (link,) = [a for a in p.actions if a.reason == "adopted"]
+    assert (link.row.amount, link.ynab_tx_id, link.entry_key) == (
+        -3800,
+        "y1",
+        "YNAB:-3600:2026-10-05:1",
+    )
+    assert [a.import_id for a in p.by_kind(ActionKind.CREATE)] == ["YNAB:-3600:2026-10-05:2"]
+    assert p.by_kind(ActionKind.UPDATE) == []  # nothing to change on the settled ride
+
+
+def test_core_R02_adoption_by_amount_never_crosses_signs_or_days() -> None:
+    # Created as a -36.00 charge two days earlier, or as a +3.80 refund: not this row.
+    far = ytx("y1", amount=-3800, date="2026-10-05", import_id="YNAB:-3600:2026-10-03:1")
+    flipped = ytx("y2", amount=-3800, date="2026-10-05", import_id="YNAB:3800:2026-10-05:1")
+    exp = export(("2026-10-05 08:10:00", "SBB CFF FFS", "-3.80"))
+    p = plan(exp, [], [far, flipped])
     assert [a for a in p.actions if a.reason == "adopted"] == []
-    assert sorted(a.row.amount for a in p.by_kind(ActionKind.CREATE)) == [-3800, -3600]
-    assert {a.import_id for a in p.by_kind(ActionKind.CREATE)} == {
-        "YNAB:-3600:2026-10-05:2",  # :1 is taken by y1
-        "YNAB:-3800:2026-10-05:1",
-    }
+    assert [a.import_id for a in p.by_kind(ActionKind.CREATE)] == ["YNAB:-3800:2026-10-05:1"]
 
 
 # ── date-only statements after a settlement ──────────────────────────────────

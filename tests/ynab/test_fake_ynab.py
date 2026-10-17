@@ -19,7 +19,7 @@ from ynab_helper.errors import (
     YnabServerError,
     YnabValidationError,
 )
-from ynab_helper.ynab import YnabClient
+from ynab_helper.ynab.client import YnabClient
 
 IID = "YNAB:-1000:2026-10-01:1"
 

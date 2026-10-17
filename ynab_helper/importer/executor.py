@@ -4,8 +4,16 @@ Order of work (the plan lists actions in this order):
 
 1. **LINK / LEDGER** — local only, all in one SQLite transaction, before any YNAB write. A
    failure here is a bug: it is raised and nothing is sent to YNAB.
-2. **CREATE** — bulk POST in chunks of 100. The ledger is committed per chunk, after the HTTP
-   call returned, and only for the transactions YNAB returned. A chunk YNAB rejects as a
+2. **CREATE** — bulk POST in chunks of 100. Before a chunk is sent, each of its rows is
+   written to the ledger as an UNLINKED entry carrying the import_id about to be POSTed (a
+   new row's placeholder entry; an existing UNLINKED entry gets the values being sent). If
+   the POST's outcome is never learned — a network error or 5xx after the retries, a lost
+   response, the process stopped before the ledger commit — the next import links that
+   entry by its import_id (``refresh_from_mirror``, whatever amount a settlement gave the row
+   since) or POSTs the same import_id again: the row can never end up in YNAB twice (R07).
+   UNLINKED means exactly "YNAB may hold it under this import_id"; ACTIVE (with the YNAB id)
+   is committed per chunk, after the HTTP call returned, and only for the transactions YNAB
+   returned. A chunk YNAB rejects as a
    whole (4xx) is split in halves until the offending rows are isolated (every create
    carries an import_id, so a retry can never duplicate); the extra requests one chunk may
    cost are capped (:func:`_bisect_allowance`), so a rejection that applies to every row
@@ -59,13 +67,14 @@ from ynab_helper.importer.models import (
     PlannedAction,
     PlanOptions,
     TxRef,
+    unconfirmed_write_note,
 )
-from ynab_helper.importer.planner import PlanContext, resolve_duplicate
+from ynab_helper.importer.planner import PlanContext, is_another_transaction, resolve_duplicate
 from ynab_helper.logging_setup import AUDIT_LOGGER
 from ynab_helper.money import format_money
 from ynab_helper.revolut.parser import ParsedExport
 from ynab_helper.storage.db import StorageError, transaction
-from ynab_helper.storage.ledger import LedgerStore
+from ynab_helper.storage.ledger import LedgerEntry, LedgerStore
 from ynab_helper.storage.mirror import MirrorStore
 from ynab_helper.sync.ynab_sync import mark_mirror_stale, note_rate_limited, sync_budget
 from ynab_helper.ynab.client import CREATE_CHUNK_SIZE, UPDATE_CHUNK_SIZE, YnabClient
@@ -251,6 +260,9 @@ class _Execution:
         #: (a 404 on a later PUT or DELETE would wrongly read as "this transaction is gone").
         self.blocked: str | None = None
         self.settled: set[int] = set()  # id() of write actions that got a final outcome
+        #: id() of CREATE actions whose entry was written before the POST → the entry as it
+        #: was before (None: a new row's placeholder was inserted).
+        self.placeholders: dict[int, LedgerEntry | None] = {}
         self.total = len(plan.ynab_actions)
         self.done = 0
 
@@ -472,13 +484,87 @@ class _Execution:
             if self.stopped is not None:
                 self._not_applied(chunk)
                 continue
+            if self.blocked is not None:
+                self._fail_all(chunk, self.blocked)
+                continue
+            sendable = self._write_ahead(chunk)
             try:
-                self._post(chunk, duplicates, _Allowance(_bisect_allowance(len(chunk))))
+                if sendable:
+                    self._post(sendable, duplicates, _Allowance(_bisect_allowance(len(sendable))))
             except _RateLimitStop as stop:
                 self._stop(stop.error)
-                self._not_applied(chunk)
+                self._not_applied(sendable)
             self._progress(PHASE_CREATE)
         return duplicates
+
+    def _write_ahead(self, chunk: Sequence[PlannedAction]) -> list[PlannedAction]:
+        """Record the creates of ``chunk`` as UNLINKED entries carrying the import_id about to
+        be POSTed (see the module docstring); returns the creates that may be sent. A create
+        whose entry cannot be written is not sent (a failure; the next import retries it)."""
+        written: dict[int, LedgerEntry | None] = {}
+        sendable: list[PlannedAction] = []
+        try:
+            with transaction(self.conn):
+                for action in chunk:
+                    try:
+                        with transaction(self.conn):
+                            written[id(action)] = self._placeholder(action)
+                    except _LEDGER_ERRORS as exc:
+                        self._unsent(action, exc)
+                    else:
+                        sendable.append(action)
+        except _LEDGER_ERRORS as exc:  # BEGIN or COMMIT failed: nothing was recorded
+            for action in chunk:
+                if id(action) not in self.settled:
+                    self._unsent(action, exc)
+            return []
+        self.placeholders.update(written)
+        return sendable
+
+    def _placeholder(self, action: PlannedAction) -> LedgerEntry | None:
+        """Write ``action``'s entry ahead of its POST; returns the entry it replaces (None
+        for a new row, whose placeholder ``action.entry`` is inserted)."""
+        if not action.entry_exists:
+            assert action.entry is not None  # guaranteed for CREATE by PlannedAction
+            self.ledger.insert(action.entry)
+            return None
+        before = self.ledger.get(action.account_id, action.entry_key)
+        if before is None or before.status != LedgerStatus.UNLINKED:
+            raise ValueError(f"CREATE {action.entry_key!r} expects an UNLINKED ledger entry")
+        self.ledger.update(action.account_id, action.entry_key, **action.ledger_updates)
+        return before
+
+    def _unsent(self, action: PlannedAction, exc: BaseException) -> None:
+        log.error(
+            "import %s: could not record %s before sending it; not sent",
+            self.account_id,
+            action.entry_key,
+            exc_info=exc,
+        )
+        self._fail(
+            action,
+            "not sent: it could not be recorded locally first; send the statement again",
+        )
+
+    def _forget_placeholder(self, action: PlannedAction) -> None:
+        """Undo :meth:`_write_ahead` for ``action``: YNAB did not create it, or the import_id
+        turned out to belong to another transaction that a later import must not link."""
+        if id(action) not in self.placeholders:
+            return
+        before = self.placeholders.pop(id(action))
+        try:
+            if before is None:
+                self.ledger.delete_unlinked(action.account_id, action.entry_key)
+            else:
+                restore = {name: getattr(before, name) for name in action.ledger_updates}
+                self.ledger.update(action.account_id, action.entry_key, **restore)
+        except _LEDGER_ERRORS:
+            log.warning(
+                "import %s: could not undo the placeholder of %s",
+                self.account_id,
+                action.entry_key,
+                exc_info=True,
+            )
 
     def _post(
         self,
@@ -497,12 +583,15 @@ class _Execution:
         budget or the account is gone: this and every later write of the import fails
         without a request (:meth:`_block`). A 5xx or network error fails the part as a whole
         (nothing row-specific to isolate).
+
+        Rows that certainly did not reach YNAB (refused or not sent, rejected by a 4xx) lose
+        their placeholder entry (:meth:`_rejected`); rows whose outcome is unknown keep it.
         """
         pending = [action for action in chunk if id(action) not in self.settled]
         if not pending:
             return
         if self.blocked is not None:
-            self._fail_all(pending, self.blocked)
+            self._rejected(pending, self.blocked)
             return
         try:
             # Validates every payload; no request is sent before the iterator is consumed.
@@ -513,11 +602,11 @@ class _Execution:
             if len(pending) > 1:
                 self._bisect(pending, duplicates, allowance, rejected)
             else:
-                self._fail(pending[0], f"invalid transaction data: {exc}")
+                self._rejected(pending, f"invalid transaction data: {exc}")
             return
         if rejected is not None:
             if allowance.left <= 0:
-                self._fail_all(
+                self._rejected(
                     pending,
                     f"{rejected} (not retried row by row, to spare YNAB's hourly request "
                     "limit; send the statement again)",
@@ -537,12 +626,22 @@ class _Execution:
             # The payloads reference no resource but the account (the same for every row):
             # the budget or the account no longer exists. No other write is sent.
             self._block(exc)
-            self._fail_all(pending, self.blocked or _error_text(exc))
+            self._rejected(pending, self.blocked or _error_text(exc))
         except YnabError as exc:
             if _is_client_error(exc) and len(pending) > 1:
                 self._bisect(pending, duplicates, allowance, _error_text(exc))
-            else:
+            elif _is_client_error(exc):
+                self._rejected(pending, _error_text(exc))
+            else:  # 5xx, network error, unexpected response: YNAB may have created them
                 self._fail_all(pending, _error_text(exc))
+
+    def _rejected(self, actions: Sequence[PlannedAction], error: str) -> None:
+        """Creates YNAB certainly did not apply (not sent, or the request was rejected): a
+        failure, and their placeholder entry goes (the next import plans them afresh)."""
+        for action in actions:
+            if id(action) not in self.settled:
+                self._fail(action, error)
+                self._forget_placeholder(action)
 
     def _bisect(
         self,
@@ -585,7 +684,7 @@ class _Execution:
 
         def effect(action: PlannedAction, tx: YnabTransaction) -> Callable[[], None]:
             def apply() -> None:
-                if action.entry_exists:
+                if action.entry_exists or id(action) in self.placeholders:
                     self.ledger.update(
                         action.account_id,
                         action.entry_key,
@@ -633,6 +732,13 @@ class _Execution:
             )
             return []
         view = self.mirror.view_for_account(self.budget_id, self.account_id)
+        for action in duplicates:
+            # Not this row (another amount or date): no entry may keep its import_id, or
+            # refresh_from_mirror would link it now or on the next import.
+            if action.row is not None and is_another_transaction(
+                action.row, view.by_import_id(action.import_id)
+            ):
+                self._forget_placeholder(action)
         self.ledger.refresh_from_mirror(self.account_id, view)
         ctx = PlanContext.create(
             self.ledger.list_for_account(self.account_id),
@@ -645,7 +751,13 @@ class _Execution:
         )
         follow_ups: list[PlannedAction] = []
         for action in duplicates:
-            outcome = resolve_duplicate(action, view.by_import_id(action.import_id), self.opts, ctx)
+            resolving = action
+            if id(action) in self.placeholders and not action.entry_exists:
+                # The placeholder is in the ledger: the resolution updates it.
+                resolving = dataclasses.replace(action, entry_exists=True)
+            outcome = resolve_duplicate(
+                resolving, view.by_import_id(action.import_id), self.opts, ctx
+            )
             self.result.warnings.extend(outcome.warnings)
             local = [a for a in outcome.actions if not a.kind.writes_ynab]
             stored = self._commit([(a, lambda a=a: self._local_effect(a)) for a in local])
@@ -704,10 +816,11 @@ class _Execution:
                     exc.status,
                 )
                 self._put_each(chunk)
-            else:
-                for action in chunk:
-                    if id(action) not in self.settled:
-                        self._fail(action, _error_text(exc))
+            else:  # 5xx, network error, unexpected response: YNAB may have applied it
+                unsettled = [a for a in chunk if id(a) not in self.settled]
+                self._note_unconfirmed(unsettled)
+                for action in unsettled:
+                    self._fail(action, _error_text(exc))
         except (TypeError, ValueError):  # refused by the client before sending
             self._put_each(chunk)
 
@@ -726,6 +839,8 @@ class _Execution:
             except YnabNotFound:
                 self._mark_deleted_in_ynab(action)
             except YnabError as exc:
+                if not _is_client_error(exc):  # YNAB may have applied it
+                    self._note_unconfirmed([action])
                 self._fail(action, _error_text(exc))
             except (TypeError, ValueError) as exc:
                 self._fail(action, f"invalid update: {exc}")
@@ -741,6 +856,7 @@ class _Execution:
             action = by_id.pop(tx.id, None)
             if action is not None:
                 confirmed.append((action, tx))
+        self._note_unconfirmed(by_id.values())
         for action in by_id.values():
             self._fail(action, "YNAB did not confirm this change; it will be retried")
 
@@ -762,6 +878,24 @@ class _Execution:
             )
             self._audit("updated", action, action.before, detail)
             self._settle(action)
+
+    def _note_unconfirmed(self, actions: Iterable[PlannedAction]) -> None:
+        """Remember the amount/date of UPDATEs whose outcome is unknown in the entry's
+        ``last_error`` (:func:`~ynab_helper.importer.models.unconfirmed_write_note`): the next
+        import can then tell YNAB showing our own write from a user's edit (R11)."""
+        for action in actions:
+            note = unconfirmed_write_note(action.fields)
+            if note is None:
+                continue
+            try:
+                self.ledger.update(action.account_id, action.entry_key, last_error=note)
+            except _LEDGER_ERRORS:
+                log.warning(
+                    "import %s: could not note the unconfirmed write of %s",
+                    self.account_id,
+                    action.entry_key,
+                    exc_info=True,
+                )
 
     def _describe_change(self, name: str, values: tuple[Any, Any]) -> str:
         old, new = values

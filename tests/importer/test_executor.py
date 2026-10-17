@@ -171,6 +171,13 @@ FINAL_B = sorted(
 )
 
 
+def _assert_placeholder(h: Harness, key: str) -> None:
+    """The entry written before a create's POST whose outcome is unknown: UNLINKED, carrying
+    the POSTed import_id (R07)."""
+    entry = h.entry(key)
+    assert (entry.status, entry.ynab_import_id, entry.ynab_tx_id) == ("UNLINKED", key, None)
+
+
 def _imported_a(h: Harness) -> None:
     result = h.run(export_a())
     assert result.ok and len(result.created) == 6
@@ -351,7 +358,7 @@ def test_network_error_on_create_is_a_failure_and_updates_and_deletes_still_run(
 
     assert [f.action for f in result.failures] == ["CREATE"]
     assert "network" in result.failures[0].error.lower()
-    assert h.ledger.get(ACCT, COOP_NEW) is None
+    _assert_placeholder(h, COOP_NEW)  # the outcome is unknown: kept, by its import_id
     assert len(result.updated) == 2 and len(result.removed) == 1
     h.fake.reset_log()
     assert h.run(export_b()).ok
@@ -366,11 +373,11 @@ def test_a_lost_create_response_is_adopted_on_the_next_run_without_a_duplicate(h
     first = h.apply(plan, opts, export_b())
 
     assert [f.action for f in first.failures] == ["CREATE"]
-    assert h.ledger.get(ACCT, COOP_NEW) is None  # YNAB has it, the ledger does not know
+    _assert_placeholder(h, COOP_NEW)  # YNAB has it; the ledger knows its import_id
     h.fake.reset_log()
     second = h.run(export_b())
-    assert second.ok and h.writes() == []  # adopted (LINK), not POSTed again
-    assert [ref.amount for ref in second.linked] == [-11_200]
+    assert second.ok and h.writes() == []  # linked by its import_id, not POSTed again
+    assert h.entry(COOP_NEW).status == LedgerStatus.ACTIVE
     assert h.entry(COOP_NEW).ynab_tx_id == h.tx_id(COOP_NEW)
     assert h.live() == FINAL_B
 
@@ -472,7 +479,7 @@ def test_duplicate_of_a_deleted_transaction_becomes_deleted_in_ynab(h):
     assert h.run(export_b()).ok and h.writes() == []  # never re-created
 
 
-def test_duplicate_with_another_amount_is_not_linked(h):
+def test_duplicate_with_another_amount_is_not_linked_mid_run_but_adopted_next_time(h):
     plan, opts = h.plan(export_b())
     h.fake.add_transaction(
         BUDGET, ACCT, amount=-40_000, date="2026-10-11", import_id=MIGROS, cleared="cleared"
@@ -484,9 +491,17 @@ def test_duplicate_with_another_amount_is_not_linked(h):
     assert any("not linked" in w for w in result.warnings)
     assert h.ledger.get(ACCT, MIGROS) is None
     h.fake.reset_log()
-    nxt = h.run(export_b())  # created under a fresh import_id now
-    assert [ref.amount for ref in nxt.created] == [-45_300]
-    assert h.fake.find_by_import_id(ACCT, "YNAB:-45300:2026-10-11:2") is not None
+    # The next import plans with the whole statement: no other row claims the transaction
+    # carrying the row's key, so it is this row (YNAB would refuse the key as a duplicate,
+    # R02) with the amount edited elsewhere — linked, never POSTed a second time.
+    nxt = h.run(export_b())
+    assert nxt.created == [] and h.writes() == []
+    assert h.entry(MIGROS).status == "ACTIVE"
+    assert [
+        t["amount"]
+        for t in h.fake.transactions(BUDGET, account_id=ACCT)
+        if t["import_id"] and t["import_id"].startswith("YNAB:-45300:")
+    ] == [-40_000]
 
 
 def test_duplicates_are_not_resolved_when_the_post_create_sync_is_rate_limited(h):
@@ -518,7 +533,7 @@ def test_duplicates_are_not_resolved_when_the_post_create_sync_is_rate_limited(h
     assert h.writes() == [("POST", TX_PATH)]
     assert result.not_applied == 4 and result.failures == []
     assert result.updated == result.removed == []
-    assert h.ledger.get(ACCT, COOP_NEW) is None
+    _assert_placeholder(h, COOP_NEW)  # YNAB holds the import_id: linked on the next run
     for key, entry in before.items():
         assert dataclasses.replace(h.entry(key), updated_at="") == dataclasses.replace(
             entry, updated_at=""
@@ -694,6 +709,62 @@ def test_progress_is_reported_and_a_failing_callback_is_ignored(h):
 def test_a_ledger_write_failing_after_a_confirmed_create_is_reported_and_converges(h, monkeypatch):
     _imported_a(h)
     plan, opts = h.plan(export_b())
+    real_update = LedgerStore.update
+
+    def flaky_update(self: LedgerStore, account_id: str, key: str, /, **fields: Any) -> Any:
+        if key == COOP_NEW and "ynab_tx_id" in fields:  # the link after YNAB's answer
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_update(self, account_id, key, **fields)
+
+    monkeypatch.setattr(LedgerStore, "update", flaky_update)
+    result = h.apply(plan, opts, export_b())
+    monkeypatch.setattr(LedgerStore, "update", real_update)
+
+    assert [ref.amount for ref in result.created] == [-11_200]  # it is in YNAB
+    assert [f.action for f in result.failures] == ["CREATE"]
+    assert "could not be saved" in result.failures[0].error
+    _assert_placeholder(h, COOP_NEW)
+    assert len(result.updated) == 2  # the rest went on
+    h.fake.reset_log()
+    assert h.run(export_b()).ok and h.writes() == []  # linked, no duplicate
+    assert h.entry(COOP_NEW).ynab_tx_id == h.tx_id(COOP_NEW)
+    assert h.live() == FINAL_B
+
+
+def test_core_R07_a_locked_database_before_the_post_sends_no_create(h, tmp_path):
+    _imported_a(h)
+    plan, opts = h.plan(export_b())
+    assert plan.local_actions == []  # the write-ahead is the first local write
+    h.conn.execute("PRAGMA busy_timeout = 0")  # same as a lock held past the 10 s timeout
+    other = sqlite3.connect(tmp_path / "tx.db", isolation_level=None)
+    other.execute("BEGIN IMMEDIATE")  # another writer holds the DB right now
+
+    def release(method: str, url: str, headers: Any, body: Any, timeout: float) -> Any:
+        if other.in_transaction:
+            other.execute("ROLLBACK")  # done by the time the first request goes out
+        return h.fake.transport(method, url, headers, body, timeout)
+
+    h.fake.reset_log()
+    try:
+        result = h.apply(plan, opts, export_b(), client=h.fake.client(transport=release))
+    finally:
+        if other.in_transaction:
+            other.execute("ROLLBACK")
+        other.close()
+
+    assert [f.action for f in result.failures] == ["CREATE"]
+    assert "not sent" in result.failures[0].error
+    assert "POST" not in [m for m, _p in h.writes()]
+    assert h.ledger.get(ACCT, COOP_NEW) is None
+    h.conn.execute("PRAGMA busy_timeout = 10000")
+    again = h.run(export_b())
+    assert again.ok and [ref.amount for ref in again.created] == [-11_200]
+    assert h.live() == FINAL_B
+
+
+def test_core_R07_a_create_that_cannot_be_recorded_first_is_not_sent(h, monkeypatch):
+    _imported_a(h)
+    plan, opts = h.plan(export_b())
     real_insert = LedgerStore.insert
 
     def flaky_insert(self: LedgerStore, entry: LedgerEntry) -> LedgerEntry:
@@ -702,16 +773,19 @@ def test_a_ledger_write_failing_after_a_confirmed_create_is_reported_and_converg
         return real_insert(self, entry)
 
     monkeypatch.setattr(LedgerStore, "insert", flaky_insert)
+    h.fake.reset_log()
     result = h.apply(plan, opts, export_b())
     monkeypatch.setattr(LedgerStore, "insert", real_insert)
 
-    assert [ref.amount for ref in result.created] == [-11_200]  # it is in YNAB
+    assert result.created == []
     assert [f.action for f in result.failures] == ["CREATE"]
-    assert "could not be saved" in result.failures[0].error
+    assert "not sent" in result.failures[0].error
+    assert "POST" not in [m for m, _p in h.writes()]
     assert h.ledger.get(ACCT, COOP_NEW) is None
-    assert len(result.updated) == 2  # the rest went on
+    assert len(result.updated) == 2 and len(result.removed) == 1  # the rest went on
     h.fake.reset_log()
-    assert h.run(export_b()).ok and h.writes() == []  # adopted, no duplicate
+    again = h.run(export_b())
+    assert again.ok and [ref.amount for ref in again.created] == [-11_200]
     assert h.live() == FINAL_B
 
 
@@ -823,14 +897,17 @@ def test_F07_a_row_missing_from_the_patch_response_is_a_failure_and_not_recorded
     assert [(f.action, f.tx.ynab_tx_id) for f in result.failures] == [("UPDATE", amazon)]
     assert "did not confirm" in result.failures[0].error
     assert [c.tx.payee for c in result.updated] == ["Migros Zuerich HB"]
+    # Only the unconfirmed write itself is noted (R11): the entry still describes the last
+    # confirmed state.
     assert dataclasses.replace(h.entry(AMAZON), updated_at="") == dataclasses.replace(
-        before, updated_at=""
+        before, updated_at="", last_error='unconfirmed write: {"amount": -90410}'
     )
     assert h.entry(MIGROS).pushed_cleared == "cleared"
     h.fake.reset_log()
     assert h.run(export_b()).ok  # YNAB already holds the change: nothing is sent twice
     assert "PATCH" not in [m for m, _p in h.writes()]
-    assert h.entry(AMAZON).csv_amount == -90_410
+    after = h.entry(AMAZON)
+    assert (after.csv_amount, after.pushed_amount, after.last_error) == (-90_410, -90_410, None)
     assert h.live() == FINAL_B
 
 
@@ -841,7 +918,10 @@ def test_a_server_error_on_a_multi_row_create_sends_exactly_one_post(h):
 
     assert h.writes() == [("POST", TX_PATH)]  # a 5xx is not row-specific: no bisection
     assert len(result.failures) == 6 and {f.action for f in result.failures} == {"CREATE"}
-    assert h.ledger.list_for_account(ACCT) == []
+    # YNAB may or may not have created them: each keeps its import_id for the next run.
+    entries = h.ledger.list_for_account(ACCT)
+    assert len(entries) == 6 and {e.status for e in entries} == {"UNLINKED"}
+    assert all(e.ynab_import_id == e.key and e.ynab_tx_id is None for e in entries)
     h.fake.reset_log()
     assert h.run(export_a()).ok and len(h.fake.transactions(BUDGET, account_id=ACCT)) == 6
 
@@ -944,7 +1024,7 @@ def test_a_locked_database_after_a_confirmed_create_is_reported_and_converges(h,
     assert not result.ok
     assert [f.action for f in result.failures] == ["CREATE"]
     assert "could not be saved" in result.failures[0].error
-    assert h.ledger.get(ACCT, COOP_NEW) is None
+    _assert_placeholder(h, COOP_NEW)  # written before the POST, linked on the next run
     assert len(result.updated) == 2 and len(result.removed) == 1  # the rest went on
     h.conn.execute("PRAGMA busy_timeout = 10000")
     h.fake.reset_log()

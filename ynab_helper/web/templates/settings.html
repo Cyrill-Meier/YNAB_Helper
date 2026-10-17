@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Settings — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="max-w-3xl space-y-6">
+  <div>
+    <h1 class="page-title">Settings</h1>
+    <p class="page-intro">Your preferences for the bot. Changes apply to the next imported statement.</p>
+  </div>
+
+  <section class="card">
+    <div class="flex items-start justify-between gap-4">
+      <div>
+        <h2 id="set-auto-label" class="font-medium">Auto-approve imported transactions</h2>
+        <p id="set-auto-help" class="mt-1 text-sm text-ink-500 dark:text-slate-400">
+          When on, new transactions land in YNAB as <em>approved</em> — they appear directly in
+          your register. When off, they land in YNAB's inbox as <em>unapproved</em> for manual review.
+        </p>
+      </div>
+      <button id="set-auto" type="button" role="switch" class="switch"
+              aria-checked="{{ 'true' if user and user.auto_approve else 'false' }}"
+              aria-labelledby="set-auto-label" aria-describedby="set-auto-help">
+        <span aria-hidden="true"></span>
+      </button>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="set-setup-title">
+    <h2 id="set-setup-title" class="font-medium">Active YNAB setup</h2>
+    <p class="mt-1 text-sm text-ink-500 dark:text-slate-400">
+      To change the token, budget or account, open Telegram and send <code>/setup</code>.
+    </p>
+    <dl class="mt-4 grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
+      <div class="flex justify-between gap-4 border-b border-slate-100 py-1.5 dark:border-ink-700">
+        <dt class="muted">Budget</dt>
+        <dd class="truncate font-medium" id="set-budget">{{ user.budget_name if user and user.budget_name else "—" }}</dd>
+      </div>
+      <div class="flex justify-between gap-4 border-b border-slate-100 py-1.5 dark:border-ink-700">
+        <dt class="muted">Import account</dt>
+        <dd class="truncate font-medium" id="set-account">{{ user.account_name if user and user.account_name else "—" }}</dd>
+      </div>
+      <div class="flex justify-between gap-4 border-b border-slate-100 py-1.5 dark:border-ink-700">
+        <dt class="muted">Crypto sync</dt>
+        <dd class="font-medium" id="set-crypto">{{ "Configured" if user and user.crypto_configured else "Not set up (/crypto in Telegram)" }}</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section class="card text-sm" aria-labelledby="set-sessions-title">
+    <h2 id="set-sessions-title" class="font-medium">Sessions</h2>
+    <div class="mt-3 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3 dark:border-ink-700">
+      <div>
+        <div class="font-medium">Sign out of this browser</div>
+        <div class="mt-1 text-ink-500 dark:text-slate-400">Ends this session immediately.</div>
+      </div>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn">Logout</button>
+      </form>
+    </div>
+    <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <div class="font-medium">Sign out everywhere</div>
+        <div class="mt-1 text-ink-500 dark:text-slate-400">
+          Ends every session of your account — other browsers and devices too — and invalidates
+          unused sign-in links.
+        </div>
+      </div>
+      <button id="set-logout-all" type="button" class="btn">Sign out everywhere</button>
+    </div>
+  </section>
+</div>
+{% endblock %}

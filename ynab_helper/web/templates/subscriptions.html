@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Subscriptions — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="page-title">Subscriptions</h1>
+      <p class="page-intro">
+        Recurring payments detected in your transaction history. Cadence is inferred from the
+        median interval between charges.
+        <span class="font-medium text-rose-600 dark:text-rose-400">Price changes</span> are flagged.
+      </p>
+      <p class="page-intro text-xs" id="sub-sync-status"></p>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <div id="sub-accounts"></div>
+      <label for="sub-window" class="sr-only">Window</label>
+      <select id="sub-window" class="field">
+        <option value="6">Last 6 months</option>
+        <option value="13" selected>Last 13 months</option>
+        <option value="24">Last 24 months</option>
+        <option value="36">Last 36 months</option>
+      </select>
+      <button id="sub-sync" type="button" class="btn py-2" title="Fetch the latest data from YNAB"><span aria-hidden="true">⟳</span> Sync</button>
+    </div>
+  </div>
+
+  <div id="sub-error" hidden></div>
+
+  {# ── Summary cards ────────────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+    <div class="card">
+      <h2 class="card-label">Detected</h2>
+      <div class="card-value" id="sub-count">—</div>
+      <div class="card-meta" id="sub-count-meta"></div>
+    </div>
+    <div class="card">
+      <h2 class="card-label">Monthly run-rate</h2>
+      <div class="card-value" id="sub-monthly">—</div>
+      <div class="card-meta">Active subscriptions as a monthly amount (yearly ÷ 12, weekly × 52 ÷ 12)</div>
+    </div>
+    <div class="card">
+      <h2 class="card-label">Price changes</h2>
+      <div class="card-value" id="sub-changes">—</div>
+      <div class="card-meta">Subscriptions whose amount has shifted</div>
+    </div>
+  </div>
+
+  <p id="sub-yearly-note" class="alert alert-info" hidden></p>
+
+  {# ── Table ────────────────────────────────────────────────────────────────── #}
+  <div class="card overflow-hidden p-0">
+    <div class="relative overflow-x-auto">
+      <table class="w-full text-sm">
+        <caption class="sr-only">Detected subscriptions</caption>
+        <thead class="bg-slate-50 text-ink-500 dark:bg-ink-700/50 dark:text-slate-400">
+          <tr>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Payee</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Cadence</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Category</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Latest</th>
+            <th scope="col" class="whitespace-nowrap px-4 py-2 text-right font-medium">Per month</th>
+            <th scope="col" class="hidden px-4 py-2 text-right font-medium lg:table-cell">Range</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">History</th>
+            <th scope="col" class="whitespace-nowrap px-4 py-2 text-left font-medium">Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="sub-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+    <div id="sub-empty" class="py-12 text-center text-ink-500 dark:text-slate-400" hidden>
+      No recurring payments detected. Try a wider window, or come back after a few more months of data.
+    </div>
+    <div id="sub-loading" class="py-12 text-center text-ink-500 dark:text-slate-400" role="status">
+      <span class="spinner" aria-hidden="true"></span><span class="ml-2">Scanning…</span>
+    </div>
+  </div>
+
+  <p class="text-xs text-ink-500 dark:text-slate-400" id="sub-footnote">
+    Heuristic: a payee counts as recurring when its charges come at a steady cadence (weekly,
+    biweekly, monthly; yearly is judged over the window plus 13 more months and needs two
+    charges) with at least 3 charges in the window, and its amount is steady (at most one price
+    change per three charges; amounts within 5 % count as the same price). Transfers and the
+    app's own balance adjustments are ignored. The history bars of each row are scaled to that
+    row's highest charge.
+  </p>
+</div>
+{% endblock %}

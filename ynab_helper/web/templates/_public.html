@@ -1,0 +1,36 @@
+{#- Layout of the pages without a session: login.html and auth.html. Same palette and theme
+    handling as base.html; no app navigation, no CSRF token, no app JavaScript. -#}
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Sign in — Revolut → YNAB{% endblock %}</title>
+  <link rel="icon" href="{{ static_base }}/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ static_base }}/app.css">
+  <script src="{{ static_base }}/js/theme.js"></script>
+  {% block head_scripts %}{% endblock %}
+</head>
+<body data-page="{{ page }}" class="h-full">
+  <div class="flex min-h-full flex-col">
+    <main id="main" class="flex flex-1 items-center justify-center p-4">
+      <div class="w-full max-w-md">
+        <div class="mb-8 text-center">
+          <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-500/10">
+            <svg viewBox="0 0 32 32" class="h-8 w-8 text-brand-500" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true" focusable="false">
+              <circle cx="16" cy="16" r="13" stroke-opacity="0.35"/>
+              <path d="M7 17l4 4 14-14" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          {% block heading %}{% endblock %}
+        </div>
+        {% block card %}{% endblock %}
+        <p class="mt-6 text-center text-xs text-ink-500 dark:text-slate-400">
+          Auth happens in Telegram — no password is stored here.
+        </p>
+      </div>
+    </main>
+    <footer class="py-3 text-center text-xs text-ink-500 dark:text-slate-400">{{ version_line }}</footer>
+  </div>
+</body>
+</html>

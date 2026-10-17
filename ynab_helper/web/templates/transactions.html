@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block title %}Transactions — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-5">
+  <div class="flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="page-title">Transactions</h1>
+      <p class="page-intro">
+        What YNAB has, across every account of the budget. Filters are kept in the address bar,
+        so reload, Back and bookmarks keep them.
+      </p>
+      <p class="page-intro text-xs" id="tx-sync-status"></p>
+    </div>
+  </div>
+
+  <div class="-mt-2 flex justify-end">
+    <div id="tx-accounts"></div>
+  </div>
+
+  {# ── Filters ──────────────────────────────────────────────────────────────── #}
+  <form id="tx-filters" class="card flex flex-col gap-3" role="search" aria-label="Filter transactions">
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-center">
+      <div class="relative min-w-0 flex-1">
+        <label for="tx-search" class="sr-only">Search payee or memo</label>
+        <svg class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3" stroke-linecap="round"/></svg>
+        <input id="tx-search" name="q" type="search" placeholder="Search payee or memo…" autocomplete="off" maxlength="200" class="field w-full pl-9">
+      </div>
+      <div>
+        <label for="tx-state" class="sr-only">State</label>
+        <select id="tx-state" name="state" class="field w-full sm:w-auto">
+          <option value="all">All states</option>
+          <option value="cleared">Cleared</option>
+          <option value="reconciled">Reconciled</option>
+          <option value="uncleared">Pending</option>
+        </select>
+      </div>
+      <div>
+        <label for="tx-category" class="sr-only">Category</label>
+        <select id="tx-category" name="category" class="field w-full sm:w-auto sm:max-w-[14rem]">
+          <option value="">All categories</option>
+          <option value="__none__">— uncategorized —</option>
+        </select>
+      </div>
+      <div>
+        <label for="tx-sort" class="sr-only">Sort order</label>
+        <select id="tx-sort" name="sort" class="field w-full sm:w-auto">
+          <option value="-date">Newest first</option>
+          <option value="date">Oldest first</option>
+          <option value="-amount">Largest inflow first</option>
+          <option value="amount">Largest outflow first</option>
+          <option value="payee_name">Payee A→Z</option>
+          <option value="-payee_name">Payee Z→A</option>
+        </select>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-end gap-3">
+      <div>
+        <label for="tx-from" class="field-label">From</label>
+        <input id="tx-from" name="date_from" type="date" class="field">
+      </div>
+      <div>
+        <label for="tx-to" class="field-label">To</label>
+        <input id="tx-to" name="date_to" type="date" class="field">
+      </div>
+      <button id="tx-clear" type="button" class="btn py-2">Clear filters</button>
+    </div>
+  </form>
+
+  {# ── Table ────────────────────────────────────────────────────────────────── #}
+  <div id="tx-error" hidden></div>
+  <div class="card overflow-hidden p-0">
+    <div class="relative overflow-x-auto">
+      <table class="w-full text-sm" aria-describedby="tx-summary">
+        <caption class="sr-only">Transactions matching the filters</caption>
+        <thead class="bg-slate-50 text-ink-500 dark:bg-ink-700/50 dark:text-slate-400">
+          <tr>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Date</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Payee</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Amount</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Category</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Memo</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">State</th>
+          </tr>
+        </thead>
+        <tbody id="tx-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+    <div id="tx-empty" class="py-12 text-center text-ink-500 dark:text-slate-400" hidden>
+      No transactions match your filters.
+    </div>
+    <div id="tx-loading" class="py-12 text-center text-ink-500 dark:text-slate-400" role="status">
+      <span class="spinner" aria-hidden="true"></span><span class="ml-2">Loading…</span>
+    </div>
+  </div>
+
+  {# ── Pagination ───────────────────────────────────────────────────────────── #}
+  <nav class="flex items-center justify-between gap-3 text-sm" aria-label="Pages">
+    <div id="tx-summary" class="text-ink-500 dark:text-slate-400" aria-live="polite"></div>
+    <div class="flex items-center gap-2">
+      <button id="tx-prev" type="button" class="btn" disabled><span aria-hidden="true">‹</span> Prev</button>
+      <button id="tx-next" type="button" class="btn" disabled>Next <span aria-hidden="true">›</span></button>
+    </div>
+  </nav>
+</div>
+{% endblock %}

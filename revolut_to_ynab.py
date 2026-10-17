@@ -629,6 +629,24 @@ def sync_accounts_from_ynab(conn, token, budget_id):
     return summary
 
 
+def _local_key_for_ynab_tx(conn, ynab_tx_id, default_iid):
+    """Local import_id already linked to this YNAB transaction, if any.
+
+    After a date-shift re-key the local row carries the new key while YNAB
+    keeps the original import_id. Syncing must update that row instead of
+    re-inserting the old key as a second "ghost" row — the importer would
+    later treat the ghost as a superseded pending and delete the live
+    transaction.
+    """
+    row = conn.execute(
+        "SELECT import_id FROM transactions "
+        "WHERE ynab_tx_id = ? AND source = 'revolut' AND deleted = 0 "
+        "ORDER BY imported_at DESC LIMIT 1",
+        (ynab_tx_id,),
+    ).fetchone()
+    return row["import_id"] if row else default_iid
+
+
 def sync_budget_transactions(conn, token, budget_id, primary_account_id=None):
     """Pull transactions from EVERY account in the budget in one call.
 
@@ -657,7 +675,9 @@ def sync_budget_transactions(conn, token, budget_id, primary_account_id=None):
         if primary_account_id and ya_id == primary_account_id:
             # Preserve existing import_id format for compatibility with
             # the CSV-import / dedupe flow.
-            local_iid = ynab_iid or f"ynab_manual:{yt['id']}"
+            local_iid = _local_key_for_ynab_tx(
+                conn, yt["id"], ynab_iid or f"ynab_manual:{yt['id']}",
+            )
             source = "revolut" if (ynab_iid or "").startswith("YNAB:") else "ynab"
         else:
             local_iid = f"acct:{ya_id}:{yt['id']}"
@@ -739,6 +759,7 @@ def sync_from_ynab(conn, token, budget_id, account_id, since_date=None):
             # Transactions entered manually in YNAB don't have an import_id.
             # Use the YNAB transaction ID as a synthetic import_id.
             import_id = f"ynab_manual:{yt['id']}"
+        import_id = _local_key_for_ynab_tx(conn, yt["id"], import_id)
 
         tx = {
             "import_id": import_id,
@@ -1103,9 +1124,12 @@ def diff_transactions(conn, transactions):
                 skipped += 1
             continue
 
-        # Check if anything meaningful changed
+        # Check if anything meaningful changed. Cleared state only ever
+        # moves forward: the web UI's YNAB sync stores 'reconciled' locally,
+        # and an older export can still show a row as PENDING — neither may
+        # push YNAB back to 'cleared' / 'uncleared'.
         amount_changed = old["amount"] != tx["amount"]
-        state_changed = old["cleared"] != tx["cleared"]
+        state_changed = _cleared_rank(tx["cleared"]) > _cleared_rank(old["cleared"])
 
         if amount_changed or state_changed:
             tx["_ynab_tx_id"] = old.get("ynab_tx_id")
@@ -1128,12 +1152,19 @@ def diff_transactions(conn, transactions):
     if transactions:
         window_lo = min(t["date"] for t in transactions)
         window_hi = max(t["date"] for t in transactions)
+        # A row whose YNAB transaction is also linked from another live local
+        # row is not an orphan: after a date-shift re-key the web UI's sync
+        # re-inserts the old key (YNAB keeps the original import_id), and
+        # deleting that "ghost" would delete the live transaction.
         orphans = conn.execute(
             "SELECT import_id, date, amount, payee_name, ynab_tx_id "
-            "FROM transactions "
+            "FROM transactions AS t "
             "WHERE cleared = 'uncleared' AND source = 'revolut' "
             "AND deleted = 0 AND ynab_tx_id IS NOT NULL "
-            "AND date BETWEEN ? AND ?",
+            "AND date BETWEEN ? AND ? "
+            "AND NOT EXISTS (SELECT 1 FROM transactions AS o "
+            "                WHERE o.ynab_tx_id = t.ynab_tx_id "
+            "                AND o.import_id != t.import_id AND o.deleted = 0)",
             (window_lo, window_hi),
         ).fetchall()
         for row in orphans:
@@ -1165,6 +1196,63 @@ def _fetch_ynab_txns_by_import_id(token, budget_id, account_id, import_ids, sinc
     txns = result.get("data", {}).get("transactions", [])
     wanted = set(import_ids)
     return {t["import_id"]: t for t in txns if t.get("import_id") in wanted}
+
+
+#: YNAB cleared states in the only order they may move: never backwards.
+_CLEARED_RANK = {"uncleared": 0, "cleared": 1, "reconciled": 2}
+
+
+def _cleared_rank(value):
+    return _CLEARED_RANK.get(value or "uncleared", 0)
+
+
+def _fetch_ynab_txns_by_id(token, budget_id, account_id, since_date=None):
+    """Return {ynab_tx_id: ynab_tx_dict} for the account's live transactions.
+
+    Updates and removals are computed from this current YNAB state rather than
+    from the local DB, so user edits in YNAB (reconciliation, memos, manual
+    clearing, deletions) are never overwritten. One request per import.
+    """
+    path = f"/budgets/{budget_id}/accounts/{account_id}/transactions"
+    if since_date:
+        path += f"?since_date={since_date}"
+    result = ynab_request("GET", path, token)
+    txns = result.get("data", {}).get("transactions", [])
+    return {t["id"]: t for t in txns if t.get("id") and not t.get("deleted")}
+
+
+def _safe_update_fields(current, tx, *, allow_amount=False, new_date=None):
+    """Fields to PATCH so YNAB reflects the CSV without undoing user edits.
+
+    - cleared only moves uncleared → cleared (never touches cleared/reconciled);
+    - the memo is only rewritten to drop our '(pending)' marker, keeping
+      whatever else is in YNAB's memo (never sent as None blindly);
+    - amount/date are only changed when allowed and the transaction is
+      neither reconciled nor split.
+    """
+    fields = {}
+    cur_cleared = current.get("cleared") or "uncleared"
+    if tx.get("cleared") == "cleared" and cur_cleared == "uncleared":
+        fields["cleared"] = "cleared"
+    cur_memo = current.get("memo") or ""
+    if tx.get("cleared") == "cleared" and "(pending)" in cur_memo:
+        fields["memo"] = _strip_pending_marker(cur_memo) or None
+    locked = cur_cleared == "reconciled" or bool(current.get("subtransactions"))
+    if allow_amount and not locked and current.get("amount") != tx["amount"]:
+        fields["amount"] = tx["amount"]
+    if new_date and not locked and current.get("date") != new_date:
+        fields["date"] = new_date
+    return fields
+
+
+def _ynab_state_since(rows):
+    """Earliest date worth fetching for the given update/delete rows (60-day margin)."""
+    dates = [r["date"] for r in rows if r.get("date")]
+    dates += [r["_rekey_from"].split(":")[2] for r in rows if r.get("_rekey_from")]
+    if not dates:
+        return None
+    earliest = datetime.strptime(min(dates), "%Y-%m-%d") - timedelta(days=60)
+    return earliest.strftime("%Y-%m-%d")
 
 
 def _strip_pending_marker(memo):
@@ -1228,7 +1316,15 @@ def cleanup_pending_memos(token, budget_id, account_id, csv_path=None, dry_run=F
     still_pending = 0
     for t in stale:
         iid = t.get("import_id")
-        if iid and iid in csv_state and csv_state[iid]["is_pending"]:
+        csv_row = csv_state.get(iid) if iid else None
+        if csv_row and csv_row["is_pending"]:
+            still_pending += 1
+            continue
+        # Still uncleared in YNAB and not confirmed completed by the CSV:
+        # it may genuinely still be pending, so keep its marker.
+        if t.get("cleared", "uncleared") == "uncleared" and not (
+            csv_row and csv_row["cleared"] == "cleared"
+        ):
             still_pending += 1
             continue
         actionable.append(t)
@@ -1245,7 +1341,7 @@ def cleanup_pending_memos(token, budget_id, account_id, csv_path=None, dry_run=F
             amt = t["amount"] / 1000
             iid = t.get("import_id")
             csv_row = csv_state.get(iid) if iid else None
-            flip = " → cleared" if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") != "cleared" else ""
+            flip = " → cleared" if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") == "uncleared" else ""
             print(f"    ↻ {t['date']}  {amt:>10.2f}  {t.get('payee_name', '')}{flip}")
         if len(actionable) > 20:
             print(f"    …and {len(actionable) - 20} more.")
@@ -1258,9 +1354,10 @@ def cleanup_pending_memos(token, budget_id, account_id, csv_path=None, dry_run=F
         update = {"memo": new_memo or None}
 
         # If the CSV confirms this row has cleared on Revolut, flip cleared too
+        # (only from uncleared — never touch a reconciled transaction).
         iid = t.get("import_id")
         csv_row = csv_state.get(iid) if iid else None
-        if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") != "cleared":
+        if csv_row and csv_row["cleared"] == "cleared" and t.get("cleared") == "uncleared":
             update["cleared"] = "cleared"
             flipped += 1
 
@@ -1484,40 +1581,23 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                     continue
 
                 ynab_tx_id = existing.get("id")
-                incoming_memo = tx.get("memo") or ""
-                existing_memo = existing.get("memo") or ""
-                drift = (
-                    existing.get("cleared", "uncleared") != tx["cleared"]
-                    or existing.get("amount", 0) != tx["amount"]
-                    or existing_memo != incoming_memo
-                )
-                if drift and ynab_tx_id:
-                    update_body = {
-                        "transaction": {
-                            "amount": tx["amount"],
-                            "cleared": tx["cleared"],
-                            "memo": incoming_memo or None,
-                        }
-                    }
+                # Same import_id means same amount at import time, so an
+                # amount difference can only be a user edit: never revert
+                # it. Cleared/memo follow the safe forward-only rules.
+                fields = _safe_update_fields(existing, tx)
+                if fields and ynab_tx_id:
                     try:
                         ynab_request(
                             "PATCH",
                             f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
-                            token, update_body,
+                            token, {"transaction": fields},
                         )
                         dup_patched += 1
-                        if existing.get("amount", 0) != tx["amount"]:
-                            print(
-                                f"    Δ {tx['date']}  {tx['payee_name']} — amount "
-                                f"{existing.get('amount', 0)/1000:+.2f} → {tx['amount']/1000:+.2f}"
-                            )
                         log.info(
                             "tx drift-fix date=%s amount=%+.2f payee=%s "
-                            "cleared=%s→%s memo=%r→%r import_id=%s ynab_id=%s",
+                            "fields=%r import_id=%s ynab_id=%s",
                             tx["date"], tx["amount"] / 1000,
-                            tx.get("payee_name", ""),
-                            existing.get("cleared", "uncleared"), tx["cleared"],
-                            existing_memo, incoming_memo,
+                            tx.get("payee_name", ""), fields,
                             tx["import_id"], ynab_tx_id,
                         )
                     except Exception as e:
@@ -1534,6 +1614,25 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
 
         conn.commit()
 
+    # ── Current YNAB state for updates / removals ──
+    # Every PATCH and DELETE below is computed from what YNAB holds *now*,
+    # not from the local DB (which the web UI's sync rewrites). That keeps
+    # reconciliation, memos, manual clearing and deletions done in YNAB.
+    linked = [tx for tx in to_update if tx.get("_ynab_tx_id")] + to_delete
+    current = {}
+    if linked:
+        try:
+            current = _fetch_ynab_txns_by_id(
+                token, budget_id, account_id, since_date=_ynab_state_since(linked),
+            )
+        except Exception as e:
+            print(f"\n  ⚠ Could not read the current YNAB state ({e}); skipped "
+                  f"{len(linked)} update(s)/removal(s) — send the file again later.")
+            log.warning("import: skipped %d updates/removals, YNAB state fetch failed: %s",
+                        len(linked), e)
+            to_update = [tx for tx in to_update if not tx.get("_ynab_tx_id")]
+            to_delete = []
+
     # ── Update changed transactions ──
     if to_update:
         print(f"\n  → Updating {len(to_update)} transaction(s) in YNAB...")
@@ -1541,6 +1640,7 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
 
         for tx in to_update:
             ynab_tx_id = tx.get("_ynab_tx_id")
+            fields = {}
             if not ynab_tx_id:
                 # No stored YNAB ID — try to create (YNAB will dedup by import_id
                 # if it exists, or create new if not)
@@ -1553,25 +1653,40 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                 if created_txs:
                     ynab_tx_id = created_txs[0].get("id")
             else:
-                # We have the YNAB transaction ID — use PATCH to update
-                update_body = {
-                    "transaction": {
-                        "amount": tx["amount"],
-                        "cleared": tx["cleared"],
-                        "memo": tx.get("memo"),
-                    }
-                }
-                if tx.get("_rekey_from"):
+                cur = current.get(ynab_tx_id)
+                if cur is None:
+                    # Deleted in YNAB by hand: never resurrect it and don't
+                    # let one missing row abort the whole import.
+                    print(f"    ⚠ {tx['date']}  {tx.get('payee_name', '')} — no longer "
+                          f"in YNAB (deleted there?), left alone")
+                    log.warning("tx skipped   import_id=%s ynab_id=%s: not in YNAB anymore",
+                                tx["import_id"], ynab_tx_id)
+                    continue
+                # Only change the amount when YNAB still holds the amount we
+                # last knew — otherwise it is the user's own edit.
+                allow_amount = (tx.get("_old_amount") is not None
+                                and cur.get("amount") == tx["_old_amount"])
+                fields = _safe_update_fields(
+                    cur, tx, allow_amount=allow_amount,
                     # Date-shifted duplicate: move the YNAB row to the
                     # re-dated CSV date instead of creating a copy.
-                    update_body["transaction"]["date"] = tx["date"]
-                result = ynab_request(
-                    "PATCH",
-                    f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
-                    token,
-                    update_body,
+                    new_date=tx["date"] if tx.get("_rekey_from") else None,
                 )
-                updated_count += 1
+                if fields:
+                    try:
+                        ynab_request(
+                            "PATCH",
+                            f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
+                            token,
+                            {"transaction": fields},
+                        )
+                    except RuntimeError as e:
+                        if "YNAB API 404" not in str(e):
+                            raise
+                        print(f"    ⚠ {tx['date']}  {tx.get('payee_name', '')} — no longer "
+                              f"in YNAB (deleted there?), left alone")
+                        continue
+                    updated_count += 1
 
             if tx.get("_rekey_from"):
                 # Replace the old-dated local record; db_upsert below
@@ -1585,11 +1700,11 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
                     tx["_rekey_from"], tx["import_id"], ynab_tx_id,
                 )
             changes = []
-            if tx.get("_old_amount") is not None and tx["_old_amount"] != tx["amount"]:
+            if "amount" in fields and tx.get("_old_amount") is not None:
                 changes.append(
                     f"amount {tx['_old_amount']/1000:+.2f} → {tx['amount']/1000:+.2f}"
                 )
-            if tx.get("_rekey_from"):
+            if "date" in fields and tx.get("_rekey_from"):
                 old_date = tx["_rekey_from"].split(":")[2]
                 if old_date != tx["date"]:
                     changes.append(f"date {old_date} → {tx['date']}")
@@ -1620,26 +1735,36 @@ def import_and_track(conn, token, budget_id, account_id, transactions, dry_run=F
         for tx in to_delete:
             ynab_tx_id = tx["_ynab_tx_id"]
             reason = tx.get("_delete_reason", "reverted")
-            try:
-                ynab_request(
-                    "DELETE",
-                    f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
-                    token,
-                )
-                removed += 1
-            except RuntimeError as e:
-                # Already gone in YNAB (e.g. deleted by hand) — just
-                # record that locally so we stop retrying.
-                if "YNAB API 404" not in str(e):
-                    raise
+            label = ("pending superseded by settled rows"
+                     if reason == "superseded" else "reverted")
+            cur = current.get(ynab_tx_id)
+            if cur is not None and (cur.get("cleared") or "uncleared") != "uncleared":
+                # Someone cleared or reconciled it in YNAB: it is not a stale
+                # pending any more — never delete it automatically.
+                print(f"    ⚠ {tx['date']}  {tx['amount']/1000:+.2f}  "
+                      f"{tx.get('payee_name', '')} — {label}, but cleared in YNAB: left alone")
+                log.warning("tx kept      import_id=%s ynab_id=%s: %s but cleared in YNAB",
+                            tx["import_id"], ynab_tx_id, reason)
+                continue
+            if cur is not None:
+                try:
+                    ynab_request(
+                        "DELETE",
+                        f"/budgets/{budget_id}/transactions/{ynab_tx_id}",
+                        token,
+                    )
+                    removed += 1
+                except RuntimeError as e:
+                    # Already gone in YNAB (e.g. deleted by hand) — just
+                    # record that locally so we stop retrying.
+                    if "YNAB API 404" not in str(e):
+                        raise
             conn.execute(
                 "UPDATE transactions SET deleted = 1, state = ?, "
                 "updated_at = ? WHERE import_id = ?",
                 (reason.upper(), datetime.now().isoformat(), tx["import_id"]),
             )
             conn.commit()
-            label = ("pending superseded by settled rows"
-                     if reason == "superseded" else "reverted")
             # "✗" lines are picked up by the bot and surfaced in the
             # Telegram import summary.
             print(f"    ✗ {tx['date']}  {tx['amount']/1000:+.2f}  "

@@ -50,7 +50,9 @@ class ExternalServiceError(YnabHelperError):
         retriable: bool = False,
         user_message: str | None = None,
     ) -> None:
-        super().__init__(message, user_message=user_message or f"{service} request failed: {message}")
+        super().__init__(
+            message, user_message=user_message or f"{service} request failed: {message}"
+        )
         self.service = service
         self.status = status
         self.retriable = retriable

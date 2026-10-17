@@ -152,12 +152,17 @@ class PlanOptions:
       :func:`~ynab_helper.importer.planner.compute_allow_sweep` (False for an older export,
       F36). Also gates re-creating removed rows that reappear (an older export must not
       resurrect them).
+    * ``range_is_current`` — the statement's date range reaches the import date; the service
+      sets it from :func:`~ynab_helper.importer.planner.statement_range_is_current`. When
+      False nothing is provably missing from the statement, so no pending is swept and no
+      transaction is reported as vanished; matching and creates are unaffected.
     """
 
     account_id: str
     approved: bool
     skip_pending: bool = False
     allow_sweep: bool = True
+    range_is_current: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.account_id, str) or not self.account_id:

@@ -246,6 +246,9 @@ def test_a_superseded_pending_is_removed_and_reported_and_guards_hold(ctx, fake)
     fake.reset_log()
 
     later = [  # the deposit settled as two rows with other names; it is gone from Revolut
+        # The statement starts before the deposit: only then is its absence proof that it
+        # vanished (the coverage starts at the first completion, ExportFrame.coverage).
+        ("2026-08-17 09:00:00", "Bakery", "-3.00"),
         ("2026-08-18 11:00:00", "Coffee", "-4.00"),
         ("2026-08-19 08:00:00", "Hotel Hold", "-110.00", "PENDING"),  # still pending
         ("2026-08-20 09:30:12", "Hotel Bellevue", "-150.00"),
@@ -311,7 +314,10 @@ def test_a_pending_still_cleared_in_ynab_is_never_swept(ctx, fake):
     (deposit,) = _live(fake)
     fake.user_edit_transaction(deposit["id"], cleared="cleared")  # the user cleared it
     fake.reset_log()
-    result = _import(ctx, [("2026-08-18 11:00:00", "Coffee", "-4.00")])
+    result = _import(
+        ctx,
+        [("2026-08-17 09:00:00", "Bakery", "-3.00"), ("2026-08-18 11:00:00", "Coffee", "-4.00")],
+    )
     assert result.removed == [] and fake.tx(deposit["id"])["deleted"] is False
     assert any("Hotel Deposit" in warning for warning in result.warnings)
 

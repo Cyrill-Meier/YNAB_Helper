@@ -127,6 +127,7 @@ __all__ = [
     "match_rows",
     "plan_import",
     "resolve_duplicate",
+    "statement_range_is_current",
     "vote_offsets",
 ]
 
@@ -515,6 +516,52 @@ def _entry_span(entry: LedgerEntry) -> tuple[datetime, datetime] | None:
     return start, start + _DAY_END
 
 
+def _coverage(export: ParsedExport, latest: datetime | None) -> tuple[datetime, datetime] | None:
+    """The span in which ``export`` shows every transaction that started then and exists.
+
+    Revolut selects completed rows by their *Completed* Date. A transaction that started
+    before the statement's range but completed before it began is therefore legitimately
+    absent, although other rows that started on the same day are present because they
+    completed later (seen on a real export: a 2026-10-01.. statement whose rows start on
+    09-29). Using the first *Started* date as the lower bound would make such transactions
+    look "vanished" — and a pending among them would be swept from YNAB.
+
+    So the coverage starts at the latest of: the first Started date, the first Completed
+    *instant* (exact, so it holds whatever timezone Revolut selects in), and the range start
+    in the file name; it ends at the end of the earlier of the last Started date and the
+    range end in the file name. It is empty (None) when nothing proves completeness:
+
+    * rows dated after the statement's own range end (or a newest timestamp after it): a
+      custom range exported later, so transactions that completed between the range end
+      and the export are missing;
+    * no completed row and no range in the file name (e.g. a renamed, pending-only file).
+    """
+    if export.window is None:
+        return None
+    lo = _day_start(export.window[0])
+    hi_day = export.window[1]
+    completed = [r.completed_at for r in export.rows if r.completed_at is not None]
+    if completed:
+        lo = max(lo, min(completed)) if lo is not None else None
+    elif export.filename_window is None:
+        return None
+    if export.filename_window is not None:
+        range_lo, range_hi = export.filename_window
+        if export.window[1] > range_hi:
+            return None
+        if latest is not None and latest.date().isoformat() > range_hi:
+            return None
+        range_start = _day_start(range_lo)
+        if lo is None or range_start is None:
+            return None
+        lo, hi_day = max(lo, range_start), min(hi_day, range_hi)
+    hi = _day_start(hi_day)
+    if lo is None or hi is None:
+        return None
+    hi += _DAY_END
+    return (lo, hi) if lo <= hi else None
+
+
 @dataclass(frozen=True, slots=True)
 class ExportFrame:
     """Where an export sits relative to the ledger, for window and recency tests.
@@ -523,6 +570,9 @@ class ExportFrame:
       (``{0}`` when none did); an entry's instant in the export's rendering is
       ``started_at + d`` for one of them.
     * ``window`` — the export's (first, last) Started Date.
+    * ``coverage`` — the (start, end) instants between which the export is *complete*, i.e.
+      shows every transaction that started then and still exists (see :func:`_coverage`).
+      Never wider than ``window``; None when nothing proves the export complete.
     * ``latest`` — the newest Started/Completed timestamp of the export's timed rows: the
       export was generated after it. None for date-only exports.
     * ``latest_started`` — the newest Started timestamp of the export's timed rows.
@@ -532,6 +582,7 @@ class ExportFrame:
     window: tuple[str, str] | None
     latest: datetime | None
     latest_started: datetime | None
+    coverage: tuple[datetime, datetime] | None = None
 
     @classmethod
     def of(cls, export: ParsedExport, offsets: Iterable[int] = ()) -> ExportFrame:
@@ -552,6 +603,7 @@ class ExportFrame:
             window=export.window,
             latest=latest,
             latest_started=latest_started,
+            coverage=_coverage(export, latest),
         )
 
     def _shifted(self, entry: LedgerEntry) -> tuple[datetime, datetime] | None:
@@ -580,13 +632,15 @@ class ExportFrame:
         return span[0] <= bounds[1] and span[1] >= bounds[0]
 
     def covers(self, entry: LedgerEntry) -> bool:
-        """True if the export must show the entry's row if it still existed: inside the window
-        and started before the export was generated, under *every* plausible offset."""
-        span, bounds = self._shifted(entry), self._window_bounds()
-        if span is None or bounds is None:
+        """True if the export must show the entry's row if it still existed: inside the
+        export's *coverage* (not merely its window) and started before the export was
+        generated, under *every* plausible offset."""
+        span = self._shifted(entry)
+        if span is None or self.coverage is None:
             return False
-        upper = bounds[1] if self.latest is None else min(bounds[1], self.latest)
-        return span[0] >= bounds[0] and span[1] <= upper
+        lo, hi = self.coverage
+        upper = hi if self.latest is None else min(hi, self.latest)
+        return span[0] >= lo and span[1] <= upper
 
     def predates(self, entry: LedgerEntry) -> bool:
         """True if the entry started after the export's newest timestamp (under every
@@ -2006,6 +2060,21 @@ def compute_allow_sweep(
     return end >= newest_day - _ONE_DAY
 
 
+def statement_range_is_current(export: ParsedExport, today: date) -> bool:
+    """False when the range in the statement's file name ended more than a day before
+    ``today`` (the import date); True otherwise, including when the name has no range.
+
+    A statement whose range ends in the past omits transactions that completed after the
+    range end, so a pending missing from it proves nothing (e.g. a September statement
+    downloaded on 10-02 omits a 09-29 pending that completed on 10-01). The service passes
+    the result as :attr:`PlanOptions.range_is_current`.
+    """
+    if export.filename_window is None:
+        return True
+    range_end = _day(export.filename_window[1])
+    return range_end is not None and range_end >= today - _ONE_DAY
+
+
 # ── the planner ──────────────────────────────────────────────────────────────
 
 
@@ -2041,6 +2110,10 @@ def plan_import(
     # Window/recency tests consider the offsets matches actually used (a learned offset no
     # match used, e.g. from a round-time renumbering collision, is no evidence of a frame).
     frame = ExportFrame.of(export, _used_offsets(pairs))
+    if not opts.range_is_current:
+        # A range that ended before the import proves nothing missing (sweep/vanished only;
+        # this is not an *older* export, so matching and creates are unaffected).
+        frame = dataclasses.replace(frame, coverage=None)
     newest = _export_is_older(entries, frame)
     regressed = _regressed_match(pairs, rows, entries)
     stale = not opts.allow_sweep or newest is not None or regressed is not None
@@ -2251,10 +2324,12 @@ def _sweep(
 ) -> tuple[int, int]:
     """§6.2 step 5: delete unmatched, still-uncleared pendings the export covers.
 
-    "Covers" (:meth:`ExportFrame.covers`): inside the export window and started before the
-    export's newest timestamp under every plausible offset — a pending that started after an
-    older statement was generated, or that a shifted rendering puts outside the window, is
-    never deleted (F36).
+    "Covers" (:meth:`ExportFrame.covers`): inside the export's *coverage* — the span the
+    statement is provably complete for, which starts at its first completion and range start
+    rather than its first Started date — and started before the export's newest timestamp,
+    under every plausible offset. A pending that completed before the statement's range, that
+    started after an older statement was generated, or that a shifted rendering puts outside
+    the coverage, is never deleted (F36; production dry run 2026-10-17).
     """
     swept_ids: set[str] = set()
     vanished: list[LedgerEntry] = []

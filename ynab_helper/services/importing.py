@@ -13,7 +13,11 @@ from typing import Final, Literal
 from ynab_helper.errors import CsvError, YnabHelperError
 from ynab_helper.importer.executor import ProgressCallback, apply_plan
 from ynab_helper.importer.models import ImportResult, PlanOptions
-from ynab_helper.importer.planner import compute_allow_sweep, plan_import
+from ynab_helper.importer.planner import (
+    compute_allow_sweep,
+    plan_import,
+    statement_range_is_current,
+)
 from ynab_helper.locks import LOCKS
 from ynab_helper.maintenance import dedupe as _dedupe
 from ynab_helper.revolut.files import store_upload
@@ -24,6 +28,7 @@ from ynab_helper.storage.csv_files import CsvFileStore
 from ynab_helper.storage.ledger import LedgerEntry, LedgerStore
 from ynab_helper.storage.mirror import MirrorStore, MirrorView
 from ynab_helper.sync.ynab_sync import sync_and_refresh
+from ynab_helper.timeutil import local_today
 from ynab_helper.ynab.client import YnabClient
 
 __all__ = ["SOURCE_KINDS", "SourceKind", "import_csv"]
@@ -299,6 +304,7 @@ def _plan_and_apply(
         approved=ctx.auto_approve,
         skip_pending=skip_pending,
         allow_sweep=compute_allow_sweep(export, entries, account_id=ctx.account_id),
+        range_is_current=statement_range_is_current(export, local_today()),
     )
     plan = plan_import(export, entries, view, opts)
     return apply_plan(

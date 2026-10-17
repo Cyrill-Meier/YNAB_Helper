@@ -1,0 +1,252 @@
+/*
+ * Source stylesheet of the web UI (Tailwind CSS v3.4.17, built by scripts/build_css.sh into
+ * ynab_helper/web/static/app.css). Holds v1's component rules (cards, quick actions, toasts,
+ * switch) that v1 compiled in the browser, plus the v2 primitives (buttons, badges, form
+ * fields, dialog, navigation). No inline styles anywhere: the CSP is style-src 'self'.
+ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-slate-50 text-ink-900 antialiased dark:bg-ink-900 dark:text-slate-100;
+  }
+  :focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-brand-600 dark:outline-brand-500;
+  }
+  code {
+    @apply rounded bg-slate-100 px-1.5 py-0.5 text-[0.85em] dark:bg-ink-700;
+  }
+  table th,
+  table td {
+    @apply align-middle;
+  }
+  tbody tr:hover {
+    @apply bg-slate-50 dark:bg-ink-700/40;
+  }
+  dialog::backdrop {
+    background: rgb(0 0 0 / 0.45);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* ── cards & primitives (v1) ─────────────────────────────────────────────── */
+  .card {
+    @apply rounded-2xl border border-slate-200 bg-white p-5 shadow-soft dark:border-ink-700 dark:bg-ink-800;
+  }
+  .card-label {
+    @apply text-xs uppercase tracking-wider text-ink-500 dark:text-slate-400;
+  }
+  .card-value {
+    @apply mt-1 text-2xl font-semibold tracking-tight tabular-nums;
+  }
+  .card-meta {
+    @apply mt-1 min-h-[1rem] text-xs text-ink-500 dark:text-slate-400;
+  }
+  .page-title {
+    @apply text-2xl font-semibold tracking-tight;
+  }
+  .page-intro {
+    @apply mt-1 text-sm text-ink-500 dark:text-slate-400;
+  }
+  .muted {
+    @apply text-ink-500 dark:text-slate-400;
+  }
+  .link {
+    @apply font-medium text-brand-800 underline-offset-2 hover:underline dark:text-brand-500;
+  }
+
+  /* ── quick-action tiles (v1) ─────────────────────────────────────────────── */
+  .action {
+    @apply flex cursor-pointer items-center gap-3 rounded-2xl border border-slate-200 bg-white p-5 text-sm font-medium transition hover:border-brand-500 hover:shadow-soft dark:border-ink-700 dark:bg-ink-800;
+  }
+  .action-icon {
+    @apply grid h-9 w-9 place-items-center rounded-lg bg-brand-500/10 text-lg;
+  }
+
+  /* ── buttons ─────────────────────────────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md border border-slate-200 bg-white px-3 py-1.5 text-sm transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-ink-600 dark:bg-transparent dark:hover:bg-ink-700;
+  }
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md bg-brand-500 px-4 py-2 text-sm font-medium text-ink-900 transition hover:bg-brand-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md bg-rose-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .icon-btn {
+    @apply flex h-8 w-8 items-center justify-center rounded-md text-ink-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-ink-700;
+  }
+
+  /* ── form fields ─────────────────────────────────────────────────────────── */
+  .field {
+    @apply rounded-md border border-slate-200 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500/40 dark:border-ink-600 dark:bg-ink-800;
+  }
+  .field-label {
+    @apply mb-1 block text-xs font-medium text-ink-500 dark:text-slate-400;
+  }
+  .checkbox {
+    @apply h-4 w-4 rounded border-slate-300 accent-brand-600 dark:border-ink-600;
+  }
+
+  /* ── badges ──────────────────────────────────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2 py-0.5 text-xs;
+  }
+  .badge-neutral {
+    @apply bg-slate-100 text-slate-700 dark:bg-ink-700 dark:text-slate-300;
+  }
+  .badge-ok {
+    @apply bg-emerald-100 text-emerald-800 dark:bg-emerald-500/15 dark:text-emerald-300;
+  }
+  .badge-warn {
+    @apply bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300;
+  }
+  .badge-danger {
+    @apply bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300;
+  }
+  .badge-info {
+    @apply bg-indigo-100 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300;
+  }
+  .badge-brand {
+    @apply bg-brand-50 text-brand-800 dark:bg-brand-500/15 dark:text-brand-500;
+  }
+
+  /* ── amounts ─────────────────────────────────────────────────────────────── */
+  .amount-out {
+    @apply text-rose-600 dark:text-rose-400;
+  }
+  .amount-in {
+    @apply text-emerald-700 dark:text-emerald-400;
+  }
+
+  /* ── alerts (inline messages) ────────────────────────────────────────────── */
+  .alert {
+    @apply rounded-md border px-3 py-2 text-sm;
+  }
+  .alert-warn {
+    @apply border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200;
+  }
+  .alert-error {
+    @apply border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-500/20 dark:bg-rose-500/10 dark:text-rose-200;
+  }
+  .alert-ok {
+    @apply border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-500/20 dark:bg-emerald-500/10 dark:text-emerald-200;
+  }
+  .alert-info {
+    @apply border-slate-200 bg-slate-50 text-slate-900 dark:border-ink-600 dark:bg-ink-700 dark:text-slate-100;
+  }
+
+  /* ── toasts (v1) ─────────────────────────────────────────────────────────── */
+  .toast {
+    @apply flex max-w-sm items-start gap-3 rounded-xl border px-4 py-3 text-sm shadow-soft;
+    animation: rynab-toast-in 0.2s ease-out;
+  }
+  .toast.ok {
+    @apply border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-500/20 dark:bg-emerald-950 dark:text-emerald-200;
+  }
+  .toast.warn {
+    @apply border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-500/20 dark:bg-amber-950 dark:text-amber-200;
+  }
+  .toast.error {
+    @apply border-rose-200 bg-rose-50 text-rose-900 dark:border-rose-500/20 dark:bg-rose-950 dark:text-rose-200;
+  }
+  .toast.info {
+    @apply border-slate-200 bg-slate-50 text-slate-900 dark:border-ink-600 dark:bg-ink-700 dark:text-slate-100;
+  }
+  .toast.leaving {
+    @apply translate-y-[-4px] opacity-0 transition duration-200;
+  }
+
+  /* ── switch (Settings) ───────────────────────────────────────────────────── */
+  .switch {
+    @apply relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent bg-slate-300 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500/50 disabled:cursor-wait disabled:opacity-60 dark:bg-ink-600;
+  }
+  .switch > span {
+    @apply inline-block h-5 w-5 translate-x-0 transform rounded-full bg-white shadow ring-0 transition-transform;
+  }
+  .switch[aria-checked="true"] {
+    @apply bg-brand-500;
+  }
+  .switch[aria-checked="true"] > span {
+    @apply translate-x-5;
+  }
+
+  /* ── navigation ──────────────────────────────────────────────────────────── */
+  .nav-link {
+    @apply block rounded-md px-3 py-1.5 text-ink-500 transition hover:bg-slate-100 hover:text-ink-900 dark:text-slate-400 dark:hover:bg-ink-700 dark:hover:text-slate-100;
+  }
+  .nav-link[aria-current="page"] {
+    @apply bg-brand-50 font-medium text-brand-800 dark:bg-ink-700 dark:text-brand-500;
+  }
+  /* Below lg the navigation is a disclosure panel (js/components/nav.js); from lg up it is
+     a single row that always fits (no horizontal scrollbar, v1's overflow at ~770 px). */
+  .site-nav {
+    @apply hidden border-t border-slate-200 dark:border-ink-700 lg:block;
+  }
+  .site-nav[data-open="true"] {
+    @apply block;
+  }
+  .site-nav-list {
+    @apply mx-auto grid max-w-7xl grid-cols-2 gap-1 px-4 py-2 text-sm sm:grid-cols-3 sm:px-6 lg:flex lg:flex-wrap lg:items-center lg:px-8;
+  }
+
+  /* ── spinner & dialog ────────────────────────────────────────────────────── */
+  .spinner {
+    @apply inline-block h-4 w-4 shrink-0 rounded-full border-2 border-current border-r-transparent align-[-0.125em];
+    animation: rynab-spin 0.7s linear infinite;
+  }
+  .dialog {
+    @apply w-[calc(100%-2rem)] max-w-md rounded-2xl border border-slate-200 bg-white p-5 text-ink-900 shadow-soft dark:border-ink-700 dark:bg-ink-800 dark:text-slate-100;
+  }
+
+  /* ── charts (SVG; sizes come from attributes, colours from these classes) ─── */
+  .bar-track {
+    @apply fill-slate-100 dark:fill-ink-700;
+  }
+  .bar-fill {
+    @apply fill-brand-500/80;
+  }
+  .bar-fill-muted {
+    @apply fill-brand-500/40;
+  }
+  .bar-fill-hover {
+    @apply fill-brand-500/70 transition-colors hover:fill-brand-500;
+  }
+  .spark-bar-latest {
+    @apply fill-brand-500;
+  }
+}
+
+@keyframes rynab-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes rynab-toast-in {
+  from {
+    transform: translateY(-8px);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}

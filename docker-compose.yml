@@ -1,16 +1,52 @@
+# Reference compose file for NEW installs of the Revolut -> YNAB bot.
+#
+# Copy it next to your `bot.env` and `Caddyfile`, then `docker compose up -d`.
+# An existing deployment keeps its own compose file: nothing in this file is
+# required by the image (privilege drop, health check and stop signal are
+# built into the image), so the server-side file does not need to change when
+# this one does.
+#
+# Layout of the deploy directory:
+#   docker-compose.yml   this file
+#   bot.env              secrets and settings (see .env.example), chmod 600
+#   bot_data/            created on first start: databases, statements, bot.log
+#   Caddyfile            reverse-proxy config (see the Caddyfile in the repo)
+
+# Rotated, compressed container logs for every service, so stdout logs cannot
+# fill the disk over time (F110).
+x-logging: &default-logging
+  driver: local
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   revolut-ynab-bot:
     image: ghcr.io/cyrill-meier/ynab_helper:latest
     container_name: revolut-ynab-bot
     restart: unless-stopped
     volumes:
-      # Your .env file with secrets (create on the host, NOT from Git)
+      # Your .env file with secrets (create on the host, NOT from Git).
+      # Root-only permissions (600) are fine: the container reads it as root
+      # before it drops to the unprivileged app user (uid 10001).
       - ./bot.env:/app/.env:ro
-      # Persistent storage for user DB + per-user transaction DBs
+      # Persistent storage for user DB + per-user transaction DBs. The
+      # container chowns this directory to uid 10001 on every start.
       - ./bot_data:/app/bot_data
     environment:
       - TZ=Europe/Zurich
-      - PYTHONUNBUFFERED=1
+    # The entrypoint starts as root only to fix bot_data ownership and read
+    # bot.env, then drops to uid 10001 for good; nothing in the image needs
+    # setuid binaries, so forbid regaining privileges that way.
+    security_opt:
+      - no-new-privileges:true
+    # The image's HEALTHCHECK watches the bot's poll loop; see the status with
+    # `docker inspect --format '{{.State.Health.Status}}' revolut-ynab-bot`.
+    # On `docker stop` (and every Watchtower update) the bot gets SIGTERM,
+    # stops polling and shuts down within about 8 s; 20 s leaves headroom
+    # before Docker falls back to SIGKILL.
+    stop_grace_period: 20s
+    logging: *default-logging
     # The web UI listens on 8080 inside the container. Caddy below reaches
     # it over the internal compose network; we deliberately do NOT publish
     # that port to the host.
@@ -33,7 +69,9 @@ services:
   # The Caddyfile next to this compose file declares which hostnames are
   # served and where they proxy to.
   caddy:
-    image: caddy:2-alpine
+    # Pinned to the 2.11 minor line: Watchtower pulls patch releases of
+    # this tag automatically; move to the next minor deliberately.
+    image: caddy:2.11-alpine
     container_name: caddy
     restart: unless-stopped
     ports:
@@ -47,6 +85,7 @@ services:
       - caddy_config:/config
     depends_on:
       - revolut-ynab-bot
+    logging: *default-logging
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 
@@ -57,17 +96,24 @@ services:
     # containrrr image still ships an API v1.25 client which Docker
     # 25+ rejects with "client version 1.25 is too old. Minimum
     # supported API version is 1.40."
-    image: nickfedor/watchtower:latest
+    # Pinned to the 1.23 minor line (patch releases arrive automatically
+    # because Watchtower updates itself within the "ynab" scope).
+    image: nickfedor/watchtower:1.23
     container_name: watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Only needed if you pull from a PRIVATE registry: mount the Docker
+      # client config holding the registry login (`docker login ghcr.io`).
+      # The published bot image is public, so this stays commented out.
+      # - /root/.docker/config.json:/config.json:ro
     environment:
       # Check for new images every 5 minutes
       - WATCHTOWER_POLL_INTERVAL=300
       # Only update containers with the "ynab" scope label
       - WATCHTOWER_SCOPE=ynab
       - TZ=Europe/Zurich
+    logging: *default-logging
     labels:
       - "com.centurylinklabs.watchtower.scope=ynab"
 

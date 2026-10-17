@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Reconcile — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="max-w-3xl space-y-6">
+  <div>
+    <h1 class="page-title">Reconcile</h1>
+    <p class="page-intro">
+      Compare YNAB's cleared balance with the balance of the most recent statement. If they
+      differ, one adjustment transaction makes them line up — after you confirmed the numbers.
+    </p>
+  </div>
+
+  <section class="card" aria-labelledby="rec-title">
+    <div class="flex flex-wrap items-center justify-between gap-4">
+      <div class="min-w-0">
+        <h2 id="rec-title" class="card-label">Last statement</h2>
+        <div class="truncate font-medium" id="rec-csv">—</div>
+      </div>
+      <button id="rec-preview" type="button" class="btn-primary">Check balance</button>
+    </div>
+
+    <p id="rec-initial" class="mt-4 text-sm text-ink-500 dark:text-slate-400">
+      Nothing to show yet — press <span class="font-medium text-ink-900 dark:text-slate-100">Check balance</span>
+      to compare. Nothing is written to YNAB until you confirm.
+    </p>
+    <div id="rec-preview-result" class="mt-4 space-y-4" hidden></div>
+  </section>
+
+  <section id="rec-outcome" class="card space-y-2" aria-labelledby="rec-outcome-title" tabindex="-1" hidden>
+    <h2 id="rec-outcome-title" class="font-medium">Result</h2>
+    <div id="rec-outcome-body" class="text-sm"></div>
+  </section>
+
+  <div class="card text-sm text-ink-500 dark:text-slate-400">
+    <h2 class="mb-1 font-medium text-ink-900 dark:text-slate-100">When you'd want this</h2>
+    Reconcile is useful after a manual edit in YNAB or when the running total looks off. It reads
+    the balance of the newest completed row of the statement and compares it with YNAB's cleared
+    balance on that date. If they match, nothing happens. If not, it posts a single
+    <em>CSV Reconciliation</em> adjustment (marked reconciled) so they agree, and you can investigate
+    the difference at your leisure.
+  </div>
+</div>
+{% endblock %}

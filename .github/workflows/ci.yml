@@ -1,0 +1,268 @@
+# CI and image publishing.
+#
+# Every pull request and every push to main runs the test job and builds and
+# checks the image. Only a push to main publishes it: Watchtower on the
+# production host deploys ghcr.io/cyrill-meier/ynab_helper:latest within
+# minutes, so nothing reaches :latest without passing the tests and the image
+# checks first (F31). workflow_dispatch builds and checks but never publishes
+# (F71).
+#
+# Supply chain (F115): every action is pinned to a full commit SHA (the version
+# comment is what Dependabot updates) and the default token is read-only. The
+# only job that can write packages is `publish`, which runs solely for pushes
+# to main, i.e. after a merge. Pull requests (including Dependabot's action
+# bumps) never get a token that could move :latest, so unreviewed action code
+# cannot deploy to production.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    # A push that only touches documentation or the host-side reference
+    # files cannot change the image, so it does not rebuild and restart
+    # production. Everything else (code, templates, static files,
+    # requirements, Dockerfile, tests) does (F68). Pull requests always run
+    # so required status checks are never left pending.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "docker-compose.yml"
+      - "Caddyfile"
+      - ".env.example"
+      - ".github/dependabot.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pushes to main share one queue whose running workflow is never cancelled, so
+# publishes happen in commit order and an older build can never overwrite a
+# newer :latest (F109). GitHub keeps at most one *pending* run per group,
+# though: when several commits land while a run is in progress, the pending
+# ones are superseded by the newest and never built, so only commits that
+# were built have a :<short sha> tag (the previously deployed image always has
+# one, which is what a rollback needs). `queue: max` would keep every pending
+# run, but it cannot be combined with cancel-in-progress: true, which pull
+# requests use here to cancel superseded runs of the same ref.
+concurrency:
+  group: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'deploy-main' || format('ci-{0}', github.ref) }}
+  cancel-in-progress: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies (hash-checked)
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+
+      - name: Ruff format
+        run: ruff format --check .
+
+      - name: Tests
+        run: python -m pytest -q
+
+      # The built Tailwind CSS is committed; fail when it is out of date with
+      # the templates/scripts. The build script arrives with the frontend
+      # rework, so the check is skipped (with a notice) until it exists. It is
+      # run through bash so a missing executable bit cannot skip the check.
+      - name: CSS drift check
+        run: |
+          if [ -f scripts/build_css.sh ]; then
+            bash scripts/build_css.sh --check
+          else
+            echo "::notice::scripts/build_css.sh not present; CSS drift check skipped"
+          fi
+
+      - name: Audit runtime dependencies
+        run: pip-audit --requirement requirements.txt --require-hashes --disable-pip --progress-spinner off
+
+  image:
+    name: Build and check image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Read-only on purpose: this job runs for every pull request, including
+    # Dependabot's bumps of the actions below, so it must not hold a token
+    # that can push to the registry (F115).
+    permissions:
+      contents: read
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      archive_sha256: ${{ steps.save.outputs.sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # BUILD_SHA / BUILD_DATE keep the formats of the previous workflow (short
+      # SHA, "YYYY-MM-DD HH:MM UTC") because the bot's version line shows them;
+      # the OCI labels get the full SHA and an RFC 3339 timestamp instead.
+      - name: Compute image name and build metadata
+        id: meta
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          short_sha="${GITHUB_SHA::7}"
+          {
+            echo "image=${image}"
+            echo "short_sha=${short_sha}"
+            echo "build_date=$(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Built once and loaded into the local Docker engine. The image checked
+      # below is handed to the publish job as an archive, so the image that is
+      # pushed is exactly the image that passed the checks.
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}
+            ${{ steps.meta.outputs.image }}:latest
+          build-args: |
+            BUILD_SHA=${{ steps.meta.outputs.short_sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.created }}
+          cache-from: type=gha
+          # A cache outage must not block a deploy; it only makes the build slower.
+          cache-to: type=gha,mode=max,ignore-error=true
+
+      - name: Image self-check
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}
+        run: docker run --rm "$IMAGE" selfcheck
+
+      - name: Container smoke test (privilege drop, entry points, SIGTERM)
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}
+        run: bash scripts/ci_smoke.sh "$IMAGE"
+
+      # Only a push to main publishes, so only then is the checked image
+      # exported for the publish job. The checksum travels as a job output and
+      # is verified before loading.
+      - name: Export checked image
+        id: save
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          archive="${RUNNER_TEMP}/image.tar"
+          docker save --output "${archive}" "${IMAGE}:${SHORT_SHA}" "${IMAGE}:latest"
+          echo "sha256=$(sha256sum "${archive}" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checked image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar
+          if-no-files-found: error
+          retention-days: 1
+          # A full re-run of the workflow uploads again under the same name.
+          overwrite: true
+
+  publish:
+    name: Publish image
+    needs: image
+    # The only job that can write packages, and it never runs for pull
+    # requests or manual runs (F71, F115). Its steps are kept minimal: no
+    # checkout, no build, only load, verify and push.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # contents: read matches the permissions the previous publish workflow
+    # pushed to this GHCR package with (the repository is public anyway).
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download checked image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+          digest-mismatch: error
+
+      - name: Verify and load checked image
+        env:
+          ARCHIVE_SHA256: ${{ needs.image.outputs.archive_sha256 }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          SHORT_SHA: ${{ needs.image.outputs.short_sha }}
+        run: |
+          archive="${RUNNER_TEMP}/image.tar"
+          if [ -z "${ARCHIVE_SHA256}" ]; then
+            echo "::error::the image job did not report the archive checksum"
+            exit 1
+          fi
+          echo "${ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict -
+          docker load --input "${archive}"
+          # The archive must hold the image built from this very commit.
+          revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${IMAGE}:${SHORT_SHA}")"
+          if [ "${revision}" != "${GITHUB_SHA}" ]; then
+            echo "::error::image revision ${revision} does not match ${GITHUB_SHA}"
+            exit 1
+          fi
+          latest_id="$(docker image inspect --format '{{.Id}}' "${IMAGE}:latest")"
+          sha_id="$(docker image inspect --format '{{.Id}}' "${IMAGE}:${SHORT_SHA}")"
+          if [ "${latest_id}" != "${sha_id}" ]; then
+            echo "::error::the latest and ${SHORT_SHA} tags point to different images"
+            exit 1
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The SHA tag goes first so the rollback target exists before :latest
+      # moves (rollback = pin the compose image to :<short sha>). Note that
+      # re-running an older run of this workflow republishes that commit as
+      # :latest, i.e. it rolls production back.
+      - name: Push image
+        env:
+          IMAGE: ${{ needs.image.outputs.image }}
+          SHORT_SHA: ${{ needs.image.outputs.short_sha }}
+        run: |
+          docker push "${IMAGE}:${SHORT_SHA}"
+          docker push "${IMAGE}:latest"
+          # Informational only: the push above already succeeded.
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:latest" || echo unknown)"
+          {
+            echo "### Published"
+            echo ""
+            echo "- \`${IMAGE}:${SHORT_SHA}\`"
+            echo "- \`${IMAGE}:latest\`"
+            echo "- digest: \`${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

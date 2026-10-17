@@ -22,3 +22,6 @@ bot_data/
 
 # Revolut CSVs (may contain personal financial data)
 account-statement*.csv
+
+# Build tool cache (pinned Tailwind CLI, scripts/build_css.sh)
+.cache/

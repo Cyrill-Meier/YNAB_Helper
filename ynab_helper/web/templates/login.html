@@ -1,0 +1,42 @@
+{#- The login page (GET /, sign-in errors). Context: the common keys plus ``message`` and,
+    on errors, ``error: True``; ``expired`` when a session ran out (F24); ``setup_paused``
+    when the browser's session is kept while the user runs /setup in Telegram (R05). -#}
+{% extends "_public.html" %}
+{% block title %}Sign in — Revolut → YNAB{% endblock %}
+{% block heading %}
+<h1 class="text-2xl font-semibold tracking-tight">Revolut → YNAB</h1>
+<p class="mt-1 text-sm text-ink-500 dark:text-slate-400">Sign in via your Telegram bot</p>
+{% endblock %}
+{% block card %}
+<div class="card p-6">
+  {% if setup_paused %}
+  <p class="alert alert-warn" role="status">{{ message }}</p>
+  <p class="mt-6"><a href="/" class="btn-primary">Reload</a></p>
+  {% else %}
+  {% if expired %}
+  <p class="alert alert-warn mb-5" role="status">Your session has expired. Please sign in again.</p>
+  {% endif %}
+  <ol class="space-y-3 text-sm">
+    <li class="flex gap-3">
+      <span class="grid h-6 w-6 flex-none place-items-center rounded-full bg-brand-500 text-xs font-medium text-ink-900" aria-hidden="true">1</span>
+      <span>Open Telegram and chat with your bot.</span>
+    </li>
+    <li class="flex gap-3">
+      <span class="grid h-6 w-6 flex-none place-items-center rounded-full bg-brand-500 text-xs font-medium text-ink-900" aria-hidden="true">2</span>
+      <span>Send <code>/login</code>.</span>
+    </li>
+    <li class="flex gap-3">
+      <span class="grid h-6 w-6 flex-none place-items-center rounded-full bg-brand-500 text-xs font-medium text-ink-900" aria-hidden="true">3</span>
+      <span>Tap the button the bot sends you back. The link is single-use and expires in a few minutes.</span>
+    </li>
+  </ol>
+  {% if message %}
+    {% if error %}
+    <p class="alert alert-error mt-6" role="alert">{{ message }}</p>
+    {% else %}
+    <p class="mt-6 text-xs text-ink-500 dark:text-slate-400">{{ message }}</p>
+    {% endif %}
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

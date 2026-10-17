@@ -1,0 +1,45 @@
+{#- Sign-in interstitial (GET /auth?t=…). The GET never consumes the token (F88): this form
+    POSTs it. Without ``confirm_switch`` the form carries data-autosubmit="true" and
+    js/auth.js submits it on load ("Continue" is the fallback). With ``confirm_switch`` this
+    browser is already signed in as ``user``: the page asks before switching accounts and is
+    never auto-submitted (a forwarded link must not swap the user into another budget).
+    Keep the default referrer policy: the POST must carry its Origin. -#}
+{% extends "_public.html" %}
+{% block title %}{% if confirm_switch %}Switch account? — Revolut → YNAB{% else %}Signing in — Revolut → YNAB{% endif %}{% endblock %}
+{% block head_scripts %}<script src="{{ static_base }}/js/auth.js" defer></script>{% endblock %}
+{% block heading %}
+{% if confirm_switch %}
+<h1 class="text-2xl font-semibold tracking-tight">Switch account?</h1>
+{% else %}
+<h1 class="text-2xl font-semibold tracking-tight">Signing in…</h1>
+<p class="mt-1 text-sm text-ink-500 dark:text-slate-400">Revolut → YNAB</p>
+{% endif %}
+{% endblock %}
+{% block card %}
+<div class="card p-6">
+  {% if confirm_switch %}
+  {%- set current = user.first_name or user.username or user.telegram_id -%}
+  <p class="text-sm" role="status">
+    This browser is signed in as <strong>{{ current }}</strong>{% if user.budget_name %} (budget <strong>{{ user.budget_name }}</strong>){% endif %}.
+  </p>
+  {% if message %}<p class="alert alert-warn mt-4">{{ message }}</p>{% endif %}
+  <div class="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+    <form id="auth-form" method="post" action="/auth">
+      <input type="hidden" name="t" value="{{ login_token }}">
+      <button type="submit" class="btn w-full py-2 sm:w-auto">Continue</button>
+    </form>
+    <a href="/app/dashboard" class="btn-primary">Stay signed in as {{ current }}</a>
+  </div>
+  {% else %}
+  <form id="auth-form" method="post" action="/auth" data-autosubmit="true" class="flex flex-col items-center gap-4 text-center">
+    <input type="hidden" name="t" value="{{ login_token }}">
+    <p class="flex items-center gap-2 text-sm text-ink-500 dark:text-slate-400" role="status">
+      <span class="spinner" aria-hidden="true"></span>
+      Signing you in…
+    </p>
+    <button type="submit" class="btn-primary">Continue</button>
+    <p class="text-xs text-ink-500 dark:text-slate-400">Nothing happening? Press Continue.</p>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

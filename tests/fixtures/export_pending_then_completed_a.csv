@@ -1,0 +1,7 @@
+Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Topup,Current,2026-10-01 07:45:10,2026-10-01 07:46:10,Top-Up by *4242,300.00,0.00,CHF,COMPLETED,1300.00
+Card Payment,Current,2026-10-10 14:00:00,,Hotel Bellevue (hold),-150.00,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-10 18:20:00,2026-10-11 04:00:00,Coop Pronto,-11.20,0.00,CHF,COMPLETED,1288.80
+Card Payment,Current,2026-10-11 19:02:13,,Migros Zuerich HB,-45.30,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-11 22:15:00,,Amazon EU,-89.99,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-12 08:00:00,2026-10-12 08:00:30,SBB CFF FFS,-6.80,0.00,CHF,COMPLETED,1282.00

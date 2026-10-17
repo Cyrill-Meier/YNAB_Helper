@@ -1,0 +1,23 @@
+Type,Product,Started Date,Completed Date,Description,Amount,Fee,Currency,State,Balance
+Topup,Current,2026-10-01 08:00:00,2026-10-01 08:00:01,Top-Up by *4242,100.00,0.00,CHF,COMPLETED,100.00
+Card Payment,Current,,,Missing start date,-1.00,0.00,CHF,PENDING,
+Card Payment,Current,2026-13-45 10:00:00,,Bad date,-2.00,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:00:00,,Bad amount,abc,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:01:00,,Empty amount,,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:02:00,,Not a number,nan,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:03:00,,Infinite,-inf,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:04:00,,Infinite fee,-1.00,inf,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:05:00,,Huge,-1e15,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:06:00,2026-10-02 10:06:01,Odd fee,-3.00,n/a,CHF,COMPLETED,97.00
+Card Payment,Current,2026-10-02 10:07:00,,Unknown state,-4.00,0.00,CHF,ON_HOLD,
+Card Payment,Current,2026-10-02 10:08:00,,Empty state,-5.00,0.00,CHF,,
+Card Payment,Current,1969-12-31 23:00:00,,Too old,-6.00,0.00,CHF,PENDING,
+Card Payment,Current,2026-10-02 10:09:00,2026-10-02 10:09:01,Bad balance,-7.00,0.00,CHF,COMPLETED,lots
+Card Payment,Current,2026-10-02 10:10:00,not a date,Bad completed date,-8.00,0.00,CHF,COMPLETED,82.00
+Card Payment,Current,2026-10-02 10:11:00
+Transfer,Savings,garbage,,Savings garbage,xyz,,CHF,WEIRD,
+Card Payment,Current,2026-10-02 10:12:00,2026-10-02 10:12:01,Short row without balance,-9.00,0.00,CHF,COMPLETED
+Card Payment,Current,2026-10-02 10:13:00,,Lowercase state,-10.00,0.00,CHF,pending,
+Card Payment,Current,2026-10-02 10:14:00,2026-10-02 10:14:01,Absurd balance,-11.00,0.00,CHF,COMPLETED,1e12
+Card Payment,Current,2026-10-02 10:15:00,,Unknown state again,-4.00,0.00,CHF,DECLINED,
+Card Payment,Current,2026-10-02 10:16:00,,Same amount after declined,-4.00,0.00,CHF,PENDING,

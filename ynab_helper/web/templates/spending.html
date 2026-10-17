@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Spending — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="page-title">Spending</h1>
+      <p class="page-intro">
+        Net spending per category from YNAB (refunds netted, transfers and income excluded) over
+        complete months; the current month is shown separately.
+      </p>
+      <p class="page-intro text-xs" id="sp-sync-status"></p>
+    </div>
+    <div class="flex flex-wrap items-center gap-2">
+      <div id="sp-accounts"></div>
+      <label for="sp-months" class="sr-only">Window</label>
+      <select id="sp-months" class="field">
+        <option value="3">Last 3 months</option>
+        <option value="6" selected>Last 6 months</option>
+        <option value="12">Last 12 months</option>
+        <option value="24">Last 24 months</option>
+      </select>
+      <button id="sp-sync" type="button" class="btn py-2" title="Fetch the latest data from YNAB"><span aria-hidden="true">⟳</span> Sync</button>
+    </div>
+  </div>
+
+  <div id="sp-error" hidden></div>
+
+  {# ── Summary cards ────────────────────────────────────────────────────────── #}
+  <div class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+    <div class="card">
+      <h2 class="card-label">This month so far</h2>
+      <div class="card-value" id="sp-mtd">—</div>
+      <div class="card-meta" id="sp-mtd-meta"></div>
+    </div>
+    <div class="card">
+      <h2 class="card-label">Last complete month</h2>
+      <div class="card-value" id="sp-last">—</div>
+      <div class="card-meta" id="sp-last-meta"></div>
+    </div>
+    <div class="card">
+      <h2 class="card-label">Average / month</h2>
+      <div class="card-value" id="sp-avg">—</div>
+      <div class="card-meta" id="sp-avg-meta"></div>
+    </div>
+  </div>
+
+  {# ── Total per month ──────────────────────────────────────────────────────── #}
+  <section class="card" aria-labelledby="sp-months-title">
+    <div class="mb-3 flex items-center justify-between gap-3">
+      <h2 id="sp-months-title" class="font-medium">Total spend per month</h2>
+      <span class="text-xs text-ink-500 dark:text-slate-400" id="sp-window-label"></span>
+    </div>
+    <ul id="sp-month-bars" class="space-y-2"></ul>
+  </section>
+
+  {# ── Per-category breakdown ───────────────────────────────────────────────── #}
+  <section class="card overflow-hidden p-0" aria-labelledby="sp-cats-title">
+    <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-5 py-3 dark:border-ink-700">
+      <h2 id="sp-cats-title" class="font-medium">Categories — month over month</h2>
+      <span class="text-xs text-ink-500 dark:text-slate-400">Select a category to see its transactions</span>
+    </div>
+    <ul id="sp-cats" class="divide-y divide-slate-100 dark:divide-ink-700"></ul>
+    <div id="sp-empty" class="py-12 text-center text-ink-500 dark:text-slate-400" hidden>
+      No spending in this window. Categorize some transactions in YNAB and come back.
+    </div>
+    <div id="sp-loading" class="py-12 text-center text-ink-500 dark:text-slate-400" role="status">
+      <span class="spinner" aria-hidden="true"></span><span class="ml-2">Loading…</span>
+    </div>
+  </section>
+</div>
+{% endblock %}

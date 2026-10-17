@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Dedupe — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="space-y-6">
+  <div class="flex flex-wrap items-end justify-between gap-4">
+    <div>
+      <h1 class="page-title">Dedupe</h1>
+      <p class="page-intro">
+        Find transactions the importer created in YNAB that no row of the latest statement accounts
+        for — typically leftovers of an earlier import where Revolut settled a different amount
+        than it pre-authorized. Nothing is deleted until you confirm.
+      </p>
+    </div>
+    <button id="dd-scan" type="button" class="btn-primary">Scan</button>
+  </div>
+
+  <section id="dd-meta" class="card" aria-label="Scan summary" hidden>
+    <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
+      <div class="min-w-0">
+        <dt class="card-label">Statement</dt>
+        <dd class="truncate font-medium" id="dd-csv">—</dd>
+      </div>
+      <div>
+        <dt class="card-label">Range</dt>
+        <dd class="font-medium" id="dd-range">—</dd>
+      </div>
+      <div>
+        <dt class="card-label">Rows · YNAB in range</dt>
+        <dd class="font-medium" id="dd-counts">—</dd>
+      </div>
+      <div>
+        <dt class="card-label">Candidates</dt>
+        <dd class="font-medium" id="dd-candidates">—</dd>
+      </div>
+    </dl>
+  </section>
+
+  <div id="dd-empty" class="card py-10 text-center text-ink-500 dark:text-slate-400" hidden>
+    <span aria-hidden="true">🎉</span> No orphaned imports in the statement's date range.
+  </div>
+
+  <p id="dd-progress" class="text-sm text-ink-500 dark:text-slate-400" role="status"></p>
+  <div id="dd-report" class="space-y-2"></div>
+
+  <section id="dd-results" class="card overflow-hidden p-0" aria-label="Candidates" hidden>
+    <div class="flex flex-wrap items-center gap-2 border-b border-slate-200 px-4 py-3 dark:border-ink-700">
+      <label class="flex items-center gap-2 text-sm">
+        <input id="dd-select-all" type="checkbox" class="checkbox">
+        <span>Select all</span>
+      </label>
+      <span class="text-sm text-ink-500 dark:text-slate-400" id="dd-selected-count" aria-live="polite">0 selected</span>
+      <div class="ml-auto flex items-center gap-2">
+        <button id="dd-clear" type="button" class="btn">Clear</button>
+        <button id="dd-delete" type="button" class="btn-danger" disabled>Delete selected</button>
+      </div>
+    </div>
+    <div class="relative overflow-x-auto">
+      <table class="w-full text-sm">
+        <caption class="sr-only">Importer transactions without a statement row</caption>
+        <thead class="bg-slate-50 text-ink-500 dark:bg-ink-700/50 dark:text-slate-400">
+          <tr>
+            <th scope="col" class="w-8 px-4 py-2"><span class="sr-only">Select</span></th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Date</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Payee</th>
+            <th scope="col" class="px-4 py-2 text-right font-medium">Amount</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">Memo</th>
+            <th scope="col" class="px-4 py-2 text-left font-medium">State</th>
+          </tr>
+        </thead>
+        <tbody id="dd-tbody" class="divide-y divide-slate-100 dark:divide-ink-700"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <div id="dd-initial" class="card py-10 text-center text-ink-500 dark:text-slate-400">
+    Press <span class="font-medium text-ink-900 dark:text-slate-100">Scan</span> to look for orphans.
+  </div>
+</div>
+{% endblock %}

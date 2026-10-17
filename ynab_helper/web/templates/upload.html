@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Upload — Revolut → YNAB{% endblock %}
+{% block content %}
+<div class="max-w-3xl space-y-6">
+  <div>
+    <h1 class="page-title">Upload CSV</h1>
+    <p class="page-intro">
+      Import a Revolut account-statement CSV. The same import runs as via Telegram: it compares the
+      statement with what YNAB has and only creates or updates what changed.
+    </p>
+  </div>
+
+  {#- F66: the file input itself is focusable (visually hidden, not display:none); the label
+      is the drop zone and shows the focus ring. No extra click handler (one chooser). -#}
+  <div class="card overflow-hidden p-0">
+    <label id="up-drop" for="up-input"
+           class="m-4 flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 px-6 py-14 text-center transition hover:border-brand-500 hover:bg-brand-500/5 focus-within:border-brand-500 focus-within:ring-2 focus-within:ring-brand-500/40 dark:border-ink-700 aria-busy:cursor-wait aria-busy:opacity-60">
+      <svg class="mb-3 h-10 w-10 text-ink-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true" focusable="false">
+        <path d="M12 16V4m0 0l-4 4m4-4l4 4M4 20h16" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="font-medium" id="up-label">Drop a CSV here, or choose a file</span>
+      <span class="mt-1 text-xs text-ink-500 dark:text-slate-400" id="up-hint">
+        Up to 25 MB. Revolut's <code>account-statement_*.csv</code> export.
+      </span>
+      <input id="up-input" type="file" accept=".csv,text/csv" class="sr-only" aria-describedby="up-hint">
+    </label>
+  </div>
+
+  <p id="up-status" class="text-sm text-ink-500 dark:text-slate-400" role="status"></p>
+
+  <section id="up-result" class="card space-y-4" aria-labelledby="up-result-title" tabindex="-1" hidden>
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h2 id="up-result-title" class="font-medium">Import result</h2>
+      <span id="up-result-name" class="max-w-xs truncate text-sm text-ink-500 dark:text-slate-400"></span>
+    </div>
+    <div id="up-result-body" class="space-y-4"></div>
+  </section>
+</div>
+{% endblock %}
